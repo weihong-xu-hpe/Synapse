@@ -131,14 +131,39 @@ class StdioProxy:
             while not self._stop_event.is_set():
                 msg = _read_message()
                 if msg is None:
+                    logger.info("stdin EOF, exiting")
                     break
-                self._handle_stdin_message(msg)
+                self._dispatch(msg)
         except (BrokenPipeError, KeyboardInterrupt):
             pass
         finally:
             self._stop_event.set()
             self._http.close()
             logger.info("Stdio proxy stopped")
+
+    def _dispatch(self, msg: dict[str, Any]) -> None:
+        """Route a single stdin message. Catches all errors to keep the loop alive."""
+        msg_id = msg.get("id", "-")
+        method = msg.get("method", "")
+        if _is_jsonrpc_response(msg):
+            kind = "response"
+        elif _is_jsonrpc_request(msg):
+            kind = f"request:{method}"
+        elif _is_jsonrpc_notification(msg):
+            kind = f"notification:{method}"
+        else:
+            kind = "unknown"
+        logger.info("← stdin  id=%s  %s", msg_id, kind)
+        try:
+            self._handle_stdin_message(msg)
+        except Exception:
+            logger.exception("Unhandled error processing id=%s %s", msg_id, kind)
+            if _is_jsonrpc_request(msg) and msg_id != "-":
+                _write_message({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32603, "message": "internal proxy error"},
+                })
 
     def _handle_stdin_message(self, msg: dict[str, Any]) -> None:
         if _is_jsonrpc_response(msg):
@@ -194,6 +219,8 @@ class StdioProxy:
         headers["Accept"] = _SSE_MEDIA_TYPE
 
         request_id = msg.get("id")
+        tool_name = msg.get("params", {}).get("name", "?")
+        logger.info("SSE tool call id=%s tool=%s", request_id, tool_name)
 
         # Use a separate httpx client for the streaming connection so
         # the main client stays free for forwarding sampling responses.
@@ -207,6 +234,7 @@ class StdioProxy:
                     json=msg,
                     headers=headers,
                 ) as resp:
+                    logger.info("SSE stream opened, status=%s id=%s", resp.status_code, request_id)
                     buffer = ""
                     for chunk in resp.iter_text():
                         if self._stop_event.is_set():
@@ -218,8 +246,13 @@ class StdioProxy:
                                 event_msg = json.loads(payload)
                             except json.JSONDecodeError:
                                 continue
+                            evt_method = event_msg.get("method", "")
+                            evt_id = event_msg.get("id", "-")
+                            logger.info("→ stdout  id=%s  method=%s (from SSE)", evt_id, evt_method)
                             _write_message(event_msg)
+                    logger.info("SSE stream ended id=%s", request_id)
             except httpx.HTTPError as exc:
+                logger.error("SSE error id=%s: %s", request_id, exc)
                 _write_message({
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -228,6 +261,8 @@ class StdioProxy:
                         "message": f"HTTP proxy SSE error: {exc}",
                     },
                 })
+            except Exception:
+                logger.exception("SSE thread crash id=%s", request_id)
             finally:
                 stream_http.close()
 
@@ -237,6 +272,7 @@ class StdioProxy:
         # for sampling responses.
 
     def _forward_sampling_response(self, msg: dict[str, Any]) -> None:
+        logger.info("Forwarding sampling response id=%s", msg.get("id", "-"))
         self._post_json(msg)
 
     def _session_headers(self) -> dict[str, str]:
