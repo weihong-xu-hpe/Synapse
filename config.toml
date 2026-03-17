@@ -1,0 +1,55 @@
+[server]
+host = "0.0.0.0"
+port = 8765
+cors_allowed_origins = ["*"]
+auth_token = ""
+
+[memory]
+base_path = "~/synapse"
+archive_path = "~/synapse/.archive"
+
+[embedding]
+provider = "remote_api"
+model = "bge-m3"
+dimension = 1024
+timeout_seconds = 30
+
+[reranker]
+provider = "remote_api"
+model = "qllama/bge-reranker-v2-m3"
+max_candidates = 9
+timeout_seconds = 30
+
+# [providers.remote_api] connects Synapse to any OpenAI-compatible HTTP inference server.
+# Both embedding and reranking use the same provider block; set embedding_base_url
+# to point at a separate server if your embedding and reranker run on different ports.
+#
+# Example — two llama-server instances (see README for full startup commands):
+#   embedding : llama-server -m ~/models/bge-m3.gguf --embeddings --port 47860
+#   reranker  : llama-server -m ~/models/bge-reranker-v2-m3.gguf --rerank --pooling rank --port 47861
+[providers.remote_api]
+base_url = "http://127.0.0.1:47861"
+embedding_base_url = "http://127.0.0.1:47860"
+embedding_endpoint = "/v1/embeddings"
+rerank_endpoint = "/v1/rerank"
+api_key_env = ""
+headers = {}
+request_timeout_seconds = 30
+
+[retrieval]
+engine = "sqlite"
+rrf_k = 60
+top_k = 3
+
+[decay]
+factor = 0.98
+janitor_days = 30
+archive_retention_days = 90
+
+[sanitization]
+custom_patterns = []
+
+[logging]
+retention_days = 7
+max_file_size_mb = 50
+log_dir = "./.synapse/.logs"

@@ -1,0 +1,34 @@
+# Runtime state
+.synapse/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+
+# Testing
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+.env.*
+
+# Virtual environments
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Temp / local
+.tmp/
+agentic-hybrid-memory-architecture-design.md
