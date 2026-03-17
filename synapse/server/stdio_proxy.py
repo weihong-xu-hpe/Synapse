@@ -3,8 +3,14 @@
 Bridges VS Code's stdio MCP transport to an existing Synapse HTTP server,
 enabling full sampling support (which Streamable HTTP clients may not handle).
 
+Architecture:
+    - Main thread: reads stdin, dispatches messages
+    - SSE thread: reads SSE stream from POST (sampling tools) or GET (session),
+      writes sampling/createMessage requests to stdout
+    - Sampling responses from stdin are forwarded back to the HTTP server
+
 Usage:
-    python -m synapse mcp-proxy [--url http://host:port/mcp]
+    python -m synapse mcp-proxy [<server>]
 
 VS Code mcp.json:
     {
@@ -32,13 +38,21 @@ _DEFAULT_SERVER_URL = "http://127.0.0.1:8765/mcp"
 _SSE_DATA_PREFIX = "data: "
 _SSE_MEDIA_TYPE = "text/event-stream"
 _SESSION_HEADER = "mcp-session-id"
+_SAMPLING_TOOL_NAMES = frozenset({
+    "decide_memory_write",
+    "integrate_memory_with_sampling",
+    "run_dreamer",
+})
+
+_write_lock = threading.Lock()
 
 
 def _write_message(message: dict[str, Any]) -> None:
-    """Write a JSON-RPC message to stdout (newline-delimited)."""
+    """Write a JSON-RPC message to stdout (newline-delimited). Thread-safe."""
     raw = json.dumps(message, ensure_ascii=False)
-    sys.stdout.write(raw + "\n")
-    sys.stdout.flush()
+    with _write_lock:
+        sys.stdout.write(raw + "\n")
+        sys.stdout.flush()
 
 
 def _read_message() -> dict[str, Any] | None:
@@ -71,15 +85,43 @@ def _is_jsonrpc_response(msg: dict[str, Any]) -> bool:
     return "id" in msg and ("result" in msg or "error" in msg) and "method" not in msg
 
 
+def _needs_sse_sampling(msg: dict[str, Any]) -> bool:
+    """Check if this tools/call requires sampling."""
+    if str(msg.get("method", "")) != "tools/call":
+        return False
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return False
+    return str(params.get("name", "")).strip() in _SAMPLING_TOOL_NAMES
+
+
+def _parse_sse_events(raw_buffer: str) -> tuple[list[str], str]:
+    """Extract complete SSE data payloads from a buffer, return (payloads, remaining)."""
+    payloads: list[str] = []
+    while "\n\n" in raw_buffer:
+        event_block, raw_buffer = raw_buffer.split("\n\n", 1)
+        for line in event_block.split("\n"):
+            if line.startswith(_SSE_DATA_PREFIX):
+                payloads.append(line[len(_SSE_DATA_PREFIX):])
+    return payloads, raw_buffer
+
+
 class StdioProxy:
-    """Bridges stdin/stdout JSON-RPC to a Synapse Streamable HTTP server."""
+    """Bridges stdin/stdout JSON-RPC to a Synapse Streamable HTTP server.
+
+    Sampling flow:
+    1. Tool call arrives on stdin → proxy POSTs with Accept: text/event-stream
+    2. SSE reader thread reads the response stream in background
+    3. When server pushes sampling/createMessage → written to stdout
+    4. VS Code invokes LLM, sends response on stdin → main loop reads it
+    5. Main loop forwards sampling response via POST to server
+    6. Server completes tool call → SSE stream pushes final result → written to stdout
+    """
 
     def __init__(self, server_url: str = _DEFAULT_SERVER_URL) -> None:
         self._server_url = server_url
         self._session_id: str | None = None
-        self._http = httpx.Client(timeout=120.0)
-        self._pending_sampling: dict[int, bool] = {}
-        self._sse_thread: threading.Thread | None = None
+        self._http = httpx.Client(timeout=300.0)
         self._stop_event = threading.Event()
 
     def run(self) -> None:
@@ -100,7 +142,6 @@ class StdioProxy:
 
     def _handle_stdin_message(self, msg: dict[str, Any]) -> None:
         if _is_jsonrpc_response(msg):
-            # This is a sampling response from VS Code — forward to HTTP server
             self._forward_sampling_response(msg)
             return
 
@@ -112,7 +153,7 @@ class StdioProxy:
             method = msg.get("method", "")
             if method == "initialize":
                 self._handle_initialize(msg)
-            elif self._needs_sse_sampling(msg):
+            elif _needs_sse_sampling(msg):
                 self._handle_sampling_tool_call(msg)
             else:
                 self._handle_simple_request(msg)
@@ -121,7 +162,6 @@ class StdioProxy:
         logger.warning("Unknown message shape: %s", json.dumps(msg)[:200])
 
     def _handle_initialize(self, msg: dict[str, Any]) -> None:
-        """Forward initialize, capture session ID."""
         resp = self._http.post(
             self._server_url,
             json=msg,
@@ -131,21 +171,11 @@ class StdioProxy:
         body = resp.json()
         _write_message(body)
 
-        # Start GET SSE listener for this session (for async sampling pushes)
-        if self._session_id and self._sse_thread is None:
-            self._sse_thread = threading.Thread(
-                target=self._listen_sse,
-                daemon=True,
-            )
-            self._sse_thread.start()
-
     def _handle_simple_request(self, msg: dict[str, Any]) -> None:
-        """Forward a non-sampling request synchronously."""
         resp = self._post_json(msg)
         if resp is None:
             return
         if resp.status_code == 202:
-            # Notification accepted, no body
             return
         try:
             body = resp.json()
@@ -154,95 +184,60 @@ class StdioProxy:
             pass
 
     def _handle_sampling_tool_call(self, msg: dict[str, Any]) -> None:
-        """Forward a sampling tool call with Accept: text/event-stream, relay SSE events."""
+        """Forward a sampling tool call, read SSE in background so stdin stays free.
+
+        The SSE stream is read in a daemon thread. When the server pushes
+        sampling/createMessage, it's written to stdout. The main loop continues
+        reading stdin and can pick up the sampling response from VS Code.
+        """
         headers = self._session_headers()
         headers["Accept"] = _SSE_MEDIA_TYPE
 
-        try:
-            with self._http.stream(
-                "POST",
-                self._server_url,
-                json=msg,
-                headers=headers,
-            ) as resp:
-                self._process_sse_stream(resp)
-        except httpx.HTTPError as exc:
-            _write_message({
-                "jsonrpc": "2.0",
-                "id": msg.get("id"),
-                "error": {
-                    "code": -32000,
-                    "message": f"HTTP proxy error: {exc}",
-                },
-            })
+        request_id = msg.get("id")
 
-    def _process_sse_stream(self, resp: httpx.Response) -> None:
-        """Read SSE events from response, dispatch sampling requests and tool results."""
-        buffer = ""
-        for chunk in resp.iter_text():
-            buffer += chunk
-            while "\n\n" in buffer:
-                event_block, buffer = buffer.split("\n\n", 1)
-                for line in event_block.split("\n"):
-                    if line.startswith(_SSE_DATA_PREFIX):
-                        data = line[len(_SSE_DATA_PREFIX):]
-                        self._dispatch_sse_data(data)
+        # Use a separate httpx client for the streaming connection so
+        # the main client stays free for forwarding sampling responses.
+        stream_http = httpx.Client(timeout=300.0)
 
-    def _dispatch_sse_data(self, raw: str) -> None:
-        """Parse an SSE data payload and route it."""
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            return
+        def _read_sse_and_relay():
+            try:
+                with stream_http.stream(
+                    "POST",
+                    self._server_url,
+                    json=msg,
+                    headers=headers,
+                ) as resp:
+                    buffer = ""
+                    for chunk in resp.iter_text():
+                        if self._stop_event.is_set():
+                            break
+                        buffer += chunk
+                        payloads, buffer = _parse_sse_events(buffer)
+                        for payload in payloads:
+                            try:
+                                event_msg = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+                            _write_message(event_msg)
+            except httpx.HTTPError as exc:
+                _write_message({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32000,
+                        "message": f"HTTP proxy SSE error: {exc}",
+                    },
+                })
+            finally:
+                stream_http.close()
 
-        if isinstance(msg.get("method"), str) and msg["method"] == "sampling/createMessage":
-            # Server wants host-side sampling — push to VS Code via stdout
-            _write_message(msg)
-        elif "result" in msg or "error" in msg:
-            # This is the final tool result — push to VS Code
-            _write_message(msg)
-        else:
-            # Other notifications — forward
-            _write_message(msg)
+        worker = threading.Thread(target=_read_sse_and_relay, daemon=True)
+        worker.start()
+        # Do NOT join — return immediately so main loop can read stdin
+        # for sampling responses.
 
     def _forward_sampling_response(self, msg: dict[str, Any]) -> None:
-        """Forward a sampling response from VS Code back to the HTTP server."""
         self._post_json(msg)
-
-    def _listen_sse(self) -> None:
-        """Background GET SSE listener for session-level async events."""
-        if not self._session_id:
-            return
-        headers = {
-            _SESSION_HEADER: self._session_id,
-            "Accept": _SSE_MEDIA_TYPE,
-        }
-        try:
-            with self._http.stream("GET", self._server_url, headers=headers) as resp:
-                buffer = ""
-                for chunk in resp.iter_text():
-                    if self._stop_event.is_set():
-                        break
-                    buffer += chunk
-                    while "\n\n" in buffer:
-                        event_block, buffer = buffer.split("\n\n", 1)
-                        for line in event_block.split("\n"):
-                            if line.startswith(_SSE_DATA_PREFIX):
-                                data = line[len(_SSE_DATA_PREFIX):]
-                                self._dispatch_sse_data(data)
-        except (httpx.HTTPError, httpx.StreamError):
-            if not self._stop_event.is_set():
-                logger.warning("SSE listener disconnected, sampling via GET SSE unavailable")
-
-    def _needs_sse_sampling(self, msg: dict[str, Any]) -> bool:
-        """Check if this tools/call requires sampling (SSE transport)."""
-        if str(msg.get("method", "")) != "tools/call":
-            return False
-        params = msg.get("params")
-        if not isinstance(params, dict):
-            return False
-        from synapse.server.mcp import is_sampling_tool_name
-        return is_sampling_tool_name(str(params.get("name", "")))
 
     def _session_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"Content-Type": "application/json"}
