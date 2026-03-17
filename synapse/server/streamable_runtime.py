@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from threading import Lock
@@ -9,6 +11,8 @@ from threading import Event
 from time import time
 from typing import Any, Callable, Protocol
 from uuid import uuid4
+
+logger = logging.getLogger("synapse.streamable-runtime")
 
 from synapse.server.mcp import MCPSession, SynapseMCPServer
 from synapse.server.sampling import (
@@ -24,6 +28,17 @@ from synapse.server.service import SynapseServerService, SynapseServiceError
 _STREAM_CLOSE_SENTINEL = object()
 _DEFAULT_SAMPLING_TIMEOUT_SECONDS = 30.0
 _SAMPLING_REQUEST_METHOD = "sampling/createMessage"
+
+
+def _preview_content(result: dict[str, Any]) -> str:
+    """Extract a short preview of content text for diagnostics."""
+    content = result.get("content")
+    if isinstance(content, dict):
+        return str(content.get("text", ""))[:500]
+    if isinstance(content, list):
+        parts = [str(item.get("text", "")) for item in content if isinstance(item, dict)]
+        return " ".join(parts)[:500]
+    return repr(content)[:500]
 _NON_OBJECT_SAMPLING_RESULT_MESSAGE = "Sampling-capable MCP client returned a non-object result"
 
 
@@ -144,19 +159,26 @@ class StreamableSamplingClient:
         )
         result_payload = response.get("result")
         if not isinstance(result_payload, dict):
+            logger.error("Sampling result is not a dict: %s", json.dumps(response, default=str)[:2000])
             raise SynapseServiceError(
                 "INVALID_SAMPLING_RESPONSE",
                 _NON_OBJECT_SAMPLING_RESULT_MESSAGE,
                 status_code=502,
+                details={"response_keys": list(response.keys()) if isinstance(response, dict) else type(response).__name__},
             )
         try:
             return parse_sampling_json_result(result_payload)
         except (KeyError, TypeError, ValueError) as exc:
+            logger.error(
+                "Cannot parse sampling JSON: %s — raw result: %s",
+                exc,
+                json.dumps(result_payload, default=str)[:2000],
+            )
             raise SynapseServiceError(
                 "INVALID_SAMPLING_RESPONSE",
                 "Sampling-capable MCP client returned an unreadable JSON payload",
                 status_code=502,
-                details={"reason": str(exc)},
+                details={"reason": str(exc), "raw_content_preview": _preview_content(result_payload)},
             ) from exc
 
     def decide_memory_write(self, request: MemoryWriteSamplingRequest) -> MemoryWriteSamplingDecision:
@@ -171,19 +193,26 @@ class StreamableSamplingClient:
         )
         result_payload = response.get("result")
         if not isinstance(result_payload, dict):
+            logger.error("Sampling result is not a dict: %s", json.dumps(response, default=str)[:2000])
             raise SynapseServiceError(
                 "INVALID_SAMPLING_RESPONSE",
                 _NON_OBJECT_SAMPLING_RESULT_MESSAGE,
                 status_code=502,
+                details={"response_keys": list(response.keys()) if isinstance(response, dict) else type(response).__name__},
             )
         try:
             return parse_memory_write_sampling_result(result_payload)
         except (KeyError, TypeError, ValueError) as exc:
+            logger.error(
+                "Cannot parse sampling decision: %s — raw result: %s",
+                exc,
+                json.dumps(result_payload, default=str)[:2000],
+            )
             raise SynapseServiceError(
                 "INVALID_SAMPLING_RESPONSE",
                 "Sampling-capable MCP client returned an unreadable memory write decision",
                 status_code=502,
-                details={"reason": str(exc)},
+                details={"reason": str(exc), "raw_content_preview": _preview_content(result_payload)},
             ) from exc
 
     def _request_sampling(
