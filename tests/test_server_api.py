@@ -270,11 +270,9 @@ def test_streamable_http_auth_token_is_enforced_for_mcp_only(tmp_path: Path) -> 
         assert authorized.status_code == 200
         tool_names = {tool["name"] for tool in authorized.json()["result"]["tools"]}
         assert tool_names == {
-            "decide_memory_write",
-            "integrate_memory_with_sampling",
             "run_dreamer",
             "search_memory",
-            "get_node",
+            "write_memory",
         }
 
 
@@ -393,7 +391,7 @@ def test_streamable_sampling_unavailable_errors_point_to_active_architecture_doc
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "integrate_memory_with_sampling",
+                    "name": "write_memory",
                     "arguments": {
                         "title": "Gateway Rate Limits",
                         "content": "Rate limiting complements the gateway design.",
@@ -432,12 +430,11 @@ def test_streamable_sampling_tools_execute_when_sampling_client_is_injected(tmp_
                 "id": 2,
                 "method": "tools/call",
                 "params": {
-                    "name": "integrate_memory_with_sampling",
+                    "name": "write_memory",
                     "arguments": {
                         "title": "Gateway Rate Limits",
                         "content": "Rate limiting complements the gateway design.",
                         "query_hint": "Gateway design rate limiting",
-                        "require_confident_decision": True,
                     },
                 },
             },
@@ -514,7 +511,7 @@ def test_streamable_sampling_query_hint_enhances_candidate_lookup_without_overri
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "integrate_memory_with_sampling",
+                    "name": "write_memory",
                     "arguments": {
                         "title": "Duplicate Response Guardrails",
                         "content": (
@@ -522,7 +519,6 @@ def test_streamable_sampling_query_hint_enhances_candidate_lookup_without_overri
                             "and timeout handling."
                         ),
                         "query_hint": "duplicate response handling",
-                        "require_confident_decision": True,
                     },
                 },
             },
@@ -555,11 +551,10 @@ def test_streamable_sampling_round_trip_completes_over_post_sse_stream(tmp_path:
                         "id": 2,
                         "method": "tools/call",
                         "params": {
-                            "name": "integrate_memory_with_sampling",
+                            "name": "write_memory",
                             "arguments": {
                                 "title": "Gateway Streaming Policy",
                                 "content": "Streamable HTTP sampling should use one coherent session.",
-                                "require_confident_decision": True,
                             },
                         },
                     },
@@ -622,11 +617,10 @@ def test_streamable_sampling_round_trip_completes_over_session_event_stream(tmp_
                             "id": 2,
                             "method": "tools/call",
                             "params": {
-                                "name": "integrate_memory_with_sampling",
+                                "name": "write_memory",
                                 "arguments": {
                                     "title": "Gateway Session Streaming Policy",
                                     "content": "Session event streams should support server-driven sampling.",
-                                    "require_confident_decision": True,
                                 },
                             },
                         },
@@ -721,7 +715,7 @@ def test_streamable_duplicate_sampling_response_is_rejected(tmp_path: Path) -> N
                         "id": 2,
                         "method": "tools/call",
                         "params": {
-                            "name": "decide_memory_write",
+                            "name": "write_memory",
                             "arguments": {
                                 "title": "Gateway Cache Policy",
                                 "content": "Cache invalidation belongs with gateway policy notes.",

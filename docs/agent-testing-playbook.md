@@ -65,7 +65,7 @@ mcp-session-id: $SESSION
 }
 ```
 
-- 确认返回 5 个工具: `search_memory`, `decide_memory_write`, `integrate_memory_with_sampling`, `run_dreamer`, `get_node`
+- 确认返回 3 个工具: `search_memory`, `write_memory`, `run_dreamer`
 
 ### 0.3 SSE 流监听 (sampling 工具必须)
 
@@ -142,24 +142,7 @@ mcp-session-id: $SESSION
 - [ ] `structuredContent.query == "test query"`
 - [ ] `structuredContent.top_k == 5`
 
-### 1.2 get_node (不存在的 ID)
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 11,
-  "method": "tools/call",
-  "params": {
-    "name": "get_node",
-    "arguments": { "node_id": "nonexistent-node-id" }
-  }
-}
-```
-
-**检查点**:
-- [ ] 返回错误码 `NODE_NOT_FOUND` (JSON-RPC error 或 structuredContent 中体现)
-
-### 1.3 tools/call 未知工具
+### 1.2 tools/call 未知工具
 
 ```json
 {
@@ -197,9 +180,9 @@ mcp-session-id: $SESSION
 
 ## Phase 2: Write — Sampling 写入验证
 
-> 目标: 验证 decide + integrate 两步写入流程。需要 SSE 流 + 手动 sampling 回复。
+> 目标: 验证 write_memory 写入流程。需要 SSE 流 + 手动 sampling 回复。
 
-### 2.1 decide_memory_write — 空库创建决策
+### 2.1 write_memory — 空库创建决策
 
 **发送** (带 `Accept: text/event-stream`):
 
@@ -209,7 +192,7 @@ mcp-session-id: $SESSION
   "id": 20,
   "method": "tools/call",
   "params": {
-    "name": "decide_memory_write",
+    "name": "write_memory",
     "arguments": {
       "title": "Python asyncio patterns",
       "content": "Use asyncio.gather for concurrent coroutines.",
@@ -244,43 +227,16 @@ mcp-session-id: $SESSION
 
 **检查点**:
 - [ ] SSE 流最终推送工具结果
+- [ ] `execution.executed == true`
 - [ ] `decision.action == "create"`
 - [ ] `decision.confidence == 0.95`
 - [ ] `evidence.candidates` 为空
-- [ ] **没有执行写入**（decide 只返回决策，不落盘）
-
-### 2.2 integrate_memory_with_sampling — 创建节点
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 21,
-  "method": "tools/call",
-  "params": {
-    "name": "integrate_memory_with_sampling",
-    "arguments": {
-      "title": "Python asyncio patterns",
-      "content": "Use asyncio.gather for concurrent coroutines.",
-      "type": "persistent",
-      "sensitivity": "internal",
-      "require_confident_decision": false
-    }
-  }
-}
-```
-
-SSE → 收到 sampling 请求 → 回送同样的 create 决策
-
-**检查点**:
-- [ ] `execution.executed == true`
-- [ ] `execution.result.action == "create"`
 - [ ] `execution.result.node` 包含有效 `node_id`, `title`, `file_path`
 - [ ] 文件已写入 `memory_root/nodes/` 目录
-- [ ] `execution.fallback_applied == false`
 
 → **记下返回的 `node_id`**，后续步骤需要。
 
-### 2.3 search_memory — 验证写入可检索
+### 2.2 search_memory — 验证写入可检索
 
 ```json
 {
@@ -296,32 +252,13 @@ SSE → 收到 sampling 请求 → 回送同样的 create 决策
 
 **检查点**:
 - [ ] `results` 非空
-- [ ] 包含 Phase 2.2 写入的节点
+- [ ] 包含 Phase 2.1 写入的节点
+- [ ] 每条 result 包含完整 `node` 对象（含 `content`, `links`, `metadata`）
 - [ ] `score > 0`
 
-### 2.4 get_node — 验证节点详情
+### 2.3 write_memory — supersede 决策
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 23,
-  "method": "tools/call",
-  "params": {
-    "name": "get_node",
-    "arguments": { "node_id": "<2.2 返回的 node_id>" }
-  }
-}
-```
-
-**检查点**:
-- [ ] `title == "Python asyncio patterns"`
-- [ ] `content` 包含 "asyncio.gather"
-- [ ] `metadata.type == "persistent"`
-- [ ] `metadata.status == "active"`
-
-### 2.5 integrate — supersede 决策
-
-先创建第二个节点（重复 2.2 流程，内容稍有不同）：
+先创建第二个节点（重复 2.1 流程，内容稍有不同）：
 
 ```json
 {
@@ -329,7 +266,7 @@ SSE → 收到 sampling 请求 → 回送同样的 create 决策
   "id": 24,
   "method": "tools/call",
   "params": {
-    "name": "integrate_memory_with_sampling",
+    "name": "write_memory",
     "arguments": {
       "title": "Python asyncio best practices",
       "content": "Prefer asyncio.TaskGroup over asyncio.gather for structured concurrency.",
@@ -344,7 +281,7 @@ SSE → 收到 sampling 请求 → 回送同样的 create 决策
 
 ```json
 {
-  "text": "{\"action\":\"supersede\",\"target_node_ids\":[\"<2.2 的 node_id>\"],\"reasoning\":\"Updated best practice replaces old pattern\",\"confidence\":0.9}"
+  "text": "{\"action\":\"supersede\",\"target_node_ids\":[\"<2.1 的 node_id>\"],\"reasoning\":\"Updated best practice replaces old pattern\",\"confidence\":0.9}"
 }
 ```
 
@@ -353,9 +290,9 @@ SSE → 收到 sampling 请求 → 回送同样的 create 决策
 - [ ] `execution.result.target_node_ids` 包含被取代的 node_id
 - [ ] 旧节点 status 变为 `superseded`
 - [ ] 新节点创建成功，status 为 `active`
-- [ ] `get_node` 查旧节点，确认 `metadata.status == "superseded"` 且 `superseded_by` 指向新节点
+- [ ] `search_memory` 查旧节点标题，确认 result 中 `node.metadata.status == "superseded"` 且 `node.metadata.superseded_by` 指向新节点
 
-### 2.6 integrate — complement 决策
+### 2.4 write_memory — complement 决策
 
 ```json
 {
@@ -363,7 +300,7 @@ SSE → 收到 sampling 请求 → 回送同样的 create 决策
   "id": 26,
   "method": "tools/call",
   "params": {
-    "name": "integrate_memory_with_sampling",
+    "name": "write_memory",
     "arguments": {
       "title": "Python asyncio error handling",
       "content": "Always wrap TaskGroup bodies in try/except to handle per-task errors.",
@@ -378,7 +315,7 @@ Sampling 回复选择 **complement**：
 
 ```json
 {
-  "text": "{\"action\":\"complement\",\"target_node_ids\":[\"<2.5 的新 node_id>\"],\"reasoning\":\"Error handling supplements the best practices node\",\"confidence\":0.85}"
+  "text": "{\"action\":\"complement\",\"target_node_ids\":[\"<2.3 的新 node_id>\"],\"reasoning\":\"Error handling supplements the best practices node\",\"confidence\":0.85}"
 }
 ```
 
@@ -387,7 +324,7 @@ Sampling 回复选择 **complement**：
 - [ ] 新节点和目标节点之间建立了 wiki-link
 - [ ] 两个节点都保持 `active`
 
-### 2.7 低置信度 + fallback 行为
+### 2.5 低置信度 fallback 行为
 
 ```json
 {
@@ -395,13 +332,11 @@ Sampling 回复选择 **complement**：
   "id": 27,
   "method": "tools/call",
   "params": {
-    "name": "integrate_memory_with_sampling",
+    "name": "write_memory",
     "arguments": {
       "title": "Edge case note",
       "content": "Something ambiguous",
-      "require_confident_decision": true,
-      "confidence_threshold": 0.8,
-      "allow_default_create_fallback": true
+      "confidence_threshold": 0.8
     }
   }
 }
@@ -419,32 +354,6 @@ Sampling 回复给出 **低置信度**：
 - [ ] `execution.fallback_applied == true`
 - [ ] 实际执行的是 `create`（安全降级）
 - [ ] 节点仍然被成功创建
-
-### 2.8 低置信度 + 无 fallback → 拒绝
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 28,
-  "method": "tools/call",
-  "params": {
-    "name": "integrate_memory_with_sampling",
-    "arguments": {
-      "title": "Another ambiguous note",
-      "content": "...",
-      "require_confident_decision": true,
-      "confidence_threshold": 0.8,
-      "allow_default_create_fallback": false
-    }
-  }
-}
-```
-
-Sampling 回复同样低置信度 (confidence: 0.3)
-
-**检查点**:
-- [ ] 返回错误码 `LOW_CONFIDENCE_DECISION`
-- [ ] **没有节点被创建**
 
 ---
 
@@ -577,7 +486,7 @@ prompt 中列出 disputed 节点对及其完整内容。
 **检查点 — Link Weaving 执行**:
 
 - [ ] `links_added` 数组反映了 sampling 回复中 `link: true` 的所有对
-- [ ] 用 `get_node` 检查双向 link:
+- [ ] 用 `search_memory` 检查双向 link:
   - Node A 的 content 包含 `[[node-b-id]]`
   - Node B 的 content 包含 `[[node-a-id]]`
 
@@ -678,10 +587,10 @@ curl -N http://127.0.0.1:8765/mcp \
   -H "mcp-session-id: $SESSION" \
   -H "Accept: text/event-stream"
 
-# decide_memory_write (通过 SSE)
+# write_memory (通过 SSE)
 curl -s http://127.0.0.1:8765/mcp \
   -H "Content-Type: application/json" \
   -H "mcp-session-id: $SESSION" \
   -H "Accept: text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"decide_memory_write","arguments":{"title":"Test note","content":"Some content"}}}'
+  -d '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"write_memory","arguments":{"title":"Test note","content":"Some content"}}}'
 ```

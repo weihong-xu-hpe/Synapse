@@ -57,7 +57,7 @@ All records get one word limit: 3500 words. The `tier` field is removed from fro
 | `synapse/lifecycle/janitor.py` | Single `find_orphan_candidates(janitor_days)` call instead of per-tier. |
 | `synapse/lifecycle/condensation.py` | Remove tier references in condensation draft creation. Default tier for synthesized nodes no longer needed. |
 | `synapse/server/schemas.py` | Remove `tier` from all request models. Remove `NodeTier` import. Remove `target_tier` field from `CondenseMemoryClusterRequest`. |
-| `synapse/server/service.py` | Remove tier normalization from `integrate_knowledge`, `decide_memory_write`, etc. |
+| `synapse/server/service.py` | Remove tier normalization from `integrate_knowledge`, `write_memory`, etc. |
 | `synapse/server/sampling.py` | Remove tier from `MemoryWriteSamplingRequest`, prompt builders. |
 | `synapse/server/mcp.py` | Update tool input schemas (tier param removal). |
 | All test files | Update factories, assertions, config fixtures. |
@@ -158,13 +158,11 @@ After Phases 1-3, the final MCP tool set:
 
 | Tool | Sampling | Purpose |
 |------|:---:|--------|
-| `search_memory` | no | Read: semantic search |
-| `get_node` | no | Read: exact lookup |
-| `decide_memory_write` | yes | Write: get decision without executing |
-| `integrate_memory_with_sampling` | yes | Write: decide + execute |
+| `search_memory` | no | Read: semantic search (includes full node lookup) |
+| `write_memory` | yes | Write: decide + execute |
 | `run_dreamer` | yes | Lifecycle: full sleep-cycle pipeline |
 
-5 tools. Read / Write / Lifecycle each has a clear entry point.
+3 tools. Read / Write / Lifecycle each has a clear entry point.
 
 **Also remove:**
 - `ArchiveCondensationService.run()` as a standalone entry point — its condenser utility folds into Dreamer's Stage 5.

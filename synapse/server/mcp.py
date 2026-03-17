@@ -12,11 +12,9 @@ from pydantic import BaseModel, ValidationError
 from synapse import __version__
 from synapse.server.sampling import SamplingClient
 from synapse.server.schemas import (
-    DecideMemoryWriteRequest,
-    GetNodeToolRequest,
-    IntegrateMemoryWithSamplingRequest,
     RunDreamerRequest,
     SearchMemoryToolRequest,
+    WriteMemoryRequest,
 )
 from synapse.server.service import SynapseServerService, SynapseServiceError
 
@@ -26,8 +24,7 @@ _DEFAULT_PROTOCOL_VERSION = _SUPPORTED_PROTOCOL_VERSIONS[0]
 _HIGH_LEVEL_SAMPLING_REQUIREMENT_NOTE = " Requires a sampling-capable MCP host/client."
 _SAMPLING_TOOL_NAMES = frozenset(
     {
-        "decide_memory_write",
-        "integrate_memory_with_sampling",
+        "write_memory",
         "run_dreamer",
     }
 )
@@ -112,24 +109,14 @@ class SynapseMCPServer:
                     handler=self.service.search_memory,
                 ),
                 MCPToolDefinition(
-                    name="decide_memory_write",
-                    description=(
-                        "Use host-side sampling to decide how a draft should be written. "
-                        "Returns a structured decision and evidence without executing the write."
-                        + _HIGH_LEVEL_SAMPLING_REQUIREMENT_NOTE
-                    ),
-                    input_model=DecideMemoryWriteRequest,
-                    handler=self.service.decide_memory_write,
-                ),
-                MCPToolDefinition(
-                    name="integrate_memory_with_sampling",
+                    name="write_memory",
                     description=(
                         "Use host-side sampling to decide and execute a write through Synapse's internal canonical "
                         "execution layer."
                         + _HIGH_LEVEL_SAMPLING_REQUIREMENT_NOTE
                     ),
-                    input_model=IntegrateMemoryWithSamplingRequest,
-                    handler=self.service.integrate_memory_with_sampling,
+                    input_model=WriteMemoryRequest,
+                    handler=self.service.write_memory,
                 ),
                 MCPToolDefinition(
                     name="run_dreamer",
@@ -142,12 +129,7 @@ class SynapseMCPServer:
                     input_model=RunDreamerRequest,
                     handler=self.service.run_dreamer,
                 ),
-                MCPToolDefinition(
-                    name="get_node",
-                    description="Retrieve a specific node by ID.",
-                    input_model=GetNodeToolRequest,
-                    handler=self.service.get_node,
-                ),
+
             )
         }
 

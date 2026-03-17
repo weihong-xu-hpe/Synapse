@@ -49,7 +49,7 @@ Synapse now centers the public interface on **one MCP-native workflow**.
 
 Agents interact with Synapse through:
 
-- retrieval and inspection tools such as `search_memory` and `get_node`
+- retrieval and inspection tools such as `search_memory`
 - high-level sampling-backed write and lifecycle tools
 - a server-internal canonical execution layer that Synapse uses behind the scenes after a decision has been validated
 
@@ -61,12 +61,10 @@ In other words, the calling agent no longer chooses between multiple public orch
 
 ## Default public MCP tool surface
 
-By default, Synapse exposes five high-level MCP tools:
+By default, Synapse exposes three high-level MCP tools:
 
-- `search_memory` — hybrid retrieval over active memory
-- `get_node` — fetch a single node by ID
-- `decide_memory_write` — sampling-backed write decision
-- `integrate_memory_with_sampling` — full sampling-backed write + execution
+- `search_memory` — hybrid retrieval over active memory (returns full node objects)
+- `write_memory` — sampling-backed write decision + execution
 - `run_dreamer` — lifecycle maintenance (stale cleanup, superseded archival, disputed review, missing link suggestions, archive condensation)
 
 Lower-level execution primitives exist internally but are not part of the public agent contract.
@@ -95,13 +93,13 @@ Minimal setup:
 1. configure Synapse normally in `config.toml`
 2. start Synapse with `python -m synapse serve --run-server`
 3. connect from an MCP client that advertises `sampling`
-4. call high-level tools such as `integrate_memory_with_sampling` or `decide_memory_write`
+4. call high-level tools such as `write_memory`
 
 ## End-to-end flow when using MCP sampling
 
 ```mermaid
 flowchart TD
-  A[Agent decides to use high-level MCP tool] --> B[Call MCP tool\ndecide_memory_write / integrate_memory_with_sampling / run_dreamer]
+  A[Agent decides to use high-level MCP tool] --> B[Call MCP tool\nwrite_memory / run_dreamer]
   B --> C{Synapse MCP server\nSampling-capable client negotiated?}
   C -- No --> C1[Return SAMPLING_UNAVAILABLE]
   C -- Yes --> D[Service layer builds deterministic context\nunified candidate retrieval / node loading / validation]

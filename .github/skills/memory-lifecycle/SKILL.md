@@ -41,9 +41,8 @@ Before acting, consult:
 
 4. **Reuse the standard write contract**
    - Any new lifecycle-generated node must still go through:
-     - `search_existing_nodes`
-     - `get_node` as needed
-     - `integrate_knowledge`
+     - `search_memory` (returns full node objects)
+     - `write_memory`
    - Use the same `create` / `supersede` / `complement` rules as ordinary writes.
 
 5. **Handle status correction sparingly**

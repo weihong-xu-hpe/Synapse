@@ -30,12 +30,9 @@ Refine or re-run the search if:
 ## Relationship to write flows
 
 - Use `search_memory` for reading context.
-- Use `search_existing_nodes` for write-time overlap and conflict checks.
+- Use `search_memory` for write-time overlap and conflict checks.
 - For lifecycle work, use `search_memory` to orient around a theme, then use normal write-time checks before creating any new node.
 
-## When to fetch a full node
+## Full node data in search results
 
-Use `get_node` when:
-- a high-similarity candidate might be superseded
-- a candidate may be complementary but the snippet is insufficient
-- lifecycle work requires reading the full node before summarizing or re-expressing it
+`search_memory` returns full node objects (content, links, metadata) in each result. No separate fetch step is needed.

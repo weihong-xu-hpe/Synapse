@@ -8,7 +8,7 @@
 
 ### 当前进度（2026-03-16）
 
-- ✅ **Phase A 已完成**：active docs 已明确 skill 保留但不是正式入口，正式 public surface 只剩 sampling 高层工具 + `search_memory` / `get_node`
+- ✅ **Phase A 已完成**：active docs 已明确 skill 保留但不是正式入口，正式 public surface 只剩 `search_memory` / `write_memory` / `run_dreamer`
 - ✅ **Phase B 已完成**：读取检索与高层写前候选检索已统一到同一内部候选原语，`query_hint` 改为增强式联合召回
 - ✅ **Phase C 已完成**：public MCP surface 不再暴露低层 canonical tools，运行时默认 guidance 已收口到高层工具
 - 🔄 **Phase D 进行中**：回归验证已通过，历史兼容材料已改为 retired 说明；真实 host compatibility 证据仍需持续补充
@@ -21,7 +21,7 @@
 
 - Streamable MCP session 可建立
 - sampling request / response loop 可闭环
-- `integrate_memory_with_sampling` / `review_memory_cluster` / `condense_memory_cluster` / `promote_memory_candidate` 可执行
+- `write_memory` / `run_dreamer` 可执行
 - `create`、`complement`、lifecycle `execute_safe_actions` 已经在受控验证中跑通
 
 但系统仍然存在两个不该继续拖着的分叉：
@@ -44,12 +44,8 @@
 对外正式入口只保留：
 
 - `search_memory`
-- `get_node`
-- `decide_memory_write`
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `condense_memory_cluster`
-- `promote_memory_candidate`
+- `write_memory`
+- `run_dreamer`
 
 ### 2.2 skill 文件先保留，但不再作为执行主线
 
@@ -110,7 +106,7 @@
 
 高层写入候选路径：
 
-- `decide_memory_write` / `integrate_memory_with_sampling`
+- `write_memory`
 - `build_memory_write_query(...)`
 - `_search_existing_nodes_payload(...)`
 
@@ -177,8 +173,7 @@
 
 以下工具必须改为复用统一候选检索核心：
 
-- `decide_memory_write`
-- `integrate_memory_with_sampling`
+- `write_memory`
 
 ### 新要求
 
@@ -355,7 +350,7 @@ active docs 必须明确：
 
 1. ✅ 提取统一候选检索原语
 2. ✅ `search_memory` 复用该原语
-3. ✅ `decide_memory_write` / `integrate_memory_with_sampling` 复用该原语
+3. ✅ `write_memory` 复用该原语
 4. ✅ `query_hint` 改为增强式联合召回
 
 ## Phase C — 收口执行面

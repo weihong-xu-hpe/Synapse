@@ -48,6 +48,6 @@ When lifecycle work produces a new node:
 1. draft the summary or promoted node
 2. run normal overlap checks
 3. choose `create`, `supersede`, or `complement`
-4. call `integrate_knowledge`
+4. call `write_memory`
 
 If the safest outcome is no semantic rewrite, keep history intact and recommend no-op or manual review.

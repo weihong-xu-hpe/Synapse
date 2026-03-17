@@ -81,11 +81,9 @@ log_dir = "./.synapse/.logs"
 
 Synapse's public interface is centered on high-level MCP tools such as:
 
-- `decide_memory_write`
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `condense_memory_cluster`
-- `promote_memory_candidate`
+- `search_memory`
+- `write_memory`
+- `run_dreamer`
 
 This high-level set is the default public exposure profile.
 
@@ -211,7 +209,7 @@ Recommended pattern:
 
 1. start Synapse with `python -m synapse serve --run-server`
 2. let the MCP client negotiate `sampling`
-3. call high-level tools such as `integrate_memory_with_sampling` or `review_memory_cluster`
+3. call high-level tools such as `write_memory`
 
 This is the best fit when you want a thin agent layer and faster host-mediated semantic decisions.
 

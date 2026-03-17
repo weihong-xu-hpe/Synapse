@@ -148,11 +148,8 @@
 
 ### 需要接通的高层工具
 
-- `decide_memory_write`
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `condense_memory_cluster`
-- `promote_memory_candidate`
+- `write_memory`
+- `run_dreamer`
 
 ### 工作内容
 

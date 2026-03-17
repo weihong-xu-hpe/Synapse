@@ -107,11 +107,9 @@ def test_streamable_orchestrator_lists_public_tools(tmp_path: Path) -> None:
 
     names = [tool["name"] for tool in orchestrator.list_tools()]
     assert names == [
-        "decide_memory_write",
-        "get_node",
-        "integrate_memory_with_sampling",
         "run_dreamer",
         "search_memory",
+        "write_memory",
     ]
 
 
@@ -139,7 +137,7 @@ def test_streamable_orchestrator_returns_sampling_unavailable_error_without_host
 
     result = orchestrator.invoke_tool(
         session,
-        "decide_memory_write",
+        "write_memory",
         {
             "title": "Gateway Design",
             "content": "Rate limiting complements the gateway design.",

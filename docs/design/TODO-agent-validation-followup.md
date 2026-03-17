@@ -30,7 +30,7 @@
 
 ## 2.1 已确认成立的点
 
-- `integrate_memory_with_sampling` 能完成 sampling → canonical write 的闭环
+- `write_memory` 能完成 sampling → canonical write 的闭环
 - `create` / `complement` / `supersede` 已真实落盘
 - SQLite `nodes` / `nodes_fts` / `nodes_vec` / `edges` 已反映写入结果
 - confidence threshold 会阻止低置信度决策直接执行
@@ -73,7 +73,7 @@
 
 ### 验收标准
 
-- `search_memory`、`integrate_memory_with_sampling`、`review_memory_cluster`、`condense_memory_cluster`、`promote_memory_candidate` 的结果能被标准 MCP host 正常看见
+- `search_memory`、`write_memory`、`run_dreamer` 的结果能被标准 MCP host 正常看见
 - 不再依赖 `content.type = "json"` 作为唯一结构化返回方式
 - 现有测试迁移到读取 `structuredContent`（必要时兼容 text）
 
@@ -159,10 +159,8 @@ agent 很难区分：
 ### 至少覆盖
 
 - `search_memory`
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `condense_memory_cluster`
-- `promote_memory_candidate`
+- `write_memory`
+- `run_dreamer`
 
 ### 验收标准
 
@@ -179,10 +177,9 @@ agent 很难区分：
 
 ### 至少覆盖
 
-- `review_memory_cluster(plan_only)`
-- `condense_memory_cluster(execute_safe_actions)` with `no_op`
-- `promote_memory_candidate(execute_safe_actions)` with `keep_as_note`
-- `recommend_manual_review`
+- `run_dreamer` triage with empty candidates (no-op)
+- `run_dreamer` triage producing skip/keep decisions
+- `run_dreamer` conflict resolution with no disputed nodes (no-op)
 
 ### 验收标准
 

@@ -30,7 +30,7 @@ Synapse 应当收敛为**单线架构**：
 
 当前已经完成并确认的收口动作：
 
-- public MCP surface 已收口到 `search_memory`、`get_node` 与五个 sampling 高层工具
+- public MCP surface 已收口到 3 个工具：`search_memory`、`write_memory`、`run_dreamer`
 - `integrate_knowledge`、`search_existing_nodes`、`update_node_status` 已退回 internal-only 角色
 - 仓库中的 `memory-write` / `memory-lifecycle` skill 文件被保留为 policy/reference 资产，而非正式执行入口
 - 高层写入候选检索已与读取侧候选检索统一到同一内部候选原语
@@ -179,15 +179,11 @@ Synapse 的对外接口设计必须默认围绕 sampling 进行，而不是把 s
 
 这是 agent-facing 的真正工具表面。
 
-建议正式对外暴露：
+正式对外暴露：
 
 - `search_memory`
-- `get_node`
-- `decide_memory_write`
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `condense_memory_cluster`
-- `promote_memory_candidate`
+- `write_memory`
+- `run_dreamer`
 
 职责：
 
@@ -340,12 +336,8 @@ stdio 会让系统一直背着一个与远程目标不一致的 transport 心智
 ### 8.1 正式 public surface
 
 - `search_memory`
-- `get_node`
-- `decide_memory_write`
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `condense_memory_cluster`
-- `promote_memory_candidate`
+- `write_memory`
+- `run_dreamer`
 
 ### 8.2 internal-only execution helpers
 
@@ -419,10 +411,8 @@ stdio 会让系统一直背着一个与远程目标不一致的 transport 心智
 
 至少要跑通：
 
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `promote_memory_candidate`
-- `condense_memory_cluster`
+- `write_memory`
+- `run_dreamer`
 
 ## 10.4 failure semantics 成立
 

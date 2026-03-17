@@ -1,6 +1,6 @@
 ---
 name: memory-write
-description: "Use when deciding whether to store new information in Synapse, choosing note vs memory, checking overlap with existing nodes, and deciding create/supersede/complement before calling integrate_knowledge. Trigger phrases: remember this, save this, store this in memory, write this to Synapse, update this memory, supersede old memory."
+description: "Use when deciding whether to store new information in Synapse, choosing note vs memory, checking overlap with existing nodes, and deciding create/supersede/complement before calling write_memory. Trigger phrases: remember this, save this, store this in memory, write this to Synapse, update this memory, supersede old memory."
 ---
 
 # Memory Write
@@ -33,8 +33,8 @@ Before deciding a write, consult:
 
 3. **Check for overlap before writing**
    - Summarize the draft into a compact semantic query.
-   - Call `search_existing_nodes(query=..., similarity_threshold=0.0)`.
-   - Fetch full node content with `get_node` only for high-similarity, high-risk candidates.
+   - Call `search_memory(query=...)` — results include full node content, links, and metadata.
+   - Review high-similarity candidates directly from the results.
 
 4. **Choose the write action**
    - Use [Write Decision Matrix](./references/write-decision-matrix.md).
@@ -42,7 +42,7 @@ Before deciding a write, consult:
    - If uncertain, prefer `create`.
 
 5. **Execute the write**
-   - Call `integrate_knowledge` with:
+   - Call `write_memory` with:
      - `title`
      - `content`
      - `tier`

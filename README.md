@@ -45,8 +45,8 @@ Synapse is being simplified around **one public integration path**:
 
 In practice, this means agents should treat Synapse as an MCP-native memory system:
 
-- use `search_memory` and `get_node` for retrieval and inspection
-- use high-level tools such as `decide_memory_write`, `integrate_memory_with_sampling`, and `run_dreamer`
+- use `search_memory` for retrieval and inspection
+- use high-level tools such as `write_memory` and `run_dreamer`
 - rely on the connected MCP host/client to negotiate sampling when semantic decisions are needed
 - let Synapse assemble evidence, validate structured decisions, and execute internal write semantics on the server side
 

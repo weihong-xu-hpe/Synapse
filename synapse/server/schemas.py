@@ -36,7 +36,7 @@ class IntegrateKnowledgeRequest(BaseModel):
     reasoning: str = ""
 
 
-class DecideMemoryWriteRequest(BaseModel):
+class WriteMemoryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1)
@@ -46,11 +46,6 @@ class DecideMemoryWriteRequest(BaseModel):
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
     query_hint: str | None = None
     similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-
-
-class IntegrateMemoryWithSamplingRequest(DecideMemoryWriteRequest):
-    allow_default_create_fallback: bool = False
-    require_confident_decision: bool = False
     confidence_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
 
 

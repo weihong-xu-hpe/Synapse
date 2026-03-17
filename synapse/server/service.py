@@ -254,7 +254,7 @@ class SynapseServerService:
         )
         return payload
 
-    def decide_memory_write(
+    def write_memory(
         self,
         title: str,
         content: str,
@@ -263,41 +263,6 @@ class SynapseServerService:
         sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
         query_hint: str | None = None,
         similarity_threshold: float = 0.5,
-    ) -> dict[str, Any]:
-        payload = self._decide_memory_write_payload(
-            title=title,
-            content=content,
-            node_type=node_type,
-            links=links,
-            sensitivity=sensitivity,
-            query_hint=query_hint,
-            similarity_threshold=similarity_threshold,
-        )
-        self._log_tool_call(
-            "decide_memory_write",
-            {
-                "title": title.strip(),
-                "node_type": str(node_type),
-                "links": links or [],
-                "sensitivity": str(sensitivity),
-                "query_hint": query_hint,
-                "similarity_threshold": similarity_threshold,
-            },
-            payload,
-        )
-        return payload
-
-    def integrate_memory_with_sampling(
-        self,
-        title: str,
-        content: str,
-        node_type: NodeType | str = NodeType.TRANSIENT,
-        links: list[str] | None = None,
-        sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
-        query_hint: str | None = None,
-        similarity_threshold: float = 0.5,
-        allow_default_create_fallback: bool = False,
-        require_confident_decision: bool = False,
         confidence_threshold: float = _DEFAULT_CONFIDENCE_THRESHOLD,
     ) -> dict[str, Any]:
         payload = self._decide_memory_write_payload(
@@ -313,19 +278,7 @@ class SynapseServerService:
         decision_payload = payload["decision"].copy()
         confidence = decision_payload.get("confidence")
         fallback_applied = False
-        if require_confident_decision and (
-            confidence is None or float(confidence) < float(confidence_threshold)
-        ):
-            if not allow_default_create_fallback:
-                raise SynapseServiceError(
-                    "LOW_CONFIDENCE_DECISION",
-                    "Sampling produced a decision that did not meet the required confidence threshold",
-                    status_code=409,
-                    details={
-                        "decision": decision_payload,
-                        "confidence_threshold": confidence_threshold,
-                    },
-                )
+        if confidence is None or float(confidence) < float(confidence_threshold):
             fallback_applied = True
             decision_payload = {
                 "action": IntegrateAction.CREATE.value,
@@ -371,7 +324,7 @@ class SynapseServerService:
             },
         }
         self._log_tool_call(
-            "integrate_memory_with_sampling",
+            "write_memory",
             {
                 "title": title.strip(),
                 "node_type": str(node_type),
@@ -379,8 +332,6 @@ class SynapseServerService:
                 "sensitivity": str(sensitivity),
                 "query_hint": query_hint,
                 "similarity_threshold": similarity_threshold,
-                "allow_default_create_fallback": allow_default_create_fallback,
-                "require_confident_decision": require_confident_decision,
                 "confidence_threshold": confidence_threshold,
             },
             result,
@@ -908,7 +859,7 @@ class SynapseServerService:
             "file_path": item.node.file_path.as_posix(),
             "status": item.node.metadata.status.value,
             "markers": list(item.markers),
-            "snippet": item.context_text,
+            "node": self._serialize_node(item.node),
         }
 
     def _serialize_existing_match(

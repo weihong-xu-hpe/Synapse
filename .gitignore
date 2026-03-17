@@ -32,3 +32,4 @@ dist/
 # Temp / local
 .tmp/
 agentic-hybrid-memory-architecture-design.md
+docs/design/

@@ -12,8 +12,7 @@ Before writing a new node:
 
 1. Draft `title`, `content`, and `tier`
 2. Produce a compact semantic summary of the draft
-3. Call `search_existing_nodes(query=..., similarity_threshold=0.0)`
-4. Use `get_node` only for candidates that materially affect the decision
+3. Call `search_memory(query=...)` — results include full node content, links, and metadata
 
 ## Action rules
 
