@@ -309,7 +309,13 @@ def _render_source_nodes(nodes: tuple[Node, ...]) -> str:
 def _extract_text_content(content: Any) -> str:
     if isinstance(content, dict):
         if content.get("type") == "text":
-            return str(content.get("text") or "")
+            text = str(content.get("text") or "").strip()
+            if not text:
+                raise ValueError(
+                    "Sampling response returned empty text — "
+                    "the model provider may not support sampling/createMessage"
+                )
+            return text
         raise ValueError("Sampling response content must be text")
 
     if isinstance(content, list):

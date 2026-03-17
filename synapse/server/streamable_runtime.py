@@ -16,6 +16,7 @@ logger = logging.getLogger("synapse.streamable-runtime")
 
 from synapse.server.mcp import MCPSession, SynapseMCPServer
 from synapse.server.sampling import (
+    DEFAULT_FAST_SAMPLING_MODEL_HINTS,
     MemoryWriteSamplingDecision,
     MemoryWriteSamplingRequest,
     SamplingClient,
@@ -189,7 +190,7 @@ class StreamableSamplingClient:
                 "supersede, or complement using only the supplied candidate set."
             ),
             max_tokens=600,
-            model_hints=(),
+            model_hints=DEFAULT_FAST_SAMPLING_MODEL_HINTS,
         )
         result_payload = response.get("result")
         if not isinstance(result_payload, dict):
@@ -203,16 +204,25 @@ class StreamableSamplingClient:
         try:
             return parse_memory_write_sampling_result(result_payload)
         except (KeyError, TypeError, ValueError) as exc:
+            model = result_payload.get("model", "unknown")
             logger.error(
-                "Cannot parse sampling decision: %s — raw result: %s",
+                "Cannot parse sampling decision: %s — model=%s raw result: %s",
                 exc,
+                model,
                 json.dumps(result_payload, default=str)[:2000],
             )
+            error_msg = str(exc)
+            if "empty text" in error_msg:
+                error_msg = (
+                    f"Model '{model}' returned empty text for sampling/createMessage. "
+                    "This model provider may not support MCP sampling. "
+                    "Try a model that supports sampling (e.g. Gemini 3 Flash)."
+                )
             raise SynapseServiceError(
                 "INVALID_SAMPLING_RESPONSE",
-                "Sampling-capable MCP client returned an unreadable memory write decision",
+                error_msg,
                 status_code=502,
-                details={"reason": str(exc), "raw_content_preview": _preview_content(result_payload)},
+                details={"reason": str(exc), "model": model, "raw_content_preview": _preview_content(result_payload)},
             ) from exc
 
     def _request_sampling(
