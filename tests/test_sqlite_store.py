@@ -120,7 +120,6 @@ def test_fts_search_vector_search_edges_and_neighbors(tmp_path: Path) -> None:
 
         assert store.get_edges(alpha.id) == [beta.id, gamma.id]
         assert store.get_edges(beta.id, direction="incoming") == [alpha.id, gamma.id]
-        assert store.get_in_degree(beta.id) == 2
         assert store.get_neighbors([alpha.id], depth=1) == [beta.id, gamma.id]
 
 

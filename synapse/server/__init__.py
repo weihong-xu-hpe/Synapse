@@ -14,7 +14,6 @@ from synapse.server.streamable_runtime import (
 	StreamableSession,
 	StreamableSessionManager,
 	StreamableToolOrchestrator,
-	StreamableTransportRuntime,
 	create_streamable_orchestrator,
 	create_streamable_session_manager,
 )
@@ -31,7 +30,6 @@ __all__ = [
 	"StreamableSession",
 	"StreamableSessionManager",
 	"StreamableToolOrchestrator",
-	"StreamableTransportRuntime",
 	"StreamableRuntime",
 	"create_app",
 	"create_streamable_orchestrator",

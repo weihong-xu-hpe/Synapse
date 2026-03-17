@@ -9,7 +9,7 @@ from queue import Empty, Queue
 from threading import Lock
 from threading import Event
 from time import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 from uuid import uuid4
 
 logger = logging.getLogger("synapse.streamable-runtime")
@@ -492,31 +492,6 @@ class StreamableSessionManager:
     def list_active_sessions(self) -> list[str]:
         with self._lock:
             return sorted(self._sessions)
-
-
-class StreamableTransportRuntime(Protocol):
-    """Protocol for future Streamable transport implementations."""
-
-    def read_message(self) -> dict[str, object]:
-        """Return the next inbound MCP message."""
-        raise NotImplementedError
-
-    def write_message(self, message: dict[str, object]) -> None:
-        """Send an outbound MCP message to the client."""
-        raise NotImplementedError
-
-    def emit_sampling_request(self, session_id: str, request: dict[str, object]) -> int:
-        """Emit a sampling request and return its correlation id."""
-        raise NotImplementedError
-
-    def wait_sampling_response(
-        self,
-        session_id: str,
-        request_id: int,
-        timeout_seconds: float,
-    ) -> dict[str, object]:
-        """Block until the matching sampling response arrives."""
-        raise NotImplementedError
 
 
 class StreamableToolOrchestrator:

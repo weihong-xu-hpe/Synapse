@@ -275,11 +275,6 @@ class SQLiteNodeStore:
             if embedding is not None:
                 self._upsert_embedding(connection, node.id, embedding)
 
-    def upsert(self, node: Node) -> None:
-        """Protocol-friendly alias for inserting or updating a node."""
-
-        self.upsert_node(node)
-
     def upsert_embedding(self, node_id: str, embedding: list[float]) -> None:
         with self.transaction() as connection:
             self._upsert_embedding(connection, node_id, embedding)
@@ -302,11 +297,6 @@ class SQLiteNodeStore:
         if row is None:
             return None
         return self._row_to_node(row)
-
-    def get(self, node_id: str) -> Node | None:
-        """Protocol-friendly alias for fetching a node."""
-
-        return self.get_node(node_id)
 
     def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
         requested_ids = list(dict.fromkeys(node_ids))
@@ -337,13 +327,6 @@ class SQLiteNodeStore:
     def delete_embedding(self, node_id: str) -> None:
         with self.transaction() as connection:
             connection.execute("DELETE FROM nodes_vec WHERE id = ?", (node_id,))
-
-    def delete(self, node_id: str) -> bool:
-        """Protocol-friendly alias for deleting a node."""
-
-        with self.transaction() as connection:
-            cursor = connection.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
-        return cursor.rowcount > 0
 
     def update_access(self, node_ids: list[str]) -> None:
         if not node_ids:
@@ -400,13 +383,6 @@ class SQLiteNodeStore:
             return [str(row["source_id"]) for row in rows]
         raise ValueError("direction must be 'outgoing' or 'incoming'")
 
-    def get_in_degree(self, node_id: str) -> int:
-        row = self._connection.execute(
-            "SELECT COUNT(*) AS count FROM edges WHERE target_id = ?",
-            (node_id,),
-        ).fetchone()
-        return int(row["count"]) if row is not None else 0
-
     def list_nodes(self, filters: dict[str, Any] | None = None) -> list[Node]:
         filters = filters or {}
         clauses: list[str] = []
@@ -422,11 +398,6 @@ class SQLiteNodeStore:
         query += " ORDER BY created_at ASC, id ASC"
         rows = self._connection.execute(query, values).fetchall()
         return [self._row_to_node(row) for row in rows]
-
-    def list(self) -> list[Node]:
-        """Protocol-friendly alias for listing all nodes."""
-
-        return self.list_nodes()
 
     def count_nodes(self) -> int:
         row = self._connection.execute("SELECT COUNT(*) AS count FROM nodes").fetchone()

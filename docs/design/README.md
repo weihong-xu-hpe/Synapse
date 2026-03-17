@@ -1,15 +1,8 @@
 # Synapse Design Docs
 
-本目录现在只保留**当前有效的活跃设计文档**。
+本目录只保留**当前有效的活跃设计文档**。
 
-如果一份文档讨论的是：
-
-- 旧的双线架构
-- REST 公开接口主线
-- stdio transport 主线
-- HTTP/SSE sampling 过渡方案
-
-它应该进入 `archive/`，而不应继续留在 active design 集中。
+已淘汰的文档（旧双线架构、REST 公开接口、HTTP/SSE 过渡方案等）已归档至 `archive/`。
 
 ---
 
@@ -23,7 +16,6 @@
 
 - Synapse 以后是什么系统
 - 为什么只保留 Streamable MCP 一条线
-- 为什么 REST / stdio / legacy SSE 不再保留
 - internal canonical execution layer 在新架构中的位置
 
 ### 2. `streamable-mcp-implementation-plan.md`

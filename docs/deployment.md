@@ -28,16 +28,6 @@ python -m synapse serve --run-server
 
 The CLI no longer exposes transport selection. Synapse starts its single server runtime through the same entrypoint each time.
 
-## stdio proxy for VS Code
-
-VS Code's MCP client may not support sampling over Streamable HTTP. Synapse includes a stdio-to-HTTP proxy:
-
-```bash
-python -m synapse mcp-proxy [--url http://host:port/mcp]
-```
-
-See the [usage guide](usage.md#vs-code-integration-via-stdio-proxy) for VS Code configuration.
-
 ## macOS daemonization
 
 Synapse supports user-level `launchd` integration.

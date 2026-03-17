@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Callable, Iterable
 
 from synapse.config import SynapseConfig
@@ -418,9 +417,9 @@ class Dreamer:
                     }
                 ),
                 content=draft.content,
-                file_path=Path("active") / f"{new_id}.md",
+                file_path=self.runtime_paths.active / f"{new_id}.md",
             )
-            write_node_file(new_node, base_path=self.runtime_paths.base)
+            write_node_file(new_node, base_path=self.runtime_paths.active)
             condensed_results.append(
                 CondensationResult(
                     source_ids=draft.source_node_ids,
@@ -465,7 +464,7 @@ class Dreamer:
                     content=node_a.content.rstrip() + "\n\n" + link_tag_b + "\n",
                     file_path=node_a.file_path,
                 )
-                write_node_file(updated_a, base_path=self.runtime_paths.base)
+                write_node_file(updated_a, base_path=self.runtime_paths.active)
                 a_updated = True
 
             if link_tag_a not in node_b.content:
@@ -474,7 +473,7 @@ class Dreamer:
                     content=node_b.content.rstrip() + "\n\n" + link_tag_a + "\n",
                     file_path=node_b.file_path,
                 )
-                write_node_file(updated_b, base_path=self.runtime_paths.base)
+                write_node_file(updated_b, base_path=self.runtime_paths.active)
                 b_updated = True
 
             if a_updated or b_updated:
@@ -519,14 +518,14 @@ class Dreamer:
         )
         updated = Node(metadata=updated_meta, content=loser.content, file_path=loser.file_path)
         store.upsert_node(updated)
-        write_node_file(updated, base_path=self.runtime_paths.base)
+        write_node_file(updated, base_path=self.runtime_paths.active)
 
     def _clear_disputed(self, node: Node, store: SQLiteNodeStore) -> None:
         """Reset a disputed node back to active."""
         updated_meta = node.metadata.model_copy(update={"status": NodeStatus.ACTIVE})
         updated = Node(metadata=updated_meta, content=node.content, file_path=node.file_path)
         store.upsert_node(updated)
-        write_node_file(updated, base_path=self.runtime_paths.base)
+        write_node_file(updated, base_path=self.runtime_paths.active)
 
     def _archive_superseded(
         self,

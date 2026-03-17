@@ -46,7 +46,7 @@ Synapse is being simplified around **one public integration path**:
 In practice, this means agents should treat Synapse as an MCP-native memory system:
 
 - use `search_memory` and `get_node` for retrieval and inspection
-- use high-level tools such as `decide_memory_write`, `integrate_memory_with_sampling`, `review_memory_cluster`, `condense_memory_cluster`, and `promote_memory_candidate`
+- use high-level tools such as `decide_memory_write`, `integrate_memory_with_sampling`, and `run_dreamer`
 - rely on the connected MCP host/client to negotiate sampling when semantic decisions are needed
 - let Synapse assemble evidence, validate structured decisions, and execute internal write semantics on the server side
 
@@ -61,12 +61,54 @@ See:
 
 ## Repository layout
 
-- `synapse/` — Python package
-- `docs/` — user-facing documentation
-- `docs/design/` — active architecture docs plus archived design history
-- `config.toml` — main runtime configuration
-- `.env` — optional secrets for remote inference providers
-- `.synapse/` — local runtime state
+```
+Synapse/
+├── config.toml                  # runtime configuration
+├── pyproject.toml               # package metadata & dependencies
+├── synapse/                     # main Python package
+│   ├── cli.py                   # Typer CLI (serve, status, rebuild-index, …)
+│   ├── config.py                # configuration model & loader
+│   ├── indexing.py              # full-index rebuild orchestration
+│   ├── interfaces.py            # shared protocols (Embedding, Reranker)
+│   ├── models/
+│   │   └── node.py              # Node / NodeMetadata Pydantic models
+│   ├── embedding/
+│   │   └── engines.py           # embedding & reranker engine implementations
+│   ├── retrieval/
+│   │   └── pipeline.py          # hybrid retrieval pipeline (FTS + vector + rerank)
+│   ├── storage/
+│   │   ├── markdown.py          # Markdown ↔ Node serialization & file I/O
+│   │   └── sqlite.py            # SQLite index store (nodes, edges, vectors, FTS)
+│   ├── sync/
+│   │   └── manager.py           # file-watch ↔ SQLite delta sync
+│   ├── server/
+│   │   ├── app.py               # Streamable HTTP transport (session, SSE)
+│   │   ├── mcp.py               # MCP tool registry & dispatch
+│   │   ├── sampling.py          # sampling/createMessage client
+│   │   ├── schemas.py           # request/response Pydantic schemas
+│   │   ├── service.py           # core service layer (search, write, lifecycle)
+│   │   ├── write_path.py        # canonical write execution (create/supersede/complement)
+│   │   ├── streamable.py        # Starlette app factory & server entrypoint
+│   │   └── streamable_runtime.py # session manager, tool orchestrator
+│   ├── lifecycle/
+│   │   ├── condensation.py      # archive condensation logic
+│   │   └── dreamer.py           # Dreamer lifecycle pipeline
+│   ├── deployment/
+│   │   └── service_manager.py   # launchd / systemd service install
+│   ├── security/
+│   │   └── sanitization.py      # input sanitization
+│   └── utils/
+│       ├── documents.py         # document helpers
+│       ├── logging.py           # structured logging setup
+│       └── runtime.py           # runtime directory bootstrap
+├── tests/                       # pytest test suite
+└── docs/                        # user-facing documentation
+    ├── overview.md              # philosophy & architecture overview
+    ├── configuration.md         # config reference
+    ├── usage.md                 # usage guide
+    ├── deployment.md            # deployment & service management
+    └── design/                  # architecture design docs & archive
+```
 
 ## Quick start
 
@@ -91,7 +133,6 @@ python -m synapse version
 python -m synapse status
 python -m synapse rebuild-index
 python -m synapse serve --run-server
-python -m synapse mcp-proxy          # stdio proxy for VS Code
 pytest
 ```
 
@@ -104,53 +145,30 @@ You will need two model files in GGUF format:
 
 | Role | Model | Endpoint |
 |---|---|---|
-| Embedding | `bge-m3` | `http://127.0.0.1:8080/v1/embeddings` |
-| Reranker | `bge-reranker-v2-m3` | `http://127.0.0.1:8081/v1/rerank` |
+| Embedding | `bge-m3` | `http://127.0.0.1:47860/v1/embeddings` |
+| Reranker | `bge-reranker-v2-m3` | `http://127.0.0.1:47861/v1/rerank` |
 
 Start both servers before running Synapse:
 
 ```bash
 # embedding
 llama-server -m ~/models/bge-m3.gguf \
-  --embeddings --port 8080 --host 127.0.0.1 &
+  --embeddings --port 47860 --host 127.0.0.1 &
 
 # reranker  (--rerank --pooling rank are required)
 llama-server -m ~/models/bge-reranker-v2-m3.gguf \
-  --rerank --pooling rank --port 8081 --host 127.0.0.1 &
+  --rerank --pooling rank --port 47861 --host 127.0.0.1 &
 ```
 
 On macOS you can set them to launch automatically at login by placing launchd plists in `~/Library/LaunchAgents/` and loading them with `launchctl load`.
 
 Synapse talks to both servers as plain HTTP clients. It does not manage the llama-server processes.
 
-### VS Code integration via stdio proxy
-
-VS Code's MCP client does not yet support sampling over Streamable HTTP.
-Synapse ships a lightweight **stdio-to-HTTP proxy** that bridges VS Code's stdio transport to the running Synapse HTTP server, enabling full sampling support.
-
-1. Start the Synapse server: `python -m synapse serve --run-server`
-2. Configure VS Code `mcp.json`:
-
-```json
-{
-  "servers": {
-    "synapse": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "python", "-m", "synapse", "mcp-proxy"],
-      "cwd": "/path/to/Synapse"
-    }
-  }
-}
-```
-
-The proxy reads JSON-RPC from stdin, forwards to `localhost:8765/mcp`, and relays SSE-based `sampling/createMessage` requests back through stdout so VS Code can invoke its model picker.
-
 ## Project status
 
 The implementation plan in `docs/design/` has been completed end to end.
 
-Synapse now includes the full local memory pipeline, interface layer, lifecycle system, service integration, and a stdio proxy for VS Code MCP sampling.
+Synapse now includes the full local memory pipeline, interface layer, lifecycle system, and service integration.
 
 ## Guiding principle
 

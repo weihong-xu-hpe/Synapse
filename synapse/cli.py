@@ -95,10 +95,6 @@ def main_callback(
 ) -> None:
     """Load config, initialize runtime paths, and set up logging before commands run."""
 
-    invoked = ctx.invoked_subcommand
-    if invoked == "mcp-proxy":
-        return
-
     try:
         loaded_config = load_config(config_path=config)
     except (FileNotFoundError, ValidationError) as exc:
@@ -309,39 +305,6 @@ def status(ctx: typer.Context) -> None:
     _echo_service_status(_build_service_manager(state).status())
     for warning in health.warnings:
         typer.echo(f"Warning: {warning}")
-
-
-@app.command("mcp-proxy")
-def mcp_proxy(
-    server: Annotated[
-        str,
-        typer.Argument(
-            help="Server address: full URL, host:port, or just host. Examples: 10.0.1.5:8765, my-server, http://host:9000/mcp",
-        ),
-    ] = "127.0.0.1:8765",
-) -> None:
-    """Run a stdio-to-HTTP proxy for MCP sampling support in VS Code.
-
-    This command works standalone — it does not require config.toml.
-    It only needs the running Synapse HTTP server to be reachable.
-
-    Examples:
-        synapse mcp-proxy                      # localhost:8765
-        synapse mcp-proxy 10.0.1.5:8765        # remote host
-        synapse mcp-proxy my-server            # default port 8765
-        synapse mcp-proxy http://h:9000/mcp    # full URL
-    """
-
-    if server.startswith("http://") or server.startswith("https://"):
-        url = server
-    else:
-        if ":" not in server:
-            server = f"{server}:8765"
-        url = f"http://{server}/mcp"
-
-    from synapse.server.stdio_proxy import run_stdio_proxy
-
-    run_stdio_proxy(server_url=url)
 
 
 @app.command()

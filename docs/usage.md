@@ -17,7 +17,6 @@ python -m synapse version
 python -m synapse status
 python -m synapse rebuild-index
 python -m synapse serve --run-server
-python -m synapse mcp-proxy          # stdio proxy for VS Code
 pytest
 ```
 
@@ -62,19 +61,15 @@ In other words, the calling agent no longer chooses between multiple public orch
 
 ## Default public MCP tool surface
 
-By default, Synapse exposes only the high-level closed-loop MCP tools needed for retrieval, inspection, and high-level write/lifecycle actions:
+By default, Synapse exposes five high-level MCP tools:
 
-- `search_memory`
-- `get_node`
-- `decide_memory_write`
-- `integrate_memory_with_sampling`
-- `review_memory_cluster`
-- `condense_memory_cluster`
-- `promote_memory_candidate`
+- `search_memory` — hybrid retrieval over active memory
+- `get_node` — fetch a single node by ID
+- `decide_memory_write` — sampling-backed write decision
+- `integrate_memory_with_sampling` — full sampling-backed write + execution
+- `run_dreamer` — lifecycle maintenance (stale cleanup, superseded archival, disputed review, missing link suggestions, archive condensation)
 
-Lower-level MCP write helpers such as `integrate_knowledge`, `search_existing_nodes`, and `update_node_status` remain internal by default even though they still exist as implementation-layer capabilities.
-
-Repository skill files such as `memory-write` and `memory-lifecycle` may still exist in the repo, but they are now treated as policy/reference material only. They are not the public runtime path and should not be presented as parallel agent workflows.
+Lower-level execution primitives exist internally but are not part of the public agent contract.
 
 ## Running the MCP surface
 
@@ -102,36 +97,11 @@ Minimal setup:
 3. connect from an MCP client that advertises `sampling`
 4. call high-level tools such as `integrate_memory_with_sampling` or `decide_memory_write`
 
-### VS Code integration via stdio proxy
-
-VS Code's MCP client does not yet support sampling over Streamable HTTP. Synapse provides a **stdio-to-HTTP proxy** that bridges the gap:
-
-```bash
-python -m synapse mcp-proxy [--url http://host:port/mcp]
-```
-
-VS Code `mcp.json` configuration:
-
-```json
-{
-  "servers": {
-    "synapse": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "python", "-m", "synapse", "mcp-proxy"],
-      "cwd": "/path/to/Synapse"
-    }
-  }
-}
-```
-
-The proxy forwards all JSON-RPC messages to the running Synapse HTTP server and relays SSE-based `sampling/createMessage` callbacks through stdout, so VS Code can invoke its model picker for sampling-backed tools.
-
 ## End-to-end flow when using MCP sampling
 
 ```mermaid
 flowchart TD
-  A[Agent decides to use high-level MCP tool] --> B[Call MCP tool\nreview_memory_cluster / condense_memory_cluster / promote_memory_candidate / decide_memory_write / integrate_memory_with_sampling]
+  A[Agent decides to use high-level MCP tool] --> B[Call MCP tool\ndecide_memory_write / integrate_memory_with_sampling / run_dreamer]
   B --> C{Synapse MCP server\nSampling-capable client negotiated?}
   C -- No --> C1[Return SAMPLING_UNAVAILABLE]
   C -- Yes --> D[Service layer builds deterministic context\nunified candidate retrieval / node loading / validation]
@@ -176,28 +146,11 @@ Startup checks plus the server runtime:
 python -m synapse serve --run-server
 ```
 
-## Lifecycle commands
+## Lifecycle
 
-### Run the janitor
+Lifecycle maintenance — stale orphan eviction, superseded archival, disputed review, missing link discovery, and archive condensation — is handled by the `run_dreamer` MCP tool.
 
-```bash
-python -m synapse janitor
-```
-
-This can:
-
-- archive stale orphan nodes
-- archive safely superseded nodes
-- warn about disputed knowledge backlog
-- purge expired archive files
-
-### Run archive condensation
-
-```bash
-python -m synapse condense
-```
-
-This synthesizes recent archive backlog into a new active memory node while preserving original archive notes.
+There are no separate CLI commands for janitor or condensation; invoke `run_dreamer` through an MCP client with sampling support.
 
 ## Service management
 
