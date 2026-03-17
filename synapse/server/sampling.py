@@ -221,9 +221,9 @@ def build_link_weaving_prompt(pairs: tuple[tuple[Node, Node], ...]) -> str:
                 [
                     f"Pair {i}:",
                     f"  Node A: {node_a.id} — {node_a.title}",
-                    f"    Content: {node_a.content[:500]}",
+                    f"    Content: {node_a.content[:3500]}",
                     f"  Node B: {node_b.id} — {node_b.title}",
-                    f"    Content: {node_b.content[:500]}",
+                    f"    Content: {node_b.content[:3500]}",
                 ]
             )
         )

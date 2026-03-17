@@ -107,7 +107,7 @@ class ServiceManager:
         self.config = config
         self.runtime_paths = runtime_paths or get_runtime_paths(config)
         self.platform = self.detect_os(platform_name)
-        self.python_path = Path(python_executable or sys.executable).expanduser().resolve()
+        self.python_path = Path(python_executable or sys.executable).expanduser().absolute()
         self.working_directory = config.project_root.resolve()
         self.config_path = config.config_path.resolve()
         self.home_directory = Path(home_directory or Path.home()).expanduser().resolve()
