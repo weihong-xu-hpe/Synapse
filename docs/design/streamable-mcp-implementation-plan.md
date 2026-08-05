@@ -1,8 +1,9 @@
 # Synapse — Streamable MCP 单线实施拆分
 
 > **文档状态**: 执行计划（持续更新）  
-> **日期**: 2026-03-16  
-> **主文档**: `docs/design/streamable-mcp-single-path-architecture.md`
+> **日期**: 2026-08-05（2026-03-16 初版，本次更新引入本地 LLM 决策层）  
+> **主文档**: `docs/design/streamable-mcp-single-path-architecture.md`  
+> **关联文档**: `TODO-local-llm-upgrade.md`（本地 LLM 升级执行计划）
 
 ---
 
@@ -22,12 +23,14 @@
 
 而不是继续让 fallback 与目标路径并存。
 
-### 1.1 当前进度快照（2026-03-16）
+### 1.1 当前进度快照（2026-08-05）
 
 - Phase 0：已完成，active design docs 已收口为单线架构 + 实施计划 + 执行 TODO
-- Phase 1：对 public surface 与 active guidance 的收口已基本完成；低层工具不再公开暴露
-- Phase 3 的关键依赖项已完成一部分：高层写入候选检索与读取检索已统一，`query_hint` 已改为增强式联合召回
-- 剩余重点是继续清理历史叙事、补齐运行时收尾与真实 host compatibility 记录
+- Phase 1：已完成，public surface 与 active guidance 收口完成，低层工具不再公开暴露
+- Phase 2：已完成，Streamable transport runtime 已建立
+- Phase 3：sampling 闭环已接通，**但系统地位已调整**——本地 LLM 决策（`LocalLLMDecider`）成为默认主路径，sampling 降为可选高级路径。高层写入候选检索与读取检索已统一，`query_hint` 已改为增强式联合召回
+- Phase 4：安全/审计/兼容性验收已完成一部分
+- **新实施周期**：本地 LLM 升级（详见 `TODO-local-llm-upgrade.md`），分 4 个子阶段：门槛 bug 修复（✅已完成）、LocalLLMDecider + 简化 sampling、Dreamer 自动巡逻、OKF 格式约束
 
 ---
 
@@ -140,38 +143,44 @@
 
 ---
 
-## 6. Phase 3 — 接通 sampling 高层工具闭环
+## 6. Phase 3 — 接通决策高层工具闭环
 
 ### 目标
 
 让单线架构真正变成可用系统，而不是只有 transport 壳子。
 
+### 系统地位调整（2026-08-05）
+
+原计划：sampling 闭环为唯一主路径。
+
+当前：公司内部已有 free 的 OpenAI-compatible LLM API，server 自己持有 `LocalLLMDecider` 直接 HTTP 调用。**本地 LLM 决策成为默认主路径，sampling 降为可选高级路径**。详见 `TODO-local-llm-upgrade.md`。
+
 ### 需要接通的高层工具
 
-- `write_memory`
-- `run_dreamer`
+- `write_memory`（默认走 `LocalLLMDecider`）
+- Dreamer（内部调度，不再作为公开工具）
 
 ### 工作内容
 
-1. 将 sampling request / response 生命周期接到 Streamable runtime
-2. 将当前 service 层 sampling 流程迁移到新 transport 抽象
+1. **默认路径**：`LocalLLMDecider` 调用内网 LLM `/chat/completions`，带 fallback endpoint
+2. **可选路径**：sampling request / response 生命周期接到 Streamable runtime（provider 配置切换）
 3. 保留 internal canonical execution layer 作为编译落点
 4. 确保 `decision / evidence / execution` 结构不退化
+5. 简化 sampling 基础设施（不全砍，降为可选高级路径）
 
 ### 要求
 
 - 不允许为“先跑起来”而继续偷偷依赖旧 fallback 路径
 - 不允许通过禁用高层工具来掩盖 transport 未完成
+- 本地 LLM 决策路径与 sampling 路径共用同一套 prompt 和校验逻辑
 
 ### 验收标准
 
 至少要在真实 server 下完整跑通：
 
-- sampling-backed create
-- complement
-- supersede
-- lifecycle plan_only
-- lifecycle execute_safe_actions
+- 本地 LLM 决策的 create / complement / supersede
+- lifecycle plan_only / execute_safe_actions
+- sampling 高级路径（可选，provider=`mcp_sampling` 时）
 
 ---
 
@@ -202,6 +211,8 @@
 
 - 建立 host compatibility matrix
 - 区分 server implemented 与 host verified
+- **本地 LLM 决策路径**：不依赖 host sampling 能力，compatibility 门槛低
+- **sampling 高级路径**：需独立记录 sampling-capable host 的兼容性
 
 ### 验收标准
 
@@ -209,7 +220,7 @@
 
 1. synthetic client 端到端验证
 2. failure matrix 验证
-3. 至少一个真实 host 的兼容性验证
+3. 至少一个真实 host 的兼容性验证（本地 LLM 路径 + sampling 路径分别验证）
 
 ---
 
@@ -302,12 +313,13 @@ transport、sampling、tool orchestration、execution 四层必须解耦。
 单线实施完成时，应满足：
 
 - 对外只有一条正式路径：Streamable MCP
-- sampling 是主路径默认能力，而不是附加特性
+- **本地 LLM 决策为默认路径**，sampling 为可选高级路径（provider 配置切换）
 - REST / stdio / legacy SSE bridge 不再作为正式系统组成部分存在
-- 高层 sampling 工具全部可跑
+- 高层工具全部可跑（`write_memory` 默认走本地 LLM）
 - internal canonical execution layer 仍然稳定可测
 - host compatibility 被真实记录，而不是靠 fallback 掩饰
+- Dreamer 自动巡逻成立（内部调度，不依赖 host 在线）
 
 ---
 
-*文档版本: 2026-03-16*
+*文档版本: 2026-08-05（2026-03-16 初版，本次更新引入本地 LLM 决策层）*

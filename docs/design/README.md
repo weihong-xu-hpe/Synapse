@@ -50,6 +50,20 @@
 - lifecycle 工具在 `no_op` / `keep_as_note` / `recommend_manual_review` 场景下还需要补哪些显式回执
 - 接下来优先修什么，怎样用回归测试把行为钉住
 
+> **2026-08-05 更新**: 本 TODO 主体已完成。决策路径变更后（本地 LLM 为默认），部分验收项需在新语境下复核。
+
+### 5. `TODO-local-llm-upgrade.md`
+
+本地 LLM 升级执行计划（当前活跃）。
+
+回答：
+
+- 为什么把决策层从 sampling 回调切换为本地 LLM（`LocalLLMDecider`）
+- sampling 基础设施如何简化为可选高级路径
+- Dreamer 如何从手动触发改为自动巡逻
+- OKF 格式约束如何落地
+- 4 个子阶段的优先级与依赖关系
+
 ---
 
 ## Archive Policy
@@ -76,7 +90,8 @@
 
 1. `streamable-mcp-single-path-architecture.md`
 2. `streamable-mcp-implementation-plan.md`
-3. `TODO-sampling-only-cutover.md`
-4. `TODO-agent-validation-followup.md`
+3. `TODO-local-llm-upgrade.md`
+4. `TODO-sampling-only-cutover.md`
+5. `TODO-agent-validation-followup.md`
 
-读完这三份，再决定是否需要查看 `archive/` 里的历史材料。
+读完这几份，再决定是否需要查看 `archive/` 里的历史材料。

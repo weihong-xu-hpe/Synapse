@@ -1,9 +1,10 @@
 # Synapse — Streamable MCP 单线架构总设计
 
 > **文档状态**: 当前有效架构  
-> **日期**: 2026-03-16  
-> **适用范围**: Synapse 对外接口、Agent 集成模式、远程 transport、sampling 高层工具  
-> **本文定位**: 当前唯一总设计入口，后续实现与文档整理均以此为准
+> **日期**: 2026-08-05（2026-03-16 初版，本次更新引入本地 LLM 决策层）  
+> **适用范围**: Synapse 对外接口、Agent 集成模式、远程 transport、决策层  
+> **本文定位**: 当前唯一总设计入口，后续实现与文档整理均以此为准  
+> **关联文档**: `TODO-local-llm-upgrade.md`（本地 LLM 升级执行计划）
 
 ---
 
@@ -24,16 +25,18 @@ Synapse 应当收敛为**单线架构**：
 
 一句话总结：
 
-> **Synapse 是一个以 Streamable MCP 为唯一入口、以 sampling 为核心协作模式、以显式执行层为内部地基的单线记忆系统。**
+> **Synapse 是一个以 Streamable MCP 为唯一入口、以本地 LLM 为默认决策层、以显式执行层为内部地基的单线记忆系统。sampling 回调链降级为可选高级路径。**
 
-### 1.1 当前执行状态（2026-03-16）
+### 1.1 当前执行状态（2026-08-05）
 
 当前已经完成并确认的收口动作：
 
-- public MCP surface 已收口到 3 个工具：`search_memory`、`write_memory`、`run_dreamer`
+- public MCP surface 收敛到 2 个工具：`search_memory`、`write_memory`（`run_dreamer` 降为内部调度，见 §8）
 - `integrate_knowledge`、`search_existing_nodes`、`update_node_status` 已退回 internal-only 角色
 - 仓库中的 `memory-write` / `memory-lifecycle` skill 文件被保留为 policy/reference 资产，而非正式执行入口
 - 高层写入候选检索已与读取侧候选检索统一到同一内部候选原语
+- **决策层已从 sampling 回调切换为本地 LLM（`LocalLLMDecider`）**，sampling 回调链降级为可选高级路径（详见 `TODO-local-llm-upgrade.md`）
+- 检索门槛 bug 已修复（reranker 分数不再被 $f(x)=\frac{x}{1+x}$ 压缩）
 
 ---
 
@@ -112,15 +115,18 @@ Synapse 只保留一个正式对外入口：
 
 不再对外维持“REST 主线”“stdio 主线”“SSE sampling 主线”等并行叙事。
 
-## 3.2 sampling 是一等公民，不是附加能力
+## 3.2 决策层默认走本地 LLM，sampling 降为可选高级路径
 
-Synapse 的对外接口设计必须默认围绕 sampling 进行，而不是把 sampling 视为“部分 transport 才有的可选增强”。
+**历史定位（2026-03-16）**：sampling 是一等公民，transport 形态由 sampling 决定。
+
+**当前定位（2026-08-05）**：公司内部已有 free 的 OpenAI-compatible LLM API，server 自己持有 `LocalLLMDecider` 直接 HTTP 调用内网 LLM 做决策。sampling 回调链（server 反向请求 host 做推理）降级为可选高级路径——当用户想用更强的远程模型时仍可启用。
 
 这意味着：
 
-- public surface 的设计要服务于 sampling workflows
-- transport 设计要原生承载 sampling lifecycle
-- host integration 要以 sampling-capable MCP client 为前提
+- 默认决策路径：`write_memory` → `LocalLLMDecider` → 内网 LLM `/chat/completions` → 执行层
+- 可选高级路径：`write_memory` → sampling 回调 host → 执行层（需 sampling-capable host）
+- transport 不再由 sampling 单独决定；Streamable MCP 仍是唯一正式 transport，但理由回归到“会话/能力协商/远程持久服务”本身，而非“只有它能做 sampling”
+- provider 配置化切换（`local_llm` / `mcp_sampling`），详见 `TODO-local-llm-upgrade.md` §2.1
 
 ## 3.3 canonical execution layer 保留，但退居内部地基
 
@@ -175,7 +181,7 @@ Synapse 的对外接口设计必须默认围绕 sampling 进行，而不是把 s
 - 远程 host/client 对接
 - auth / timeout / cancellation / audit 边界
 
-### B. Sampling-Orchestrated Tool Layer
+### B. Decision-Orchestrated Tool Layer
 
 这是 agent-facing 的真正工具表面。
 
@@ -183,14 +189,16 @@ Synapse 的对外接口设计必须默认围绕 sampling 进行，而不是把 s
 
 - `search_memory`
 - `write_memory`
-- `run_dreamer`
 
 职责：
 
 - 组织候选与证据
-- 生成结构化 sampling prompt
-- 校验 host 返回值
+- 生成结构化决策 prompt
+- 调用决策层（默认 `LocalLLMDecider`，可选 sampling 回调）
+- 校验决策返回值
 - 编译为显式低层动作
+
+> **注**：`run_dreamer` 原属此层，现降为内部调度（见 §8）。Dreamer 由进程内定时器自动触发，不再作为公开工具。
 
 ### C. Internal Canonical Execution Layer
 
@@ -337,21 +345,21 @@ stdio 会让系统一直背着一个与远程目标不一致的 transport 心智
 
 - `search_memory`
 - `write_memory`
-- `run_dreamer`
 
 ### 8.2 internal-only execution helpers
 
 - `search_existing_nodes`
 - `integrate_knowledge`
 - `update_node_status`
+- `run_dreamer`（原为公开工具，2026-08-05 降为内部调度；Dreamer 由进程内定时器自动触发，详见 `TODO-local-llm-upgrade.md` Phase 3）
 
 ### 8.3 原则
 
 对外表面必须服务于单线目标：
 
-- 面向 sampling-capable host
 - 面向远程 Streamable MCP session
 - 面向高层 orchestration
+- 决策层默认本地 LLM，不强制要求 host 具备 sampling 能力
 
 而不是继续服务于手工编排或多 transport 并存。
 
@@ -399,20 +407,28 @@ stdio 会让系统一直背着一个与远程目标不一致的 transport 心智
 - client initialized lifecycle
 - request correlation
 
-## 10.2 sampling loop 成立
+## 10.2 本地 LLM 决策路径成立（默认）
 
 必须支持：
+
+- `LocalLLMDecider` 调用内网 LLM `/chat/completions`
+- 结构化 decision / plan 返回与校验
+- fallback 到备用 endpoint
+
+## 10.3 sampling loop 成立（可选高级路径）
+
+当 provider 配置为 `mcp_sampling` 时必须支持：
 
 - server 发 sampling request
 - client 返回结构化 decision / plan
 - server 继续原始调用
 
-## 10.3 高层工具成立
+## 10.4 高层工具成立
 
 至少要跑通：
 
-- `write_memory`
-- `run_dreamer`
+- `write_memory`（默认走本地 LLM）
+- Dreamer 自动巡逻（内部调度，不再作为公开工具验收）
 
 ## 10.4 failure semantics 成立
 
@@ -433,6 +449,8 @@ stdio 会让系统一直背着一个与远程目标不一致的 transport 心智
 - host verified
 
 不允许用文档乐观主义代替真实 compatibility matrix。
+
+> **注**：本地 LLM 决策路径不依赖 host sampling 能力，因此默认路径的 host compatibility 门槛大幅降低。sampling 高级路径的 host compatibility 仍需独立记录。
 
 ---
 
@@ -517,6 +535,15 @@ active 设计文档中不再保留：
 
 而不是反过来。
 
+### 决策 E — 本地 LLM 为默认决策路径，sampling 降为可选高级路径（2026-08-05）
+
+公司内部已有 free 的 OpenAI-compatible LLM API。server 自己持有 `LocalLLMDecider` 直接 HTTP 调用，不再依赖 host 在线做决策。
+
+- 默认决策路径：`LocalLLMDecider` → 内网 LLM
+- 可选高级路径：sampling 回调 host（provider 配置切换）
+- `run_dreamer` 从公开工具降为内部调度，Dreamer 由进程内定时器自动触发
+- 详见 `TODO-local-llm-upgrade.md`
+
 ---
 
 ## 14. 当前结论
@@ -526,12 +553,14 @@ active 设计文档中不再保留：
 1. **单线架构已被采纳并执行**
 2. **REST / stdio / legacy HTTP-SSE sampling 不再具有正式地位**
 3. **internal canonical execution layer 继续作为实现地基保留**
-4. **后续实现与文档统一围绕 Streamable MCP + sampling 展开**
+4. **后续实现与文档统一围绕 Streamable MCP + 本地 LLM 决策展开**
+5. **本地 LLM 为默认决策路径，sampling 降为可选高级路径（2026-08-05）**
+6. **public surface 收敛到 2 个工具（`search_memory` / `write_memory`），`run_dreamer` 降为内部调度**
 
 压缩成一句话：
 
-> **Synapse 不再是“多入口 memory backend”，而是“一个以 Streamable MCP sampling 为唯一正式接口的远程记忆系统”。**
+> **Synapse 是一个以 Streamable MCP 为唯一正式接口、以本地 LLM 为默认决策层、以显式执行层为内部地基的远程记忆系统。sampling 回调链降级为可选高级路径。**
 
 ---
 
-*文档版本: 2026-03-16*
+*文档版本: 2026-08-05（2026-03-16 初版，本次更新引入本地 LLM 决策层）*

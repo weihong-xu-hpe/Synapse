@@ -1,8 +1,10 @@
 # Synapse TODO — Agent 视角验收后的修复跟进
 
-> **文档状态**: 执行 TODO  
-> **日期**: 2026-03-16  
+> **文档状态**: 执行 TODO（主体已完成；决策路径已于 2026-08-05 变更）  
+> **日期**: 2026-03-16（2026-08-05 更新）  
 > **背景**: 基于一次真实 agent 视角的 MCP / sampling 工具验收整理
+>
+> **2026-08-05 更新**: 本 TODO 的 agent 可见性修复在 sampling 主路径下完成。本地 LLM 升级后，默认决策路径变更为 `LocalLLMDecider`，sampling 降为可选高级路径。部分验收项（如 `run_dreamer` 工具结果可见性）需在新语境下复核——`run_dreamer` 已降为内部调度。详见 `TODO-local-llm-upgrade.md`。
 
 ## 1. 这份 TODO 解决什么
 

@@ -1,10 +1,12 @@
 # Synapse TODO — Sampling 单线收口（不修改 skill 文件）
 
-> **文档状态**: 执行 TODO
-> **日期**: 2026-03-16
+> **文档状态**: 执行 TODO（主体已完成；sampling 系统地位已于 2026-08-05 调整）
+> **日期**: 2026-03-16（2026-08-05 更新）
 > **前提**: Streamable MCP + sampling 主路径已经在真实 server / synthetic client 组合下跑通
 > **约束**: `memory-write` / `memory-lifecycle` skill 文件暂时**不修改、不移动、不删除**
 > **目标**: 在不动 skill 文件的前提下，把 Synapse 的正式运行路径彻底收口到 sampling 高层工具，并统一读/写候选检索语义
+>
+> **2026-08-05 更新**: 本 TODO 的 sampling 收口工作已完成。sampling 现降级为可选高级路径，默认决策走 `LocalLLMDecider`（本地 LLM）。public surface 从 3 工具收敛到 2 工具（`run_dreamer` 降为内部调度）。详见 `TODO-local-llm-upgrade.md`。
 
 ### 当前进度（2026-03-16）
 
@@ -45,7 +47,8 @@
 
 - `search_memory`
 - `write_memory`
-- `run_dreamer`
+
+> **2026-08-05 更新**: `run_dreamer` 已降为内部调度（Dreamer 由进程内定时器自动触发），不再作为公开工具。
 
 ### 2.2 skill 文件先保留，但不再作为执行主线
 

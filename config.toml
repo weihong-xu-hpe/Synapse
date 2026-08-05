@@ -53,3 +53,22 @@ custom_patterns = []
 retention_days = 7
 max_file_size_mb = 50
 log_dir = "./.synapse/.logs"
+
+[decider]
+provider = "local_llm"
+# Override base_url / fallback_base_url with your local LLM endpoint.
+# Example: base_url = "http://10.235.33.60:80/v1"
+base_url = "http://localhost:8000/v1"
+model = "deepseek-v4-pro"
+api_key_env = ""
+fallback_base_url = ""
+fallback_model = ""
+fallback_api_key_env = "OPENAI_COMPATIBLE_API_KEY"
+timeout_seconds = 30
+max_tokens = 600
+temperature = 0.1
+
+[dreamer]
+enabled = true
+interval_hours = 12
+batch_size = 8
