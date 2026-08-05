@@ -12,6 +12,7 @@ import httpx
 import uvicorn
 from fastapi.testclient import TestClient
 
+import synapse.server.streamable as streamable_module
 from synapse.config import load_config
 from synapse.server import (
     STREAMABLE_ARCHITECTURE_DOC,
@@ -80,6 +81,9 @@ provider = "builtin"
 model = "bge-reranker-v2-m3"
 max_candidates = 9
 timeout_seconds = 1
+
+[decider]
+provider = "mcp_sampling"
 
 [logging]
 log_dir = "./.synapse/.logs"
@@ -204,6 +208,34 @@ def test_streamable_runtime_factory_creates_native_http_runtime(tmp_path: Path) 
         assert payload["session_header"] == SESSION_HEADER
 
 
+def test_streamable_runtime_lifespan_starts_and_stops_dreamer_scheduler(tmp_path: Path, monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeDreamerScheduler:
+        def __init__(self, config, *, runtime_paths, logger, sampling_client) -> None:
+            events.append("created")
+            self.config = config
+            self.runtime_paths = runtime_paths
+            self.logger = logger
+            self.sampling_client = sampling_client
+
+        def start(self) -> None:
+            events.append("started")
+
+        def stop(self) -> None:
+            events.append("stopped")
+
+    monkeypatch.setattr(streamable_module, "DreamerScheduler", FakeDreamerScheduler)
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    app = create_streamable_app(config, runtime_paths=runtime_paths)
+
+    assert events == ["created"]
+    with TestClient(app):
+        assert events == ["created", "started"]
+    assert events == ["created", "started", "stopped"]
+
+
 def test_run_streamable_server_uses_runtime_factory_and_runner(tmp_path: Path) -> None:
     config = load_config(write_config(tmp_path))
     runtime_paths = bootstrap_runtime_directories(config)
@@ -270,7 +302,6 @@ def test_streamable_http_auth_token_is_enforced_for_mcp_only(tmp_path: Path) -> 
         assert authorized.status_code == 200
         tool_names = {tool["name"] for tool in authorized.json()["result"]["tools"]}
         assert tool_names == {
-            "run_dreamer",
             "search_memory",
             "write_memory",
         }
@@ -374,6 +405,98 @@ def test_search_existing_nodes_reuses_retrieval_candidate_core(tmp_path: Path) -
 
     assert [item["node_id"] for item in search_payload["results"]] == [created_id]
     assert [item["node_id"] for item in existing_payload["matches"]] == [created_id]
+
+
+def test_normalize_candidate_score_does_not_compress_reranker_scores() -> None:
+    """Regression: x/(1+x) mapping collapsed [0,1] -> [0,0.5], filtering nearly all candidates."""
+    normalize = SynapseServerService._normalize_candidate_score
+    # Reranker outputs in [0,1] must pass through unchanged (within rounding).
+    assert normalize(0.0) == 0.0
+    assert normalize(0.3) == 0.3
+    assert normalize(0.5) == 0.5
+    assert normalize(0.9) == 0.9
+    assert normalize(1.0) == 1.0
+    # Out-of-range values are clamped, not compressed.
+    assert normalize(1.5) == 1.0
+    assert normalize(-0.2) == 0.0
+
+
+def test_low_reranker_score_candidate_passes_default_threshold(tmp_path: Path) -> None:
+    """A reranker score of 0.4 must survive the default 0.3 threshold (previously 0.5 filtered it)."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+
+    created = service.integrate_knowledge(
+        title="Asyncio Gather Pattern",
+        content="Use asyncio.gather to run coroutines concurrently and collect results.",
+        action="create",
+    )
+    created_id = created["node"]["id"]
+
+    # Default threshold is now 0.3; a partial-overlap query should still surface the node.
+    payload = service.search_existing_nodes("run coroutines concurrently")
+    matches = [item["node_id"] for item in payload["matches"]]
+    assert created_id in matches
+
+
+def test_write_memory_warns_for_unstructured_persistent_content(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=FakeSamplingClient(),
+    )
+
+    result = service.write_memory(
+        title="Persistent Note",
+        content="A short persistent note without structured sections.",
+        node_type="persistent",
+    )
+
+    assert result["warnings"] == [
+        {
+            "code": "low_structure",
+            "message": "Persistent memory has no ## sections; consider OKF format.",
+        }
+    ]
+
+
+def test_write_memory_does_not_warn_for_structured_persistent_content(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=FakeSamplingClient(),
+    )
+
+    result = service.write_memory(
+        title="Structured Persistent Note",
+        content="## Context\nA durable context.\n\n## Decision\nKeep this policy.",
+        node_type="persistent",
+    )
+
+    assert result["warnings"] == []
+
+
+def test_write_memory_does_not_warn_for_unstructured_transient_content(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=FakeSamplingClient(),
+    )
+
+    result = service.write_memory(
+        title="Transient Note",
+        content="A short transient note without structured sections.",
+        node_type="transient",
+    )
+
+    assert result["warnings"] == []
 
 
 def test_streamable_sampling_unavailable_errors_point_to_active_architecture_doc(tmp_path: Path) -> None:

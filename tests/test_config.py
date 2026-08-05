@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from synapse.config import load_config
 from synapse.utils.runtime import bootstrap_runtime_directories
 
@@ -33,6 +31,15 @@ archive_path = "./.synapse/.archive"
     assert config.logging.retention_days == 7
     assert config.decay.janitor_days == 30
     assert config.decay.archive_retention_days == 90
+    assert config.decider.provider == "local_llm"
+    assert config.decider.base_url == "http://localhost:8000/v1"
+    assert config.decider.model == "deepseek-v4-pro"
+    assert config.decider.timeout_seconds == 30
+    assert config.decider.max_tokens == 600
+    assert config.decider.temperature == 0.1
+    assert config.dreamer.enabled is True
+    assert config.dreamer.interval_hours == 12
+    assert config.dreamer.batch_size == 8
     assert config.resolve_path(config.memory.base_path) == (tmp_path / ".synapse").resolve()
 
 
@@ -110,3 +117,55 @@ request_timeout_seconds = 15
     assert config.providers.remote_api.headers["X-Tenant"] == "dev"
     assert config.providers.remote_api.headers["Authorization"] == "Bearer {api_key}"
     assert config.providers.remote_api.request_timeout_seconds == 15
+
+
+def test_load_config_parses_decider_block(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[decider]
+provider = "mcp_sampling"
+base_url = "http://primary.example/v1"
+model = "primary-model"
+api_key_env = "PRIMARY_KEY"
+fallback_base_url = "http://fallback.example/v1"
+fallback_model = "fallback-model"
+fallback_api_key_env = "FALLBACK_KEY"
+timeout_seconds = 17
+max_tokens = 321
+temperature = 0.25
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.decider.provider == "mcp_sampling"
+    assert config.decider.base_url == "http://primary.example/v1"
+    assert config.decider.model == "primary-model"
+    assert config.decider.api_key_env == "PRIMARY_KEY"
+    assert config.decider.fallback_base_url == "http://fallback.example/v1"
+    assert config.decider.fallback_model == "fallback-model"
+    assert config.decider.fallback_api_key_env == "FALLBACK_KEY"
+    assert config.decider.timeout_seconds == 17
+    assert config.decider.max_tokens == 321
+    assert config.decider.temperature == 0.25
+
+
+def test_load_config_parses_dreamer_block(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[dreamer]
+enabled = false
+interval_hours = 6
+batch_size = 12
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.dreamer.enabled is False
+    assert config.dreamer.interval_hours == 6
+    assert config.dreamer.batch_size == 12

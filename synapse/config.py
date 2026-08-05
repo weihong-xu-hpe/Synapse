@@ -129,6 +129,29 @@ class LoggingSettings(BaseModel):
     log_dir: Path = Path("./.synapse/.logs")
 
 
+class DeciderSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str = "local_llm"
+    base_url: str = "http://localhost:8000/v1"
+    model: str = "deepseek-v4-pro"
+    api_key_env: str = ""
+    fallback_base_url: str = ""
+    fallback_model: str = ""
+    fallback_api_key_env: str = "OPENAI_COMPATIBLE_API_KEY"
+    timeout_seconds: int = 30
+    max_tokens: int = 600
+    temperature: float = 0.1
+
+
+class DreamerSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    interval_hours: int = Field(default=12, ge=1)
+    batch_size: int = Field(default=8, ge=1, le=20)
+
+
 class SynapseConfig(BaseModel):
     """Validated Synapse runtime configuration."""
 
@@ -143,6 +166,8 @@ class SynapseConfig(BaseModel):
     decay: DecaySettings = Field(default_factory=DecaySettings)
     sanitization: SanitizationSettings = Field(default_factory=SanitizationSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    decider: DeciderSettings = Field(default_factory=DeciderSettings)
+    dreamer: DreamerSettings = Field(default_factory=DreamerSettings)
 
     _config_path: Path = PrivateAttr(default=Path(DEFAULT_CONFIG_FILE_NAME))
     _project_root: Path = PrivateAttr(default=Path.cwd())

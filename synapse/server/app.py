@@ -13,7 +13,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from synapse import __version__
-from synapse.server.mcp import SynapseMCPServer, is_sampling_tool_name
+from synapse.server.decider import LocalLLMDecider
+from synapse.server.mcp import SynapseMCPServer
 from synapse.server.service import SynapseServerService, SynapseServiceError
 from synapse.server.streamable_runtime import StreamableEventStream, StreamableToolOrchestrator, create_streamable_session_manager
 
@@ -78,13 +79,15 @@ def _require_streamable_session_id(request: Request) -> str:
     )
 
 
-def _tool_call_requires_sampling(payload: dict[str, Any]) -> bool:
+def _tool_call_requires_sampling(payload: dict[str, Any], *, sampling_enabled: bool) -> bool:
+    if not sampling_enabled:
+        return False
     if str(payload.get("method") or "") != "tools/call":
         return False
     params = payload.get("params")
     if not isinstance(params, dict):
         return False
-    return is_sampling_tool_name(str(params.get("name") or ""))
+    return str(params.get("name") or "").strip() == "write_memory"
 
 
 def _jsonrpc_error_response(
@@ -200,12 +203,14 @@ async def _handle_jsonrpc_request(
     session,
     mcp_server: SynapseMCPServer,
     sampling_client,
+    sampling_enabled: bool,
 ) -> Response:
     response_headers = {STREAMABLE_SESSION_HEADER: session.session_id}
     requires_transport_sampling = (
         sampling_client is None
+        and sampling_enabled
         and session.supports_sampling
-        and _tool_call_requires_sampling(payload)
+        and _tool_call_requires_sampling(payload, sampling_enabled=sampling_enabled)
     )
     if requires_transport_sampling and _request_prefers_event_stream(request):
         response_stream = StreamableEventStream()
@@ -253,7 +258,7 @@ async def _handle_jsonrpc_request(
     return JSONResponse(content=response_payload, headers=response_headers)
 
 
-def _create_mcp_post_handler(mcp_server: SynapseMCPServer, session_manager, sampling_client):
+def _create_mcp_post_handler(mcp_server: SynapseMCPServer, session_manager, sampling_client, sampling_enabled: bool):
     async def mcp_streamable_api(request: Request) -> Response:
         payload = await request.json()
         if not isinstance(payload, dict):
@@ -292,6 +297,7 @@ def _create_mcp_post_handler(mcp_server: SynapseMCPServer, session_manager, samp
             session=session,
             mcp_server=mcp_server,
             sampling_client=sampling_client,
+            sampling_enabled=sampling_enabled,
         )
 
     return mcp_streamable_api
@@ -383,34 +389,40 @@ def _client_name_from_payload(payload: dict[str, Any]) -> str:
     return str(client_info.get("name") or "").strip()
 
 
-def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None) -> FastAPI:
+def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None, lifespan=None) -> FastAPI:
     """Create the Streamable-oriented FastAPI app with a single MCP endpoint."""
+
+    sampling_enabled = config.decider.provider == "mcp_sampling"
+    effective_sampling_client = sampling_client
+    if config.decider.provider == "local_llm" and effective_sampling_client is None:
+        effective_sampling_client = LocalLLMDecider(config.decider)
 
     service = SynapseServerService(
         config,
         runtime_paths=runtime_paths,
         logger=logger,
-        sampling_client=sampling_client,
+        sampling_client=effective_sampling_client,
     )
     mcp_server = SynapseMCPServer(
         config,
         runtime_paths=service.runtime_paths,
         logger=logger,
         service=service,
-        sampling_client=sampling_client,
+        sampling_client=effective_sampling_client,
     )
     session_manager = create_streamable_session_manager()
     orchestrator = StreamableToolOrchestrator(
         service,
         logger=logger,
-        sampling_client=sampling_client,
+        sampling_client=effective_sampling_client,
     )
 
-    app = FastAPI(title="Synapse", version=__version__)
+    app = FastAPI(title="Synapse", version=__version__, lifespan=lifespan)
     app.state.mcp_server = mcp_server
     app.state.streamable_session_manager = session_manager
     app.state.streamable_orchestrator = orchestrator
     app.state.streamable_transport = STREAMABLE_TRANSPORT_NAME
+    app.state.sampling_client = effective_sampling_client
 
     app.add_middleware(
         CORSMiddleware,
@@ -427,7 +439,14 @@ def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None)
 
     app.middleware("http")(_create_auth_logging_middleware(config, service, logger))
 
-    app.post("/mcp")(_create_mcp_post_handler(mcp_server, session_manager, sampling_client))
+    app.post("/mcp")(
+        _create_mcp_post_handler(
+            mcp_server,
+            session_manager,
+            effective_sampling_client,
+            sampling_enabled,
+        )
+    )
     app.get("/mcp")(_create_mcp_get_handler(session_manager))
     app.delete("/mcp")(_create_mcp_delete_handler(session_manager))
     app.get("/")(_create_root_handler())

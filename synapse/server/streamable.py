@@ -6,11 +6,14 @@ the removed REST/SSE/stdio compatibility paths.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import FastAPI
 
+from synapse.lifecycle.scheduler import DreamerScheduler
+from synapse.server.decider import LocalLLMDecider
 from synapse.server.app import create_app as create_streamable_http_app
 from synapse.server.streamable_runtime import (
     StreamableSessionManager,
@@ -34,6 +37,7 @@ class StreamableRuntime:
     sampling_client: Any = None
     _session_manager: StreamableSessionManager | None = None
     _orchestrator: StreamableToolOrchestrator | None = None
+    _dreamer_scheduler: DreamerScheduler | None = None
 
     @property
     def execution_layer(self) -> Any:
@@ -63,15 +67,41 @@ class StreamableRuntime:
     def create_app(self) -> FastAPI:
         """Build the current native Streamable HTTP server app."""
 
+        lifespan_context = None
+        app_sampling_client = self.sampling_client
+        if self.config.dreamer.enabled:
+            scheduler_sampling_client = self.sampling_client or LocalLLMDecider(self.config.decider)
+            scheduler = DreamerScheduler(
+                self.config,
+                runtime_paths=self.runtime_paths,
+                logger=self.logger,
+                sampling_client=scheduler_sampling_client,
+            )
+            self._dreamer_scheduler = scheduler
+            if self.config.decider.provider == "local_llm":
+                app_sampling_client = scheduler_sampling_client
+
+            @asynccontextmanager
+            async def dreamer_lifespan(_app: FastAPI):
+                scheduler.start()
+                try:
+                    yield
+                finally:
+                    scheduler.stop()
+
+            lifespan_context = dreamer_lifespan
+
         app = create_streamable_http_app(
             self.config,
             runtime_paths=self.runtime_paths,
             logger=self.logger,
-            sampling_client=self.sampling_client,
+            sampling_client=app_sampling_client,
+            lifespan=lifespan_context,
         )
         app.state.streamable_runtime = self
         app.state.streamable_runtime_mode = STREAMABLE_RUNTIME_MODE
         app.state.streamable_architecture_doc = STREAMABLE_ARCHITECTURE_DOC
+        app.state.dreamer_scheduler = self._dreamer_scheduler
         if getattr(app.state, "streamable_session_manager", None) is None:
             app.state.streamable_session_manager = self.create_session_manager()
         else:

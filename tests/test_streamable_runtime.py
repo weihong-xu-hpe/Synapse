@@ -57,6 +57,9 @@ model = "bge-reranker-v2-m3"
 max_candidates = 9
 timeout_seconds = 1
 
+[decider]
+provider = "mcp_sampling"
+
 [logging]
 log_dir = "./.synapse/.logs"
 """.strip(),
@@ -107,7 +110,6 @@ def test_streamable_orchestrator_lists_public_tools(tmp_path: Path) -> None:
 
     names = [tool["name"] for tool in orchestrator.list_tools()]
     assert names == [
-        "run_dreamer",
         "search_memory",
         "write_memory",
     ]

@@ -35,7 +35,6 @@ from synapse.utils.runtime import RuntimePaths, bootstrap_runtime_directories
 LOGGER = logging.getLogger("synapse.mcp-daemon")
 _REDACTED_FIELDS = {"auth_token", "authorization", "content"}
 _SUPERSEDES_REASON_PATTERN = re.compile(r"^> \*\*Supersedes\*\*: \[\[[^\]]+\]\](?: — (?P<reason>.+))?$")
-_DEFAULT_CONFIDENCE_THRESHOLD = 0.75
 _INVALID_TITLE_MESSAGE = "Node title must not be blank"
 _ACTIVE_ARCHITECTURE_DOC = "docs/design/streamable-mcp-single-path-architecture.md"
 _SAMPLING_REQUIREMENTS_MESSAGE = (
@@ -262,9 +261,19 @@ class SynapseServerService:
         links: list[str] | None = None,
         sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
         query_hint: str | None = None,
-        similarity_threshold: float = 0.5,
-        confidence_threshold: float = _DEFAULT_CONFIDENCE_THRESHOLD,
+        similarity_threshold: float = 0.3,
     ) -> dict[str, Any]:
+        normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
+        section_count = sum(1 for line in content.splitlines() if line.lstrip().startswith("##"))
+        warnings: list[dict[str, str]] = []
+        if normalized_type is NodeType.PERSISTENT and section_count == 0:
+            warnings.append(
+                {
+                    "code": "low_structure",
+                    "message": "Persistent memory has no ## sections; consider OKF format.",
+                }
+            )
+
         payload = self._decide_memory_write_payload(
             title=title,
             content=content,
@@ -276,19 +285,6 @@ class SynapseServerService:
         )
 
         decision_payload = payload["decision"].copy()
-        confidence = decision_payload.get("confidence")
-        fallback_applied = False
-        if confidence is None or float(confidence) < float(confidence_threshold):
-            fallback_applied = True
-            decision_payload = {
-                "action": IntegrateAction.CREATE.value,
-                "target_node_ids": [],
-                "reasoning": (
-                    f"Sampling confidence was below {confidence_threshold:.2f}; "
-                    "falling back to a safe create action."
-                ),
-                "confidence": confidence,
-            }
 
         try:
             integrate_result = self.integrate_knowledge(
@@ -319,9 +315,9 @@ class SynapseServerService:
             "execution": {
                 "executed": True,
                 "tool": "integrate_knowledge",
-                "fallback_applied": fallback_applied,
                 "result": integrate_result,
             },
+            "warnings": warnings,
         }
         self._log_tool_call(
             "write_memory",
@@ -332,7 +328,6 @@ class SynapseServerService:
                 "sensitivity": str(sensitivity),
                 "query_hint": query_hint,
                 "similarity_threshold": similarity_threshold,
-                "confidence_threshold": confidence_threshold,
             },
             result,
         )
@@ -403,7 +398,7 @@ class SynapseServerService:
         )
         return payload
 
-    def search_existing_nodes(self, query: str, similarity_threshold: float = 0.5) -> dict[str, Any]:
+    def search_existing_nodes(self, query: str, similarity_threshold: float = 0.3) -> dict[str, Any]:
         if not query.strip():
             raise SynapseServiceError("INVALID_QUERY", "Search query must not be blank")
 
@@ -556,10 +551,10 @@ class SynapseServerService:
 
     @staticmethod
     def _normalize_candidate_score(score: float) -> float:
-        positive_score = max(0.0, float(score))
-        if positive_score <= 0.0:
-            return 0.0
-        return round(positive_score / (1.0 + positive_score), 6)
+        # Reranker scores are already in [0, 1]; clamp instead of compressing.
+        # The previous x/(1+x) mapping collapsed [0,1] -> [0,0.5], which combined
+        # with similarity_threshold=0.5 filtered out nearly every candidate.
+        return round(min(1.0, max(0.0, float(score))), 6)
 
     def _collect_candidate_matches(
         self,

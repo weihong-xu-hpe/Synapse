@@ -38,10 +38,7 @@ _DEFAULT_SERVER_URL = "http://127.0.0.1:8765/mcp"
 _SSE_DATA_PREFIX = "data: "
 _SSE_MEDIA_TYPE = "text/event-stream"
 _SESSION_HEADER = "mcp-session-id"
-_SAMPLING_TOOL_NAMES = frozenset({
-    "write_memory",
-    "run_dreamer",
-})
+_SAMPLING_TOOL_NAMES = frozenset({"write_memory"})
 
 _write_lock = threading.Lock()
 
@@ -84,8 +81,10 @@ def _is_jsonrpc_response(msg: dict[str, Any]) -> bool:
     return "id" in msg and ("result" in msg or "error" in msg) and "method" not in msg
 
 
-def _needs_sse_sampling(msg: dict[str, Any]) -> bool:
-    """Check if this tools/call requires sampling."""
+def _needs_sse_sampling(msg: dict[str, Any], *, enabled: bool = False) -> bool:
+    """Check if this tools/call should use the optional sampling bridge."""
+    if not enabled:
+        return False
     if str(msg.get("method", "")) != "tools/call":
         return False
     params = msg.get("params")
@@ -117,8 +116,9 @@ class StdioProxy:
     6. Server completes tool call → SSE stream pushes final result → written to stdout
     """
 
-    def __init__(self, server_url: str = _DEFAULT_SERVER_URL) -> None:
+    def __init__(self, server_url: str = _DEFAULT_SERVER_URL, *, sampling_enabled: bool = False) -> None:
         self._server_url = server_url
+        self._sampling_enabled = sampling_enabled
         self._session_id: str | None = None
         self._http = httpx.Client(timeout=300.0)
         self._stop_event = threading.Event()
@@ -177,7 +177,7 @@ class StdioProxy:
             method = msg.get("method", "")
             if method == "initialize":
                 self._handle_initialize(msg)
-            elif _needs_sse_sampling(msg):
+            elif _needs_sse_sampling(msg, enabled=self._sampling_enabled):
                 self._handle_sampling_tool_call(msg)
             else:
                 self._handle_simple_request(msg)
@@ -292,12 +292,12 @@ class StdioProxy:
             return None
 
 
-def run_stdio_proxy(server_url: str = _DEFAULT_SERVER_URL) -> None:
+def run_stdio_proxy(server_url: str = _DEFAULT_SERVER_URL, *, sampling_enabled: bool = False) -> None:
     """Entry point for the stdio proxy."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
-    proxy = StdioProxy(server_url=server_url)
+    proxy = StdioProxy(server_url=server_url, sampling_enabled=sampling_enabled)
     proxy.run()

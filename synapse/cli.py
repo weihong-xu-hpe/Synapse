@@ -14,10 +14,14 @@ from synapse import __version__
 from synapse.config import SynapseConfig, load_config
 from synapse.deployment import ServiceActionResult, ServiceLogView, ServiceManager, ServiceStatus
 from synapse.indexing import collect_health_status, rebuild_index as rebuild_sqlite_index, run_startup_checks
+from synapse.lifecycle import Dreamer
+from synapse.server.decider import LocalLLMDecider
 from synapse.utils import RuntimePaths, bootstrap_runtime_directories, configure_logging
 
 
 app = typer.Typer(help="Synapse local hybrid memory CLI.", no_args_is_help=True)
+dreamer_app = typer.Typer(help="Run Dreamer memory lifecycle operations.", no_args_is_help=True)
+app.add_typer(dreamer_app, name="dreamer")
 AUDIT_LOGGER_NAME = "synapse.audit"
 DAEMON_LOGGER_NAME = "synapse.mcp-daemon"
 
@@ -162,6 +166,42 @@ def serve(
         runtime_paths=state.runtime_paths,
         logger=daemon_logger,
     )
+
+
+@dreamer_app.command("run")
+def run_dreamer(
+    ctx: typer.Context,
+    batch_size: Annotated[
+        int | None,
+        typer.Option("--batch-size", min=1, max=20, help="Number of nodes or pairs sent to the decider per batch."),
+    ] = None,
+) -> None:
+    """Run one Dreamer consolidation pass using the configured local decider."""
+
+    state = _state_from_context(ctx)
+    effective_batch_size = batch_size or state.config.dreamer.batch_size
+    logger = state.loggers[DAEMON_LOGGER_NAME]
+    logger.info("Dreamer command invoked", extra={"batch_size": effective_batch_size})
+
+    dreamer = Dreamer(
+        state.config,
+        runtime_paths=state.runtime_paths,
+        sampling_client=LocalLLMDecider(state.config.decider),
+        logger=logger,
+    )
+    try:
+        report = dreamer.run(batch_size=effective_batch_size)
+    finally:
+        dreamer.close()
+
+    typer.echo("Dreamer run completed.")
+    typer.echo(f"Scanned: {report.scanned}")
+    typer.echo(f"Triage decisions: {len(report.triage)}")
+    typer.echo(f"Links added: {len(report.links_added)}")
+    typer.echo(f"Conflicts resolved: {len(report.conflicts_resolved)}")
+    typer.echo(f"Archived: {len(report.archived)}")
+    typer.echo(f"Condensed: {len(report.condensed)}")
+    typer.echo(f"Warnings: {len(report.warnings)}")
 
 
 @app.command("rebuild-index")

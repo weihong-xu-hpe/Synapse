@@ -12,7 +12,6 @@ from pydantic import BaseModel, ValidationError
 from synapse import __version__
 from synapse.server.sampling import SamplingClient
 from synapse.server.schemas import (
-    RunDreamerRequest,
     SearchMemoryToolRequest,
     WriteMemoryRequest,
 )
@@ -21,18 +20,6 @@ from synapse.server.service import SynapseServerService, SynapseServiceError
 
 _SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-03-26")
 _DEFAULT_PROTOCOL_VERSION = _SUPPORTED_PROTOCOL_VERSIONS[0]
-_HIGH_LEVEL_SAMPLING_REQUIREMENT_NOTE = " Requires a sampling-capable MCP host/client."
-_SAMPLING_TOOL_NAMES = frozenset(
-    {
-        "write_memory",
-        "run_dreamer",
-    }
-)
-
-def is_sampling_tool_name(name: str) -> bool:
-    """Return whether the named tool requires a sampling-capable client."""
-
-    return str(name or "").strip() in _SAMPLING_TOOL_NAMES
 
 
 @dataclass(slots=True)
@@ -110,26 +97,10 @@ class SynapseMCPServer:
                 ),
                 MCPToolDefinition(
                     name="write_memory",
-                    description=(
-                        "Use host-side sampling to decide and execute a write through Synapse's internal canonical "
-                        "execution layer."
-                        + _HIGH_LEVEL_SAMPLING_REQUIREMENT_NOTE
-                    ),
+                    description="Use Synapse's decision layer to decide and execute a memory write.",
                     input_model=WriteMemoryRequest,
                     handler=self.service.write_memory,
                 ),
-                MCPToolDefinition(
-                    name="run_dreamer",
-                    description=(
-                        "Run Synapse's background memory consolidation pipeline (the Dreamer). "
-                        "Scans for stale, superseded, disputed, and unlinked nodes, then uses "
-                        "host-side sampling to triage, weave links, resolve conflicts, and execute."
-                        + _HIGH_LEVEL_SAMPLING_REQUIREMENT_NOTE
-                    ),
-                    input_model=RunDreamerRequest,
-                    handler=self.service.run_dreamer,
-                ),
-
             )
         }
 

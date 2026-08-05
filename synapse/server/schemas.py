@@ -45,8 +45,7 @@ class WriteMemoryRequest(BaseModel):
     links: list[str] = Field(default_factory=list)
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
     query_hint: str | None = None
-    similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    confidence_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 class RunDreamerRequest(BaseModel):
@@ -67,7 +66,7 @@ class SearchExistingNodesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1)
-    similarity_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 class SearchMemoryToolRequest(BaseModel):

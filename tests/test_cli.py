@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -242,3 +243,45 @@ def test_serve_command_run_server_uses_streamable_runtime_entrypoint(tmp_path: P
     assert captured["runtime_paths"] is not None
     assert captured["logger_name"] == cli_module.DAEMON_LOGGER_NAME
     assert captured["kwargs"] == {}
+
+
+def test_dreamer_run_command_uses_configured_batch_size(tmp_path: Path, monkeypatch) -> None:
+    config_path = write_config(tmp_path)
+    captured: dict[str, object] = {}
+
+    class FakeDecider:
+        def __init__(self, settings) -> None:
+            captured["decider_settings"] = settings
+
+    class FakeDreamer:
+        def __init__(self, config, *, runtime_paths, sampling_client, logger) -> None:
+            captured["config"] = config
+            captured["runtime_paths"] = runtime_paths
+            captured["sampling_client"] = sampling_client
+            captured["logger"] = logger
+
+        def run(self, *, batch_size: int):
+            captured["batch_size"] = batch_size
+            return SimpleNamespace(
+                scanned={"stale": 1},
+                triage=(object(),),
+                links_added=(),
+                conflicts_resolved=(),
+                archived=(),
+                condensed=(),
+                warnings=(),
+            )
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(cli_module, "LocalLLMDecider", FakeDecider)
+    monkeypatch.setattr(cli_module, "Dreamer", FakeDreamer)
+
+    result = runner.invoke(app, ["--config", str(config_path), "dreamer", "run"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["batch_size"] == 8
+    assert captured["closed"] is True
+    assert "Dreamer run completed." in result.output
+    assert "Warnings: 0" in result.output
