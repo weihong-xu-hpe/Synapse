@@ -52,29 +52,42 @@ class DeterministicArchiveCondenser:
         now: datetime,
     ) -> CondensationDraft:
         if not nodes:
-            raise ValueError("At least one archived node is required for condensation")
+            raise ValueError("At least one archived note is required for condensation")
 
         source_ids = tuple(node.id for node in nodes)
         common_tags = self._collect_common_tags(nodes)
         title = f"Archive Condensation {now.date().isoformat()}"
-        bullet_lines = [f"- **{node.title}** (`{node.id}`): {self._summarize(node.content)}" for node in nodes]
         source_lines = [f"- [[{node.id}]] — {node.title}" for node in nodes]
         tag_lines = [f"- {tag}" for tag in common_tags] or ["- No dominant tag cluster detected."]
+
+        # OKF-structured content: every persistent node (including sleep
+        # products) uses Context / Decision / Consequences sections so the
+        # store is uniformly OKF.
+        context_lines = [
+            f"- **{node.title}** (`{node.id}`): {self._summarize(node.content)}"
+            for node in nodes
+        ]
+        decision_lines = [
+            f"- Merged {len(nodes)} archived note(s) into a single persistent record. "
+            f"Original archive files are preserved for rollback and auditability.",
+            *tag_lines,
+        ]
 
         content = "\n".join(
             [
                 f"# {title}",
                 "",
-                (
-                    f"Synthesized on {now.isoformat().replace(UTC_SUFFIX, 'Z')} from {len(nodes)} archived note(s). "
-                    "Original archive files are preserved for rollback and auditability."
-                ),
+                f"Synthesized on {now.isoformat().replace(UTC_SUFFIX, 'Z')} from {len(nodes)} archived note(s).",
                 "",
-                "## Recurring tags",
-                *tag_lines,
+                "## Context",
+                *context_lines,
                 "",
-                "## Consolidated observations",
-                *bullet_lines,
+                "## Decision",
+                *decision_lines,
+                "",
+                "## Consequences",
+                "- Consolidated record supersedes the archived sources for active retrieval.",
+                "- Original archive files remain available for audit and rollback.",
                 "",
                 "## Merged From",
                 *source_lines,

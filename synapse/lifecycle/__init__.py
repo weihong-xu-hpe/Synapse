@@ -14,6 +14,7 @@ from synapse.lifecycle.dreamer import (
 	LinkDecision,
 	TriageDecision,
 )
+from synapse.lifecycle.scheduler import DreamerScheduler
 
 __all__ = [
 	"ArchiveCondenser",
@@ -24,6 +25,7 @@ __all__ = [
 	"Dreamer",
 	"DreamerReport",
 	"DreamerWarning",
+	"DreamerScheduler",
 	"LinkDecision",
 	"TriageDecision",
 ]

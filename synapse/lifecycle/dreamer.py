@@ -25,7 +25,6 @@ from synapse.server.sampling import (
     build_conflict_resolution_prompt,
     build_link_weaving_prompt,
     build_triage_prompt,
-    parse_sampling_json_result,
 )
 from synapse.storage import SQLiteNodeStore, archive_node_path, write_node_file
 from synapse.sync import SyncBatchResult, SyncManager
@@ -263,7 +262,7 @@ class Dreamer:
                     system_prompt=_TRIAGE_SYSTEM,
                     max_tokens=1500,
                 )
-                payload = parse_sampling_json_result(result)
+                payload = result
                 for item in payload.get("decisions") or []:
                     decisions.append(
                         TriageDecision(
@@ -273,15 +272,13 @@ class Dreamer:
                         )
                     )
             except Exception as exc:
-                self._logger.warning("Triage sampling failed for batch, defaulting to archive", exc_info=exc)
+                self._logger.warning("Triage sampling failed for batch, skipping batch", exc_info=exc)
                 warnings.append(
                     DreamerWarning(
                         code="triage_sampling_failed",
-                        message=f"Triage sampling failed: {exc}. Defaulting batch to archive.",
+                        message=f"Triage sampling failed: {exc}. Skipping batch (no decisions emitted).",
                     )
                 )
-                for node in batch:
-                    decisions.append(TriageDecision(node_id=node.id, decision="archive", reason="sampling failed"))
         return decisions
 
     # -- Stage 3: Link Weaving ----------------------------------------------
@@ -305,7 +302,7 @@ class Dreamer:
                     system_prompt=_LINK_WEAVING_SYSTEM,
                     max_tokens=1500,
                 )
-                payload = parse_sampling_json_result(result)
+                payload = result
                 for item in payload.get("decisions") or []:
                     if item.get("link"):
                         decisions.append(
@@ -345,7 +342,7 @@ class Dreamer:
                     system_prompt=_CONFLICT_SYSTEM,
                     max_tokens=1500,
                 )
-                payload = parse_sampling_json_result(result)
+                payload = result
                 for item in payload.get("decisions") or []:
                     decisions.append(
                         ConflictDecision(
@@ -419,7 +416,7 @@ class Dreamer:
                 content=draft.content,
                 file_path=self.runtime_paths.active / f"{new_id}.md",
             )
-            write_node_file(new_node, base_path=self.runtime_paths.active)
+            write_node_file(new_node, base_path=self.runtime_paths.base)
             condensed_results.append(
                 CondensationResult(
                     source_ids=draft.source_node_ids,
@@ -464,7 +461,7 @@ class Dreamer:
                     content=node_a.content.rstrip() + "\n\n" + link_tag_b + "\n",
                     file_path=node_a.file_path,
                 )
-                write_node_file(updated_a, base_path=self.runtime_paths.active)
+                write_node_file(updated_a, base_path=self.runtime_paths.base)
                 a_updated = True
 
             if link_tag_a not in node_b.content:
@@ -473,7 +470,7 @@ class Dreamer:
                     content=node_b.content.rstrip() + "\n\n" + link_tag_a + "\n",
                     file_path=node_b.file_path,
                 )
-                write_node_file(updated_b, base_path=self.runtime_paths.active)
+                write_node_file(updated_b, base_path=self.runtime_paths.base)
                 b_updated = True
 
             if a_updated or b_updated:
@@ -512,20 +509,25 @@ class Dreamer:
                 self._clear_disputed(node_b, store)
 
     def _mark_superseded(self, loser: Node, winner: Node, store: SQLiteNodeStore) -> None:
-        """Mark *loser* as superseded by *winner*."""
-        updated_meta = loser.metadata.model_copy(
+        """Mark *loser* as superseded by *winner* and clear winner's disputed status."""
+        updated_loser_meta = loser.metadata.model_copy(
             update={"status": NodeStatus.SUPERSEDED, "superseded_by": winner.id}
         )
-        updated = Node(metadata=updated_meta, content=loser.content, file_path=loser.file_path)
-        store.upsert_node(updated)
-        write_node_file(updated, base_path=self.runtime_paths.active)
+        updated_loser = Node(metadata=updated_loser_meta, content=loser.content, file_path=loser.file_path)
+        store.upsert_node(updated_loser)
+        write_node_file(updated_loser, base_path=self.runtime_paths.base)
+
+        # The winner was part of a disputed pair; restore it to active so it is
+        # not re-discovered as disputed on the next Dreamer cycle.
+        if winner.metadata.status == NodeStatus.DISPUTED:
+            self._clear_disputed(winner, store)
 
     def _clear_disputed(self, node: Node, store: SQLiteNodeStore) -> None:
         """Reset a disputed node back to active."""
         updated_meta = node.metadata.model_copy(update={"status": NodeStatus.ACTIVE})
         updated = Node(metadata=updated_meta, content=node.content, file_path=node.file_path)
         store.upsert_node(updated)
-        write_node_file(updated, base_path=self.runtime_paths.active)
+        write_node_file(updated, base_path=self.runtime_paths.base)
 
     def _archive_superseded(
         self,
