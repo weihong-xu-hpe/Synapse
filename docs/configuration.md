@@ -73,6 +73,23 @@ custom_patterns = []
 retention_days = 7
 max_file_size_mb = 50
 log_dir = "./.synapse/.logs"
+
+[decider]
+provider = "local_llm"
+base_url = "http://localhost:8000/v1"
+model = "deepseek-v4-pro"
+api_key_env = ""
+fallback_base_url = ""
+fallback_model = ""
+fallback_api_key_env = "OPENAI_COMPATIBLE_API_KEY"
+timeout_seconds = 30
+max_tokens = 600
+temperature = 0.1
+
+[dreamer]
+enabled = true
+interval_hours = 12
+batch_size = 8
 ```
 
 ## Section guide
@@ -188,6 +205,40 @@ Custom regex redaction rules for remote-bound payloads.
 ### `[logging]`
 
 Controls local log retention and file-size limits.
+
+### `[decider]`
+
+Controls the local LLM used for sampling decisions (write-path triage, link weaving, conflict resolution). The Decider is an OpenAI-compatible chat-completions client with primary + fallback endpoints.
+
+- `provider` — currently `local_llm` (OpenAI-compatible HTTP)
+- `base_url` — primary LLM endpoint base URL (e.g. `http://localhost:8000/v1`); Synapse POSTs to `{base_url}/chat/completions`
+- `model` — primary model name
+- `api_key_env` — env var name holding the bearer token for the primary endpoint; leave blank for no-auth local servers
+- `fallback_base_url` — fallback LLM endpoint base URL; used when the primary endpoint fails
+- `fallback_model` — fallback model name
+- `fallback_api_key_env` — env var name holding the bearer token for the fallback endpoint
+- `timeout_seconds` — HTTP request timeout per endpoint (raise this for reasoning models that emit `reasoning_content` before the final answer)
+- `max_tokens` — generation token cap sent to the LLM; must be large enough for reasoning models (e.g. glm-5.2-fp8) whose `reasoning_content` consumes tokens before `content` is populated
+- `temperature` — sampling temperature
+
+> **Reasoning-model note:** some models (e.g. `glm-5.2-fp8`) return intermediate reasoning in a `reasoning_content` field and only populate `content` after reasoning completes. If `max_tokens` is too small, `content` stays empty and the Decider raises a parse error. Size `max_tokens` to leave headroom for both reasoning and the final structured answer.
+
+### `[dreamer]`
+
+Controls the Dreamer — Synapse's background memory consolidation engine (modeled on sleep neuroscience: scan → NREM triage → REM link weaving → conflict resolution → execute → report).
+
+- `enabled` (bool, default `true`) — whether the in-process scheduler auto-starts when the server runs
+- `interval_hours` (int, ≥1, default `12`) — interval between automatic Dreamer runs in hours
+- `batch_size` (int, 1-20, default `8`) — number of nodes or node pairs sent to the Decider per batch
+
+#### How Dreamer triggers
+
+Dreamer runs are scheduled **in-process** by `DreamerScheduler` (a daemon `threading.Timer`), not by launchd or cron:
+
+- **Automatic:** when `enabled = true`, `synapse serve --run-server` starts the scheduler, which fires a Dreamer run every `interval_hours`. A `flock`-based lock (`.synapse/.logs/dreamer.lock`) prevents overlapping runs.
+- **Manual:** `python -m synapse dreamer run` runs one pass immediately (optional `--batch-size N`). This is useful for testing Decider wiring or forcing consolidation outside the schedule.
+
+To change the cadence, edit `interval_hours` and restart the service. To disable automatic runs entirely, set `enabled = false` (manual `dreamer run` still works).
 
 ## Environment variables
 
