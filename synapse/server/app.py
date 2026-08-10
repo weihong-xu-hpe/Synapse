@@ -328,6 +328,7 @@ def _create_root_handler():
             "name": "synapse",
             "version": __version__,
             "mcp": "/mcp",
+            "rest": {"search": "/api/search", "write": "/api/write"},
             "transport": STREAMABLE_TRANSPORT_NAME,
             "session_header": STREAMABLE_SESSION_HEADER,
             "architecture_doc": ACTIVE_ARCHITECTURE_DOC,
@@ -335,6 +336,49 @@ def _create_root_handler():
 
     return root
 
+
+def _create_rest_search_handler(service: SynapseServerService):
+    """Thin REST wrapper around service.search_memory for non-MCP clients (e.g. omp hooks)."""
+
+    async def search_memory(request: Request) -> JSONResponse:
+        body = await request.json()
+        query = str(body.get("query", "")).strip()
+        if not query:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "INVALID_QUERY", "message": "Search query must not be blank", "details": {}}},
+            )
+        top_k = int(body.get("top_k", 3))
+        result = await run_in_threadpool(service.search_memory, query, top_k)
+        return JSONResponse(status_code=200, content=result)
+
+    return search_memory
+
+
+def _create_rest_write_handler(service: SynapseServerService):
+    """Thin REST wrapper around service.write_memory for non-MCP clients (e.g. omp hooks)."""
+
+    async def write_memory(request: Request) -> JSONResponse:
+        body = await request.json()
+        title = str(body.get("title", "")).strip()
+        if not title:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "INVALID_TITLE", "message": "Title must not be blank", "details": {}}},
+            )
+        result = await run_in_threadpool(
+            service.write_memory,
+            title,
+            str(body.get("content", "")),
+            body.get("type", "transient"),
+            body.get("links"),
+            body.get("sensitivity", "internal"),
+            body.get("query_hint"),
+            float(body.get("similarity_threshold", 0.3)),
+        )
+        return JSONResponse(status_code=200, content=result)
+
+    return write_memory
 
 def _create_auth_logging_middleware(config, service: SynapseServerService, logger):
     async def auth_and_logging(request: Request, call_next):
@@ -450,5 +494,7 @@ def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None,
     app.get("/mcp")(_create_mcp_get_handler(session_manager))
     app.delete("/mcp")(_create_mcp_delete_handler(session_manager))
     app.get("/")(_create_root_handler())
+    app.post("/api/search")(_create_rest_search_handler(service))
+    app.post("/api/write")(_create_rest_write_handler(service))
 
     return app

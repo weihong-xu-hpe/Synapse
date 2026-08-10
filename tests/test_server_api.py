@@ -911,3 +911,83 @@ def test_streamable_session_close_requires_header_and_closes_active_session(tmp_
         assert closed.status_code == 200
         assert closed.json()["closed"] is True
         assert closed.json()["session_id"] == session_id
+
+
+def test_rest_search_returns_results_without_mcp_session(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    created = service.integrate_knowledge(
+        title="REST Search Fixture",
+        content="A sentinel for the REST search endpoint.",
+        action="create",
+    )
+    created_id = created["node"]["id"]
+
+    with TestClient(app) as client:
+        response = client.post("/api/search", json={"query": "sentinel rest search endpoint", "top_k": 3})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["query"] == "sentinel rest search endpoint"
+    assert [item["node_id"] for item in payload["results"]] == [created_id]
+
+
+def test_rest_search_rejects_blank_query(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    with TestClient(app) as client:
+        response = client.post("/api/search", json={"query": "  ", "top_k": 3})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_QUERY"
+
+
+def test_rest_write_creates_memory_with_local_llm_decider(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    app = create_app(config, runtime_paths=runtime_paths, sampling_client=FakeSamplingClient())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/write",
+            json={
+                "title": "REST Write Fixture",
+                "content": "A sentinel written via the REST write endpoint.",
+                "type": "transient",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["execution"]["executed"] is True
+    assert payload["decision"]["action"] == "create"
+
+
+def test_rest_write_rejects_blank_title(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    with TestClient(app) as client:
+        response = client.post("/api/write", json={"title": "", "content": "x"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_TITLE"
+
+
+def test_root_handler_advertises_rest_endpoints(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["rest"] == {"search": "/api/search", "write": "/api/write"}
