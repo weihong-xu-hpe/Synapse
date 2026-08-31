@@ -33,3 +33,6 @@ dist/
 .tmp/
 agentic-hybrid-memory-architecture-design.md
 docs/design/
+!docs/design/
+docs/design/*
+!docs/design/TODO-dreamer-stats-thresholds.md

@@ -409,7 +409,7 @@ def test_search_existing_nodes_reuses_retrieval_candidate_core(tmp_path: Path) -
 
 def test_normalize_candidate_score_does_not_compress_reranker_scores() -> None:
     """Regression: x/(1+x) mapping collapsed [0,1] -> [0,0.5], filtering nearly all candidates."""
-    normalize = SynapseServerService._normalize_candidate_score
+    normalize = getattr(SynapseServerService, "_normalize_candidate_score")
     # Reranker outputs in [0,1] must pass through unchanged (within rounding).
     assert normalize(0.0) == 0.0
     assert normalize(0.3) == 0.3
@@ -461,6 +461,11 @@ def test_write_memory_warns_for_unstructured_persistent_content(tmp_path: Path) 
             "message": "Persistent memory has no ## sections; consider OKF format.",
         }
     ]
+    stats = service.stats()
+    assert stats["write_stats"]["requests_total"] == 1
+    assert stats["write_stats"]["warnings"] == {"low_structure": 1}
+    assert stats["write_stats"]["decision_totals"]["create"] == 1
+    assert stats["lifecycle_stats"]["thresholds"]["missing_link_cosine"] == 0.75
 
 
 def test_write_memory_does_not_warn_for_structured_persistent_content(tmp_path: Path) -> None:

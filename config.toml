@@ -72,3 +72,11 @@ temperature = 0.1
 enabled = true
 interval_hours = 12
 batch_size = 8
+
+[dreamer.thresholds]
+missing_link_cosine = 0.75
+stale_orphan_days = 30
+link_weaving_recency_days = 30
+superseded_archive_days = 7
+low_structure_chars = 100
+max_missing_link_pairs_per_run = 100

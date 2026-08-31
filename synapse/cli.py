@@ -340,6 +340,8 @@ def status(ctx: typer.Context) -> None:
     typer.echo(f"Superseded nodes: {health.stats['superseded_nodes']}")
     typer.echo(f"Disputed nodes: {health.stats['disputed_nodes']}")
     typer.echo(f"Archived nodes: {health.stats['archived_nodes']}")
+    _echo_lifecycle_stats(health.lifecycle_stats)
+    _echo_write_stats(health.write_stats)
     typer.echo(f"Delta sync hook: {health.delta_sync_hook}")
     typer.echo(f"Startup sync hook: {health.startup_sync_hook}")
     _echo_service_status(_build_service_manager(state).status())
@@ -354,6 +356,79 @@ def version(ctx: typer.Context) -> None:
     state = _state_from_context(ctx)
     state.loggers[AUDIT_LOGGER_NAME].info("Version command invoked")
     typer.echo(f"Synapse {__version__}")
+
+
+def _echo_lifecycle_stats(lifecycle_stats: dict[str, object]) -> None:
+    current = lifecycle_stats.get("current_candidates") if isinstance(lifecycle_stats, dict) else {}
+    runs = lifecycle_stats.get("runs") if isinstance(lifecycle_stats, dict) else {}
+    decisions = lifecycle_stats.get("decision_totals") if isinstance(lifecycle_stats, dict) else {}
+    thresholds = lifecycle_stats.get("thresholds") if isinstance(lifecycle_stats, dict) else {}
+    if not all(isinstance(section, dict) for section in (current, runs, decisions, thresholds)):
+        return
+
+    typer.echo("Lifecycle stats:")
+    typer.echo(
+        "  Current candidates: "
+        f"stale={current.get('stale_orphans', 0)}, "
+        f"missing_links={current.get('missing_link_pairs', 0)}, "
+        f"disputed_pairs={current.get('disputed_pairs', 0)}, "
+        f"superseded_archive={current.get('superseded_archival_candidates', 0)}"
+    )
+    typer.echo(
+        "  Dreamer runs: "
+        f"total={runs.get('total', 0)}, "
+        f"last_7d={runs.get('last_7d', 0)}, "
+        f"avg_duration={_format_seconds(runs.get('avg_duration_ms', 0.0))}"
+    )
+    typer.echo(
+        "  Decisions: "
+        f"keep={decisions.get('triage_keep', 0)}, "
+        f"condense={decisions.get('triage_condense', 0)}, "
+        f"archive={decisions.get('triage_archive', 0)}, "
+        f"links_added={decisions.get('links_added', 0)}"
+    )
+    typer.echo(
+        "  Thresholds: "
+        f"missing_link_cosine={thresholds.get('missing_link_cosine', 0.75)}, "
+        f"link_recency_days={thresholds.get('link_weaving_recency_days', 30)}, "
+        f"low_structure_chars={thresholds.get('low_structure_chars', 100)}, "
+        f"max_missing_link_pairs={thresholds.get('max_missing_link_pairs_per_run', 100)}"
+    )
+
+
+def _echo_write_stats(write_stats: dict[str, object]) -> None:
+    decisions = write_stats.get("decision_totals") if isinstance(write_stats, dict) else {}
+    if not isinstance(decisions, dict):
+        return
+    typer.echo("Write stats:")
+    typer.echo(
+        "  Requests: "
+        f"{write_stats.get('requests_total', 0)}, "
+        f"candidates avg={write_stats.get('candidate_count_avg', 0.0)}, "
+        f"zero-candidate rate={_format_percent(write_stats.get('candidate_count_zero_rate', 0.0))}"
+    )
+    typer.echo(
+        "  Decisions: "
+        f"create={decisions.get('create', 0)}, "
+        f"supersede={decisions.get('supersede', 0)}, "
+        f"complement={decisions.get('complement', 0)}"
+    )
+
+
+def _format_seconds(milliseconds: object) -> str:
+    try:
+        seconds = float(milliseconds) / 1000.0
+    except (TypeError, ValueError):
+        seconds = 0.0
+    return f"{seconds:.1f}s"
+
+
+def _format_percent(value: object) -> str:
+    try:
+        percent = float(value) * 100
+    except (TypeError, ValueError):
+        percent = 0.0
+    return f"{percent:.0f}%"
 
 
 def main() -> None:

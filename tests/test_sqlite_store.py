@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from synapse.models import Node, NodeMetadata, NodeStatus, NodeType, SensitivityLevel
-from synapse.storage import SQLiteNodeStore
+from synapse.storage import DreamerRunMetrics, SQLiteNodeStore, WriteMemoryEventMetrics
 
 
 NOW = datetime(2026, 3, 7, 12, 0, tzinfo=UTC)
@@ -213,3 +213,95 @@ def test_janitor_queries_and_integrity_report(tmp_path: Path) -> None:
         assert integrity.integrity_check_result == "ok"
         assert integrity.wal_mode_enabled is True
         assert integrity.total_nodes == 7
+
+
+def test_metrics_recording_and_aggregation(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        store.record_dreamer_run(
+            DreamerRunMetrics(
+                started_at=now,
+                completed_at=now,
+                duration_ms=1200,
+                batch_size=4,
+                stale_scanned=2,
+                superseded_scanned=1,
+                disputed_scanned=0,
+                missing_link_pairs_scanned=3,
+                triage_keep=1,
+                triage_condense=1,
+                triage_archive=0,
+                links_added=2,
+                conflicts_superseded=0,
+                conflicts_both_valid=0,
+                archived=1,
+                condensed=1,
+                warnings=1,
+                sampling_failures=1,
+            )
+        )
+        store.record_write_memory_event(
+            WriteMemoryEventMetrics(
+                created_at=now,
+                node_id="mem_new",
+                node_type="persistent",
+                action="create",
+                candidate_count=0,
+                similarity_threshold=0.3,
+                warning_codes=("low_structure",),
+                sampling_provider="fake-sampler",
+                execution_succeeded=True,
+            )
+        )
+
+        dreamer_summary = store.get_dreamer_metrics_summary()
+        write_summary = store.get_write_memory_metrics_summary()
+
+    assert dreamer_summary["runs"]["total"] == 1
+    assert dreamer_summary["runs"]["last_24h"] == 1
+    assert dreamer_summary["runs"]["avg_duration_ms"] == 1200.0
+    assert dreamer_summary["decision_totals"]["triage_keep"] == 1
+    assert dreamer_summary["decision_totals"]["links_added"] == 2
+    assert dreamer_summary["decision_totals"]["sampling_failures"] == 1
+    assert write_summary["requests_total"] == 1
+    assert write_summary["candidate_count_zero_rate"] == 1.0
+    assert write_summary["decision_totals"]["create"] == 1
+    assert write_summary["warnings"] == {"low_structure": 1}
+
+
+def test_missing_link_similarity_histogram_counts_unlinked_recent_pairs(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    alpha = make_node(
+        node_id="mem_alpha",
+        title="Alpha",
+        content="Gateway rate limiting policy.",
+        file_name="mem_alpha.md",
+        last_accessed=datetime.now(UTC),
+    )
+    beta = make_node(
+        node_id="mem_beta",
+        title="Beta",
+        content="Gateway rate limiting quotas.",
+        file_name="mem_beta.md",
+        last_accessed=datetime.now(UTC),
+    )
+    gamma = make_node(
+        node_id="mem_gamma",
+        title="Gamma",
+        content="Unrelated logging policy.",
+        file_name="mem_gamma.md",
+        last_accessed=datetime.now(UTC),
+    )
+
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        store.upsert_node(alpha, embedding=[1.0, 0.0, 0.0])
+        store.upsert_node(beta, embedding=[0.9, 0.1, 0.0])
+        store.upsert_node(gamma, embedding=[0.0, 1.0, 0.0])
+
+        histogram = store.missing_link_similarity_histogram(thresholds=(0.70, 0.90), recency_days=30)
+        pairs = store.find_missing_link_pairs(cosine_threshold=0.90, recency_days=30)
+
+    assert histogram == {"0.70": 1, "0.90": 1}
+    assert [(left.id, right.id) for left, right in pairs] == [(alpha.id, beta.id)]

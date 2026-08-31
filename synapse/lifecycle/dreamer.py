@@ -12,6 +12,7 @@ The Dreamer runs a 6-stage pipeline modeled on sleep neuroscience:
 from __future__ import annotations
 
 import logging
+import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Callable, Iterable
@@ -27,6 +28,7 @@ from synapse.server.sampling import (
     build_triage_prompt,
 )
 from synapse.storage import SQLiteNodeStore, archive_node_path, write_node_file
+from synapse.storage.sqlite import DreamerRunMetrics
 from synapse.sync import SyncBatchResult, SyncManager
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 
@@ -173,13 +175,28 @@ class Dreamer:
         )
 
         # Stage 1: Scan
-        stale = store.find_orphan_candidates(self.config.decay.janitor_days)
-        superseded = store.find_superseded_for_archival(days_threshold=7)
+        thresholds = self.config.dreamer.thresholds
+        stale_orphan_days = thresholds.stale_orphan_days or self.config.decay.janitor_days
+        link_weaving_recency_days = thresholds.link_weaving_recency_days or self.config.decay.janitor_days
+        stale = store.find_orphan_candidates(stale_orphan_days)
+        superseded = store.find_superseded_for_archival(days_threshold=thresholds.superseded_archive_days)
         disputed = self._find_disputed_pairs(store)
         missing_link_pairs = store.find_missing_link_pairs(
-            cosine_threshold=0.75,
-            recency_days=self.config.decay.janitor_days,
+            cosine_threshold=thresholds.missing_link_cosine,
+            recency_days=link_weaving_recency_days,
         )
+        raw_missing_link_pair_count = len(missing_link_pairs)
+        if raw_missing_link_pair_count > thresholds.max_missing_link_pairs_per_run:
+            missing_link_pairs = missing_link_pairs[: thresholds.max_missing_link_pairs_per_run]
+            warnings.append(
+                DreamerWarning(
+                    code="missing_link_pairs_capped",
+                    message=(
+                        f"Missing-link candidates capped at {thresholds.max_missing_link_pairs_per_run} "
+                        f"of {raw_missing_link_pair_count}. Raise missing_link_cosine or lower the cap if needed."
+                    ),
+                )
+            )
         scanned = {
             "stale": len(stale),
             "superseded": len(superseded),
@@ -222,9 +239,10 @@ class Dreamer:
         ).startup_sync()
 
         # Stage 6: Report
+        completed_at = self._utc_now()
         report = DreamerReport(
             started_at=started_at.isoformat().replace(UTC_SUFFIX, "Z"),
-            completed_at=self._utc_now().isoformat().replace(UTC_SUFFIX, "Z"),
+            completed_at=completed_at.isoformat().replace(UTC_SUFFIX, "Z"),
             scanned=scanned,
             triage=tuple(triage_decisions),
             links_added=tuple(link_decisions),
@@ -235,6 +253,7 @@ class Dreamer:
             warnings=tuple(warnings),
             sync=sync_result,
         )
+        self._record_metrics(report, store, batch_size=batch_size, duration_ms=_duration_ms(started_at, completed_at))
 
         for warning in warnings:
             self._logger.warning(warning.message, extra={"code": warning.code, "node_id": warning.node_id})
@@ -258,7 +277,10 @@ class Dreamer:
             batch = stale[batch_start : batch_start + batch_size]
             try:
                 result = self._sampling_client.sample_json(
-                    prompt=build_triage_prompt(tuple(batch)),
+                    prompt=build_triage_prompt(
+                        tuple(batch),
+                        low_structure_chars=self.config.dreamer.thresholds.low_structure_chars,
+                    ),
                     system_prompt=_TRIAGE_SYSTEM,
                     max_tokens=1500,
                 )
@@ -271,7 +293,7 @@ class Dreamer:
                             reason=str(item.get("reason") or ""),
                         )
                     )
-            except Exception as exc:
+            except (RuntimeError, ValueError, KeyError, TypeError) as exc:
                 self._logger.warning("Triage sampling failed for batch, skipping batch", exc_info=exc)
                 warnings.append(
                     DreamerWarning(
@@ -311,7 +333,7 @@ class Dreamer:
                                 node_b_id=str(item.get("node_b_id") or ""),
                             )
                         )
-            except Exception as exc:
+            except (RuntimeError, ValueError, KeyError, TypeError) as exc:
                 self._logger.warning("Link weaving sampling failed for batch, skipping", exc_info=exc)
                 warnings.append(
                     DreamerWarning(
@@ -352,7 +374,7 @@ class Dreamer:
                             reason=str(item.get("reason") or ""),
                         )
                     )
-            except Exception as exc:
+            except (RuntimeError, ValueError, KeyError, TypeError) as exc:
                 self._logger.warning("Conflict resolution sampling failed for batch, skipping", exc_info=exc)
                 warnings.append(
                     DreamerWarning(
@@ -657,3 +679,50 @@ class Dreamer:
         if current.tzinfo is None:
             return current.replace(tzinfo=UTC)
         return current.astimezone(UTC)
+
+    def _record_metrics(
+        self,
+        report: DreamerReport,
+        store: SQLiteNodeStore,
+        *,
+        batch_size: int,
+        duration_ms: int,
+    ) -> None:
+        triage_counts = {"keep": 0, "condense": 0, "archive": 0}
+        for decision in report.triage:
+            if decision.decision in triage_counts:
+                triage_counts[decision.decision] += 1
+        conflicts_superseded = sum(
+            1 for decision in report.conflicts_resolved if decision.decision in {"supersede_a", "supersede_b"}
+        )
+        conflicts_both_valid = sum(1 for decision in report.conflicts_resolved if decision.decision == "both_valid")
+        sampling_failures = sum(1 for warning in report.warnings if warning.code.endswith("_sampling_failed"))
+        try:
+            store.record_dreamer_run(
+                DreamerRunMetrics(
+                    started_at=report.started_at,
+                    completed_at=report.completed_at,
+                    duration_ms=duration_ms,
+                    batch_size=batch_size,
+                    stale_scanned=report.scanned.get("stale", 0),
+                    superseded_scanned=report.scanned.get("superseded", 0),
+                    disputed_scanned=report.scanned.get("disputed", 0),
+                    missing_link_pairs_scanned=report.scanned.get("missing_link_pairs", 0),
+                    triage_keep=triage_counts["keep"],
+                    triage_condense=triage_counts["condense"],
+                    triage_archive=triage_counts["archive"],
+                    links_added=len(report.links_added),
+                    conflicts_superseded=conflicts_superseded,
+                    conflicts_both_valid=conflicts_both_valid,
+                    archived=len(report.archived),
+                    condensed=len(report.condensed),
+                    warnings=len(report.warnings),
+                    sampling_failures=sampling_failures,
+                )
+            )
+        except sqlite3.DatabaseError as exc:  # pragma: no cover - metrics must never break lifecycle maintenance
+            self._logger.warning("Failed to record Dreamer metrics", exc_info=exc)
+
+
+def _duration_ms(started_at: datetime, completed_at: datetime) -> int:
+    return max(0, int((completed_at - started_at).total_seconds() * 1000))

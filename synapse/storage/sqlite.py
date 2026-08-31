@@ -15,7 +15,7 @@ from synapse.models import Node, NodeMetadata, NodeStatus
 from synapse.storage.markdown import extract_wiki_links
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FALLBACK_VECTOR_BACKEND = "python-fallback"
 SQLITE_VEC_BACKEND = "sqlite-vec"
 UTC_SUFFIX = "+00:00"
@@ -50,6 +50,45 @@ class IndexedFileState:
     node_id: str
     file_path: str
     source_mtime: datetime | None
+
+
+@dataclass(slots=True, frozen=True)
+class DreamerRunMetrics:
+    """Persisted summary of one Dreamer lifecycle run."""
+
+    started_at: str
+    completed_at: str
+    duration_ms: int
+    batch_size: int
+    stale_scanned: int
+    superseded_scanned: int
+    disputed_scanned: int
+    missing_link_pairs_scanned: int
+    triage_keep: int
+    triage_condense: int
+    triage_archive: int
+    links_added: int
+    conflicts_superseded: int
+    conflicts_both_valid: int
+    archived: int
+    condensed: int
+    warnings: int
+    sampling_failures: int
+
+
+@dataclass(slots=True, frozen=True)
+class WriteMemoryEventMetrics:
+    """Persisted summary of one write_memory request."""
+
+    created_at: str
+    node_id: str | None
+    node_type: str
+    action: str | None
+    candidate_count: int
+    similarity_threshold: float
+    warning_codes: tuple[str, ...]
+    sampling_provider: str
+    execution_succeeded: bool
 
 
 class SQLiteNodeStore:
@@ -154,6 +193,49 @@ class SQLiteNodeStore:
                 """
             )
             connection.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dreamer_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    batch_size INTEGER NOT NULL,
+                    stale_scanned INTEGER NOT NULL,
+                    superseded_scanned INTEGER NOT NULL,
+                    disputed_scanned INTEGER NOT NULL,
+                    missing_link_pairs_scanned INTEGER NOT NULL,
+                    triage_keep INTEGER NOT NULL,
+                    triage_condense INTEGER NOT NULL,
+                    triage_archive INTEGER NOT NULL,
+                    links_added INTEGER NOT NULL,
+                    conflicts_superseded INTEGER NOT NULL,
+                    conflicts_both_valid INTEGER NOT NULL,
+                    archived INTEGER NOT NULL,
+                    condensed INTEGER NOT NULL,
+                    warnings INTEGER NOT NULL,
+                    sampling_failures INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_dreamer_runs_started_at ON dreamer_runs(started_at)")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS write_memory_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    node_id TEXT,
+                    node_type TEXT NOT NULL,
+                    action TEXT,
+                    candidate_count INTEGER NOT NULL,
+                    similarity_threshold REAL NOT NULL,
+                    warning_codes TEXT NOT NULL,
+                    sampling_provider TEXT NOT NULL,
+                    execution_succeeded INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_write_memory_events_created_at ON write_memory_events(created_at)")
             self._ensure_vector_table(connection)
             self._ensure_fts_triggers(connection)
             self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
@@ -643,6 +725,22 @@ class SQLiteNodeStore:
         ).fetchone()
         return int(row["count"]) if row is not None else 0
 
+    def count_disputed_pairs(self) -> int:
+        """Count disputed node pairs using the same pairing semantics as Dreamer."""
+        disputed = self.find_by_status(NodeStatus.DISPUTED)
+        disputed_ids = {node.id for node in disputed}
+        seen: set[str] = set()
+        count = 0
+        for node in disputed:
+            if node.id in seen or not node.metadata.superseded_by:
+                continue
+            partner_id = node.metadata.superseded_by
+            if partner_id in disputed_ids and partner_id not in seen:
+                count += 1
+                seen.add(node.id)
+                seen.add(partner_id)
+        return count
+
     def find_by_status(self, status: NodeStatus) -> list[Node]:
         """Return all nodes matching *status*, ordered by last_accessed then id."""
         rows = self._connection.execute(
@@ -660,6 +758,223 @@ class SQLiteNodeStore:
         )
         self._connection.commit()
         return cursor.rowcount > 0
+
+    def missing_link_similarity_histogram(
+        self,
+        *,
+        thresholds: Iterable[float],
+        recency_days: int,
+    ) -> dict[str, int]:
+        """Count unlinked recent active node pairs above fixed cosine-similarity buckets."""
+        buckets = sorted({round(float(threshold), 2) for threshold in thresholds})
+        counts = {f"{threshold:.2f}": 0 for threshold in buckets}
+        if not buckets:
+            return counts
+
+        embeddings = self._recent_active_embeddings(recency_days)
+        ids = list(embeddings)
+        for i, id_a in enumerate(ids):
+            for id_b in ids[i + 1 :]:
+                if self._edge_exists_between(id_a, id_b):
+                    continue
+                similarity = _safe_cosine_similarity(embeddings[id_a], embeddings[id_b])
+                if similarity is None:
+                    continue
+                _increment_similarity_buckets(counts, buckets, similarity)
+        return counts
+
+    def _recent_active_embeddings(self, recency_days: int) -> dict[str, list[float]]:
+        cutoff = _utc_cutoff(recency_days)
+        rows = self._connection.execute(
+            """
+            SELECT n.id, v.embedding
+            FROM nodes AS n
+            JOIN nodes_vec AS v ON v.id = n.id
+            WHERE n.status = ? AND n.last_accessed > ?
+            ORDER BY n.id ASC
+            """,
+            [NodeStatus.ACTIVE.value, cutoff],
+        ).fetchall()
+        embeddings: dict[str, list[float]] = {}
+        for row in rows:
+            try:
+                embeddings[str(row["id"])] = json.loads(str(row["embedding"]))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return embeddings
+
+    def _edge_exists_between(self, id_a: str, id_b: str) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM edges
+            WHERE (source_id = ? AND target_id = ?)
+               OR (source_id = ? AND target_id = ?)
+            """,
+            [id_a, id_b, id_b, id_a],
+        ).fetchone()
+        return bool(row and int(row["cnt"]) > 0)
+
+    def record_dreamer_run(self, metrics: DreamerRunMetrics) -> None:
+        """Persist a low-cardinality Dreamer run summary for long-term stats."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO dreamer_runs (
+                    started_at, completed_at, duration_ms, batch_size,
+                    stale_scanned, superseded_scanned, disputed_scanned, missing_link_pairs_scanned,
+                    triage_keep, triage_condense, triage_archive, links_added,
+                    conflicts_superseded, conflicts_both_valid, archived, condensed,
+                    warnings, sampling_failures
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    metrics.started_at,
+                    metrics.completed_at,
+                    metrics.duration_ms,
+                    metrics.batch_size,
+                    metrics.stale_scanned,
+                    metrics.superseded_scanned,
+                    metrics.disputed_scanned,
+                    metrics.missing_link_pairs_scanned,
+                    metrics.triage_keep,
+                    metrics.triage_condense,
+                    metrics.triage_archive,
+                    metrics.links_added,
+                    metrics.conflicts_superseded,
+                    metrics.conflicts_both_valid,
+                    metrics.archived,
+                    metrics.condensed,
+                    metrics.warnings,
+                    metrics.sampling_failures,
+                ),
+            )
+
+    def record_write_memory_event(self, metrics: WriteMemoryEventMetrics) -> None:
+        """Persist a low-cardinality write_memory summary for long-term stats."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO write_memory_events (
+                    created_at, node_id, node_type, action, candidate_count,
+                    similarity_threshold, warning_codes, sampling_provider, execution_succeeded
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    metrics.created_at,
+                    metrics.node_id,
+                    metrics.node_type,
+                    metrics.action,
+                    metrics.candidate_count,
+                    metrics.similarity_threshold,
+                    json.dumps(list(metrics.warning_codes)),
+                    metrics.sampling_provider,
+                    int(metrics.execution_succeeded),
+                ),
+            )
+
+    def get_dreamer_metrics_summary(self) -> dict[str, Any]:
+        """Return aggregate Dreamer metrics for service stats payloads."""
+        aggregate = self._dreamer_aggregate_row()
+        windows = {
+            "last_24h": _utc_now_isoformat_offset(days=1),
+            "last_7d": _utc_now_isoformat_offset(days=7),
+            "last_30d": _utc_now_isoformat_offset(days=30),
+        }
+        window_counts = {
+            name: self._count_rows_since("dreamer_runs", "started_at", cutoff)
+            for name, cutoff in windows.items()
+        }
+        return {
+            "runs": {
+                "total": int(aggregate["total"] or 0),
+                **window_counts,
+                "avg_duration_ms": _round_optional(aggregate["avg_duration_ms"]),
+                "avg_triage_decisions": _round_optional(aggregate["avg_triage_decisions"]),
+                "avg_links_added": _round_optional(aggregate["avg_links_added"]),
+                "avg_condensed": _round_optional(aggregate["avg_condensed"]),
+                "avg_archived": _round_optional(aggregate["avg_archived"]),
+            },
+            "decision_totals": {
+                "triage_keep": int(aggregate["triage_keep"] or 0),
+                "triage_condense": int(aggregate["triage_condense"] or 0),
+                "triage_archive": int(aggregate["triage_archive"] or 0),
+                "links_added": int(aggregate["links_added"] or 0),
+                "conflicts_superseded": int(aggregate["conflicts_superseded"] or 0),
+                "conflicts_both_valid": int(aggregate["conflicts_both_valid"] or 0),
+                "warnings": int(aggregate["warnings"] or 0),
+                "sampling_failures": int(aggregate["sampling_failures"] or 0),
+            },
+        }
+
+    def get_write_memory_metrics_summary(self) -> dict[str, Any]:
+        """Return aggregate write_memory metrics for service stats payloads."""
+        aggregate = self._connection.execute(
+            """
+            SELECT
+                COUNT(*) AS requests_total,
+                AVG(candidate_count) AS candidate_count_avg,
+                SUM(CASE WHEN candidate_count = 0 THEN 1 ELSE 0 END) AS zero_candidate_count,
+                SUM(CASE WHEN action = 'create' THEN 1 ELSE 0 END) AS create_count,
+                SUM(CASE WHEN action = 'supersede' THEN 1 ELSE 0 END) AS supersede_count,
+                SUM(CASE WHEN action = 'complement' THEN 1 ELSE 0 END) AS complement_count,
+                SUM(CASE WHEN execution_succeeded = 0 THEN 1 ELSE 0 END) AS execution_failures
+            FROM write_memory_events
+            """
+        ).fetchone()
+        requests_total = int(aggregate["requests_total"] or 0)
+        warning_counts: dict[str, int] = {}
+        rows = self._connection.execute("SELECT warning_codes FROM write_memory_events").fetchall()
+        for row in rows:
+            try:
+                codes = json.loads(str(row["warning_codes"] or "[]"))
+            except json.JSONDecodeError:
+                continue
+            for code in codes:
+                warning_counts[str(code)] = warning_counts.get(str(code), 0) + 1
+
+        zero_count = int(aggregate["zero_candidate_count"] or 0)
+        zero_rate = round(zero_count / requests_total, 4) if requests_total else 0.0
+        return {
+            "requests_total": requests_total,
+            "candidate_count_avg": _round_optional(aggregate["candidate_count_avg"]),
+            "candidate_count_zero_rate": zero_rate,
+            "decision_totals": {
+                "create": int(aggregate["create_count"] or 0),
+                "supersede": int(aggregate["supersede_count"] or 0),
+                "complement": int(aggregate["complement_count"] or 0),
+            },
+            "warnings": warning_counts,
+            "execution_failures": int(aggregate["execution_failures"] or 0),
+        }
+
+    def _dreamer_aggregate_row(self) -> sqlite3.Row:
+        return self._connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                AVG(duration_ms) AS avg_duration_ms,
+                AVG(triage_keep + triage_condense + triage_archive) AS avg_triage_decisions,
+                AVG(links_added) AS avg_links_added,
+                AVG(condensed) AS avg_condensed,
+                AVG(archived) AS avg_archived,
+                SUM(triage_keep) AS triage_keep,
+                SUM(triage_condense) AS triage_condense,
+                SUM(triage_archive) AS triage_archive,
+                SUM(links_added) AS links_added,
+                SUM(conflicts_superseded) AS conflicts_superseded,
+                SUM(conflicts_both_valid) AS conflicts_both_valid,
+                SUM(warnings) AS warnings,
+                SUM(sampling_failures) AS sampling_failures
+            FROM dreamer_runs
+            """
+        ).fetchone()
+
+    def _count_rows_since(self, table: str, column: str, cutoff: str) -> int:
+        row = self._connection.execute(
+            f"SELECT COUNT(*) AS count FROM {table} WHERE {column} >= ?",
+            (cutoff,),
+        ).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
 
     def check_integrity(self) -> DatabaseIntegrityReport:
         integrity_row = self._connection.execute("PRAGMA integrity_check").fetchone()
@@ -821,6 +1136,10 @@ def _utc_now_isoformat() -> str:
     return datetime.now(UTC).isoformat().replace(UTC_SUFFIX, "Z")
 
 
+def _utc_now_isoformat_offset(*, days: int) -> str:
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat().replace(UTC_SUFFIX, "Z")
+
+
 def _utc_cutoff(days_threshold: int) -> str:
     return (datetime.now(UTC) - timedelta(days=days_threshold)).isoformat().replace(UTC_SUFFIX, "Z")
 
@@ -842,3 +1161,22 @@ def _cosine_distance(left: list[float], right: list[float]) -> float:
     dot = sum(a * b for a, b in zip(left, right, strict=True))
     similarity = max(-1.0, min(1.0, dot))
     return round(1.0 - similarity, 8)
+
+
+def _safe_cosine_similarity(left: list[float], right: list[float]) -> float | None:
+    try:
+        return 1.0 - _cosine_distance(left, right)
+    except ValueError:
+        return None
+
+
+def _increment_similarity_buckets(counts: dict[str, int], buckets: list[float], similarity: float) -> None:
+    for threshold in buckets:
+        if similarity >= threshold:
+            counts[f"{threshold:.2f}"] += 1
+
+
+def _round_optional(value: Any) -> float:
+    if value is None:
+        return 0.0
+    return round(float(value), 4)

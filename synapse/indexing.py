@@ -9,7 +9,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from synapse.config import EmbeddingSettings, SynapseConfig
 from synapse.embedding import create_embedding_engine
@@ -54,6 +54,8 @@ class SystemHealthReport:
     components: dict[str, str]
     stats: dict[str, int]
     warnings: list[str] = field(default_factory=list)
+    lifecycle_stats: dict[str, Any] = field(default_factory=dict)
+    write_stats: dict[str, Any] = field(default_factory=dict)
     database_path: Path | None = None
     embedding_fingerprint: str | None = None
     delta_sync_hook: str = "enabled"
@@ -241,6 +243,7 @@ def collect_health_status(
     sync_runtime = sync_manager.describe_runtime()
     sync_manager.close()
     warnings: list[str] = []
+    thresholds = _effective_dreamer_thresholds(config)
     stats = {
         "total_nodes": 0,
         "active_nodes": 0,
@@ -256,6 +259,19 @@ def collect_health_status(
         "file_watcher": sync_runtime.file_watcher,
         "startup_sync": sync_runtime.startup_sync_hook,
     }
+    lifecycle_stats: dict[str, Any] = {
+        "thresholds": thresholds,
+        "current_candidates": {
+            "stale_orphans": 0,
+            "missing_link_pairs": 0,
+            "disputed_pairs": 0,
+            "superseded_archival_candidates": 0,
+        },
+        "missing_link_similarity_histogram": _empty_similarity_histogram(),
+        "runs": _empty_dreamer_runs_summary(),
+        "decision_totals": _empty_dreamer_decision_totals(),
+    }
+    write_stats: dict[str, Any] = _empty_write_stats()
     embedding_fingerprint: str | None = None
 
     try:
@@ -267,6 +283,28 @@ def collect_health_status(
             stats["superseded_nodes"] = counts.get("superseded", 0)
             stats["disputed_nodes"] = counts.get("disputed", 0)
             embedding_fingerprint = store.get_embedding_fingerprint()
+            lifecycle_stats = {
+                "thresholds": thresholds,
+                "current_candidates": {
+                    "stale_orphans": len(store.find_orphan_candidates(thresholds["stale_orphan_days"])),
+                    "missing_link_pairs": len(
+                        store.find_missing_link_pairs(
+                            cosine_threshold=thresholds["missing_link_cosine"],
+                            recency_days=thresholds["link_weaving_recency_days"],
+                        )
+                    ),
+                    "disputed_pairs": store.count_disputed_pairs(),
+                    "superseded_archival_candidates": len(
+                        store.find_superseded_for_archival(days_threshold=thresholds["superseded_archive_days"])
+                    ),
+                },
+                "missing_link_similarity_histogram": store.missing_link_similarity_histogram(
+                    thresholds=(0.70, 0.75, 0.80, 0.85, 0.90),
+                    recency_days=thresholds["link_weaving_recency_days"],
+                ),
+                **store.get_dreamer_metrics_summary(),
+            }
+            write_stats = store.get_write_memory_metrics_summary()
             components["sqlite"] = "ok" if integrity.ok else "corrupt"
             components["wal_mode"] = "ok" if integrity.wal_mode_enabled else "disabled"
             components["vector_index"] = store.vector_backend
@@ -288,6 +326,8 @@ def collect_health_status(
         components=components,
         stats=stats,
         warnings=warnings,
+        lifecycle_stats=lifecycle_stats,
+        write_stats=write_stats,
         database_path=db_path,
         embedding_fingerprint=embedding_fingerprint,
         delta_sync_hook=(
@@ -301,6 +341,62 @@ def collect_health_status(
             else sync_runtime.startup_sync_hook
         ),
     )
+
+
+def _effective_dreamer_thresholds(config: SynapseConfig) -> dict[str, int | float]:
+    thresholds = config.dreamer.thresholds
+    stale_orphan_days = thresholds.stale_orphan_days or config.decay.janitor_days
+    link_weaving_recency_days = thresholds.link_weaving_recency_days or config.decay.janitor_days
+    return {
+        "missing_link_cosine": thresholds.missing_link_cosine,
+        "stale_orphan_days": stale_orphan_days,
+        "link_weaving_recency_days": link_weaving_recency_days,
+        "superseded_archive_days": thresholds.superseded_archive_days,
+        "low_structure_chars": thresholds.low_structure_chars,
+        "max_missing_link_pairs_per_run": thresholds.max_missing_link_pairs_per_run,
+    }
+
+
+def _empty_similarity_histogram() -> dict[str, int]:
+    return {"0.70": 0, "0.75": 0, "0.80": 0, "0.85": 0, "0.90": 0}
+
+
+def _empty_dreamer_runs_summary() -> dict[str, int | float]:
+    return {
+        "total": 0,
+        "last_24h": 0,
+        "last_7d": 0,
+        "last_30d": 0,
+        "avg_duration_ms": 0.0,
+        "avg_triage_decisions": 0.0,
+        "avg_links_added": 0.0,
+        "avg_condensed": 0.0,
+        "avg_archived": 0.0,
+    }
+
+
+def _empty_dreamer_decision_totals() -> dict[str, int]:
+    return {
+        "triage_keep": 0,
+        "triage_condense": 0,
+        "triage_archive": 0,
+        "links_added": 0,
+        "conflicts_superseded": 0,
+        "conflicts_both_valid": 0,
+        "warnings": 0,
+        "sampling_failures": 0,
+    }
+
+
+def _empty_write_stats() -> dict[str, Any]:
+    return {
+        "requests_total": 0,
+        "candidate_count_avg": 0.0,
+        "candidate_count_zero_rate": 0.0,
+        "decision_totals": {"create": 0, "supersede": 0, "complement": 0},
+        "warnings": {},
+        "execution_failures": 0,
+    }
 
 
 def run_startup_checks(

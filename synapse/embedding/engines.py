@@ -21,6 +21,7 @@ LOGGER = logging.getLogger(__name__)
 _TOKEN_PATTERN = re.compile(r"\w+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 JSON_MIME_TYPE = "application/json"
 API_KEY_PLACEHOLDER = "{api_key}"
+_REMOTE_EMBEDDING_REQUEST_BATCH_SIZE = 32
 
 
 @dataclass(slots=True, frozen=True)
@@ -245,20 +246,31 @@ class RemoteAPIEmbeddingEngine:
     def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
-        try:
-            vectors = _request_embedding_vectors(
-                client=self.client,
-                endpoint=self.endpoint,
-                model_name=self.model_name,
-                texts=texts,
-                timeout_seconds=self.timeout_seconds,
-                expected_dimension=self.dimension,
-            )
-        except ProviderError as exc:
-            self.last_known_available = False
-            LOGGER.warning("Remote embedding provider unavailable: %s", exc)
-            return self.fallback_engine.embed_batch(texts)
-        self.last_known_available = True
+
+        # A large list input can exceed the HTTP provider's request processing
+        # budget even when every individual document fits its context window.
+        # Keep requests bounded so one timeout does not replace the entire
+        # rebuild with deterministic fallback vectors.
+        vectors: list[list[float]] = []
+        all_batches_succeeded = True
+        for batch_start in range(0, len(texts), _REMOTE_EMBEDDING_REQUEST_BATCH_SIZE):
+            batch = texts[batch_start : batch_start + _REMOTE_EMBEDDING_REQUEST_BATCH_SIZE]
+            try:
+                batch_vectors = _request_embedding_vectors(
+                    client=self.client,
+                    endpoint=self.endpoint,
+                    model_name=self.model_name,
+                    texts=batch,
+                    timeout_seconds=self.timeout_seconds,
+                    expected_dimension=self.dimension,
+                )
+            except ProviderError as exc:
+                all_batches_succeeded = False
+                LOGGER.warning("Remote embedding provider unavailable: %s", exc)
+                vectors.extend(self.fallback_engine.embed_batch(batch))
+            else:
+                vectors.extend(batch_vectors)
+        self.last_known_available = all_batches_succeeded
         return vectors
 
 

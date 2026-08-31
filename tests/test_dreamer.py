@@ -5,6 +5,7 @@ from pathlib import Path
 from synapse.config import SynapseConfig
 from synapse.lifecycle import Dreamer
 from synapse.models import Node, NodeMetadata, NodeStatus
+from synapse.storage import SQLiteNodeStore
 from synapse.utils.runtime import RuntimePaths, bootstrap_runtime_directories
 
 
@@ -42,7 +43,8 @@ def test_triage_sampling_failure_skips_batch_without_archive_decisions(tmp_path:
     dreamer = make_dreamer(tmp_path)
     warnings = []
 
-    decisions = dreamer._run_triage(  # noqa: SLF001
+    run_triage = getattr(dreamer, "_run_triage")
+    decisions = run_triage(
         [make_node("stale-1"), make_node("stale-2")],
         batch_size=2,
         warnings=warnings,
@@ -58,7 +60,8 @@ def test_link_weaving_sampling_failure_skips_batch(tmp_path: Path) -> None:
     dreamer = make_dreamer(tmp_path)
     warnings = []
 
-    decisions = dreamer._run_link_weaving(  # noqa: SLF001
+    run_link_weaving = getattr(dreamer, "_run_link_weaving")
+    decisions = run_link_weaving(
         [(make_node("node-a"), make_node("node-b"))],
         batch_size=1,
         warnings=warnings,
@@ -72,7 +75,8 @@ def test_conflict_resolution_sampling_failure_skips_batch(tmp_path: Path) -> Non
     dreamer = make_dreamer(tmp_path)
     warnings = []
 
-    decisions = dreamer._run_conflict_resolution(  # noqa: SLF001
+    run_conflict_resolution = getattr(dreamer, "_run_conflict_resolution")
+    decisions = run_conflict_resolution(
         [(make_node("node-a"), make_node("node-b"))],
         batch_size=1,
         warnings=warnings,
@@ -80,6 +84,23 @@ def test_conflict_resolution_sampling_failure_skips_batch(tmp_path: Path) -> Non
 
     assert decisions == []
     assert warnings[0].code == "conflict_resolution_sampling_failed"
+
+
+def test_dreamer_records_run_metrics_for_completed_cycle(tmp_path: Path) -> None:
+    config, runtime_paths = make_runtime(tmp_path)
+    dreamer = Dreamer(config, runtime_paths=runtime_paths, sampling_client=FailingSamplingClient())
+
+    try:
+        report = dreamer.run(batch_size=3)
+    finally:
+        dreamer.close()
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=1024) as store:
+        summary = store.get_dreamer_metrics_summary()
+
+    assert report.scanned == {"stale": 0, "superseded": 0, "disputed": 0, "missing_link_pairs": 0}
+    assert summary["runs"]["total"] == 1
+    assert summary["decision_totals"]["triage_keep"] == 0
 
 
 def test_condensation_product_is_okf_format() -> None:

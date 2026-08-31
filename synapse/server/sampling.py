@@ -189,7 +189,7 @@ def parse_sampling_json_result(result: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def build_triage_prompt(nodes: tuple[Node, ...]) -> str:
+def build_triage_prompt(nodes: tuple[Node, ...], *, low_structure_chars: int = 100) -> str:
     """Render a triage prompt for the Dreamer's NREM consolidation stage."""
 
     return "\n".join(
@@ -201,7 +201,7 @@ def build_triage_prompt(nodes: tuple[Node, ...]) -> str:
             "2. Condense records that overlap or answer the same question — they will be merged into a summary.",
             "3. Archive records that are outdated, superseded by context, or too narrow to be useful.",
             "4. When unsure, prefer archive over keep.",
-            "5. Records with content under 100 characters and no ## sections (low-structure notes) should be condensed or archived, not kept.",
+            f"5. Records with content under {low_structure_chars} characters and no ## sections (low-structure notes) should be condensed or archived, not kept.",
             _JSON_ONLY_INSTRUCTION,
             "",
             "Stale records:",

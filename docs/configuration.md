@@ -231,6 +231,19 @@ Controls the Dreamer — Synapse's background memory consolidation engine (model
 - `interval_hours` (int, ≥1, default `12`) — interval between automatic Dreamer runs in hours
 - `batch_size` (int, 1-20, default `8`) — number of nodes or node pairs sent to the Decider per batch
 
+#### `[dreamer.thresholds]`
+
+Controls the tunable lifecycle thresholds used by Dreamer scan and triage. Defaults preserve the original conservative behavior.
+
+- `missing_link_cosine` (float, 0.0-1.0, default `0.75`) — cosine similarity required before an unlinked recent node pair is sent to link weaving
+- `stale_orphan_days` (int, default `[decay].janitor_days`) — age threshold for unlinked active nodes to enter stale orphan triage
+- `link_weaving_recency_days` (int, default `[decay].janitor_days`) — recency window for active nodes considered by missing-link discovery
+- `superseded_archive_days` (int, default `7`) — age threshold before superseded nodes can be archived
+- `low_structure_chars` (int, default `100`) — triage prompt threshold below which sectionless notes are treated as low-structure
+- `max_missing_link_pairs_per_run` (int, default `100`) — safety cap for how many missing-link pairs a single Dreamer run sends to the Decider
+
+Use `synapse status` to inspect the current lifecycle candidate counts, Dreamer run aggregates, write-path decision ratios, and effective threshold values before tuning these settings.
+
 #### How Dreamer triggers
 
 Dreamer runs are scheduled **in-process** by `DreamerScheduler` (a daemon `threading.Timer`), not by launchd or cron:

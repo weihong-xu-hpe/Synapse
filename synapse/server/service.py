@@ -6,6 +6,8 @@ import contextvars
 import json
 import logging
 import re
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,7 @@ from synapse.server.sampling import (
 )
 from synapse.storage import (
     SQLiteNodeStore,
+    WriteMemoryEventMetrics,
     extract_wiki_links,
     split_frontmatter,
     write_node_file,
@@ -298,6 +301,15 @@ class SynapseServerService:
                 reasoning=decision_payload["reasoning"],
             )
         except SynapseServiceError as exc:
+            self._record_write_memory_metrics(
+                node_id=None,
+                node_type=normalized_type.value,
+                decision_payload=decision_payload,
+                evidence=payload["evidence"],
+                similarity_threshold=similarity_threshold,
+                warning_codes=[warning["code"] for warning in warnings],
+                execution_succeeded=False,
+            )
             raise SynapseServiceError(
                 "EXECUTION_FAILED_AFTER_DECISION",
                 "Sampling produced a decision, but the subsequent low-level write failed",
@@ -308,6 +320,18 @@ class SynapseServerService:
                     "execution_error": exc.to_payload()["error"],
                 },
             ) from exc
+
+        node_payload = integrate_result.get("node") if isinstance(integrate_result, dict) else None
+        node_id = str(node_payload.get("id")) if isinstance(node_payload, dict) else None
+        self._record_write_memory_metrics(
+            node_id=node_id,
+            node_type=normalized_type.value,
+            decision_payload=decision_payload,
+            evidence=payload["evidence"],
+            similarity_threshold=similarity_threshold,
+            warning_codes=[warning["code"] for warning in warnings],
+            execution_succeeded=True,
+        )
 
         result = {
             "decision": decision_payload,
@@ -461,6 +485,8 @@ class SynapseServerService:
             "status": health.status,
             "components": health.components,
             "stats": health.stats,
+            "lifecycle_stats": health.lifecycle_stats,
+            "write_stats": health.write_stats,
             "warnings": health.warnings,
             "database_path": health.database_path.as_posix() if health.database_path is not None else None,
             "embedding_fingerprint": health.embedding_fingerprint,
@@ -938,3 +964,32 @@ class SynapseServerService:
         if isinstance(payload, list):
             return [self._redact_payload(item) for item in payload]
         return payload
+
+    def _record_write_memory_metrics(
+        self,
+        *,
+        node_id: str | None,
+        node_type: str,
+        decision_payload: dict[str, Any],
+        evidence: dict[str, Any],
+        similarity_threshold: float,
+        warning_codes: list[str],
+        execution_succeeded: bool,
+    ) -> None:
+        try:
+            with self._store() as store:
+                store.record_write_memory_event(
+                    WriteMemoryEventMetrics(
+                        created_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                        node_id=node_id,
+                        node_type=node_type,
+                        action=str(decision_payload.get("action")) if decision_payload.get("action") else None,
+                        candidate_count=int(evidence.get("candidate_count") or 0),
+                        similarity_threshold=float(similarity_threshold),
+                        warning_codes=tuple(warning_codes),
+                        sampling_provider=str(evidence.get("sampling_provider") or ""),
+                        execution_succeeded=execution_succeeded,
+                    )
+                )
+        except (OSError, ValueError, sqlite3.DatabaseError) as exc:  # pragma: no cover - metrics must never break writes
+            self.logger.warning("Failed to record write_memory metrics", exc_info=exc)

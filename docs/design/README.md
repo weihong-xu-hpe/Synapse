@@ -64,6 +64,17 @@
 - OKF 格式约束如何落地
 - 4 个子阶段的优先级与依赖关系
 
+### 6. `TODO-dreamer-stats-thresholds.md`
+
+Dreamer 观测指标与阈值配置化设计（待评审）。
+
+回答：
+
+- 为什么当前 0.75 / 0.8 / 0.9 类门槛只能作为保守默认值，不能长期写死
+- 如何通过 `stats` 暴露 Dreamer/write path 的长期趋势和候选漏斗
+- 哪些 Dreamer 门槛应该优先配置化
+- 如何用实际运行数据微调 Mac 本地环境的阈值
+
 ---
 
 ## Archive Policy
@@ -93,5 +104,6 @@
 3. `TODO-local-llm-upgrade.md`
 4. `TODO-sampling-only-cutover.md`
 5. `TODO-agent-validation-followup.md`
+6. `TODO-dreamer-stats-thresholds.md`
 
 读完这几份，再决定是否需要查看 `archive/` 里的历史材料。

@@ -144,12 +144,24 @@ class DeciderSettings(BaseModel):
     temperature: float = 0.1
 
 
+class DreamerThresholdSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    missing_link_cosine: float = Field(default=0.75, ge=0.0, le=1.0)
+    stale_orphan_days: int | None = Field(default=None, ge=1)
+    link_weaving_recency_days: int | None = Field(default=None, ge=1)
+    superseded_archive_days: int = Field(default=7, ge=1)
+    low_structure_chars: int = Field(default=100, ge=1)
+    max_missing_link_pairs_per_run: int = Field(default=100, ge=1)
+
+
 class DreamerSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
     interval_hours: int = Field(default=12, ge=1)
     batch_size: int = Field(default=8, ge=1, le=20)
+    thresholds: DreamerThresholdSettings = Field(default_factory=DreamerThresholdSettings)
 
 
 class SynapseConfig(BaseModel):

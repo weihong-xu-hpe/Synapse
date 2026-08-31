@@ -18,9 +18,11 @@ from synapse.storage.markdown import (
 )
 from synapse.storage.sqlite import (
 	DatabaseIntegrityReport,
+	DreamerRunMetrics,
 	IndexedFileState,
 	RebuildProgress,
 	SQLiteNodeStore,
+	WriteMemoryEventMetrics,
 	build_node_alias_map,
 	resolve_links_to_node_ids,
 )
@@ -39,9 +41,11 @@ __all__ = [
 	"scan_markdown_nodes",
 	"serialize_frontmatter",
 	"DatabaseIntegrityReport",
+	"DreamerRunMetrics",
 	"IndexedFileState",
 	"RebuildProgress",
 	"SQLiteNodeStore",
+	"WriteMemoryEventMetrics",
 	"split_frontmatter",
 	"build_node_alias_map",
 	"resolve_links_to_node_ids",

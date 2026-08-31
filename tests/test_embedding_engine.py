@@ -132,6 +132,74 @@ def test_remote_api_provider_applies_headers_and_auth(monkeypatch) -> None:
         assert headers["x-tenant"] == "dev"
 
 
+def test_remote_embedding_batches_large_requests_without_falling_back_whole_batch(monkeypatch) -> None:
+    captured_inputs: list[list[str]] = []
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        payload = json.loads(request.data.decode("utf-8"))
+        inputs = payload["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        captured_inputs.append(inputs)
+        return FakeHTTPResponse({"data": [{"embedding": _vector(1024, value=0.25)} for _ in inputs]})
+
+    monkeypatch.setattr(engine_module.urllib_request, "urlopen", fake_urlopen)
+
+    providers = ProviderSettings(
+        remote_api=RemoteAPIProviderSettings(
+            base_url="https://models.example.com",
+            embedding_endpoint="/v1/embeddings",
+        )
+    )
+    embedding = create_embedding_engine(
+        EmbeddingSettings(provider="remote_api", model="bge-m3"),
+        providers=providers,
+    )
+
+    texts = [f"document-{index}" for index in range(33)]
+    vectors = embedding.embed_batch(texts)
+
+    assert [len(inputs) for inputs in captured_inputs] == [32, 1]
+    assert len(vectors) == len(texts)
+    assert embedding.is_available() is True
+
+
+def test_remote_embedding_reports_partial_batch_fallback(monkeypatch) -> None:
+    calls = 0
+
+    def fake_urlopen(request, timeout):
+        nonlocal calls
+        del timeout
+        calls += 1
+        if calls == 2:
+            raise URLError("temporary provider failure")
+        payload = json.loads(request.data.decode("utf-8"))
+        inputs = payload["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        return FakeHTTPResponse({"data": [{"embedding": _vector(1024, value=0.25)} for _ in inputs]})
+
+    monkeypatch.setattr(engine_module.urllib_request, "urlopen", fake_urlopen)
+
+    providers = ProviderSettings(
+        remote_api=RemoteAPIProviderSettings(
+            base_url="https://models.example.com",
+            embedding_endpoint="/v1/embeddings",
+        )
+    )
+    embedding = create_embedding_engine(
+        EmbeddingSettings(provider="remote_api", model="bge-m3"),
+        providers=providers,
+    )
+
+    vectors = embedding.embed_batch([f"document-{index}" for index in range(65)])
+
+    assert len(vectors) == 65
+    assert calls == 3
+    assert embedding.is_available() is False
+
+
 def test_unavailable_provider_degrades_gracefully(monkeypatch) -> None:
     def failing_urlopen(request, timeout):
         del request, timeout

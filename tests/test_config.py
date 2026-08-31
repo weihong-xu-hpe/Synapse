@@ -40,6 +40,12 @@ archive_path = "./.synapse/.archive"
     assert config.dreamer.enabled is True
     assert config.dreamer.interval_hours == 12
     assert config.dreamer.batch_size == 8
+    assert config.dreamer.thresholds.missing_link_cosine == 0.75
+    assert config.dreamer.thresholds.stale_orphan_days is None
+    assert config.dreamer.thresholds.link_weaving_recency_days is None
+    assert config.dreamer.thresholds.superseded_archive_days == 7
+    assert config.dreamer.thresholds.low_structure_chars == 100
+    assert config.dreamer.thresholds.max_missing_link_pairs_per_run == 100
     assert config.resolve_path(config.memory.base_path) == (tmp_path / ".synapse").resolve()
 
 
@@ -160,6 +166,14 @@ def test_load_config_parses_dreamer_block(tmp_path: Path) -> None:
 enabled = false
 interval_hours = 6
 batch_size = 12
+
+[dreamer.thresholds]
+missing_link_cosine = 0.82
+stale_orphan_days = 14
+link_weaving_recency_days = 21
+superseded_archive_days = 3
+low_structure_chars = 80
+max_missing_link_pairs_per_run = 25
 """.strip(),
         encoding="utf-8",
     )
@@ -169,3 +183,9 @@ batch_size = 12
     assert config.dreamer.enabled is False
     assert config.dreamer.interval_hours == 6
     assert config.dreamer.batch_size == 12
+    assert config.dreamer.thresholds.missing_link_cosine == 0.82
+    assert config.dreamer.thresholds.stale_orphan_days == 14
+    assert config.dreamer.thresholds.link_weaving_recency_days == 21
+    assert config.dreamer.thresholds.superseded_archive_days == 3
+    assert config.dreamer.thresholds.low_structure_chars == 80
+    assert config.dreamer.thresholds.max_missing_link_pairs_per_run == 25

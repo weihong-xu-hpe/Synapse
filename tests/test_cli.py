@@ -175,6 +175,8 @@ def test_cli_phase3_commands_create_runtime_logs_and_report_health(tmp_path: Pat
     status_output = runner.invoke(app, ["--config", str(config_path), "status"]).output
     assert "Synapse status: healthy" in status_output
     assert "Indexed nodes: 2" in status_output
+    assert "Lifecycle stats:" in status_output
+    assert "Write stats:" in status_output
     assert "Delta sync hook: enabled" in status_output
     assert "Daemon runtime: active" in status_output
 
