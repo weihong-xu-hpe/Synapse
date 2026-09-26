@@ -21,6 +21,7 @@ Synapse is built around a local-first model:
 - Markdown-backed memory nodes with YAML frontmatter
 - local indexing and hybrid retrieval
 - MCP server surface for retrieval and high-level memory actions
+- REST endpoints: `/api/search` (session-key exclusion) and `/api/write` (keyed session upsert or LLM-decided write)
 - write-path conflict detection
 - lifecycle janitor and condensation flows
 - macOS `launchd` and Linux `systemd --user` daemon support

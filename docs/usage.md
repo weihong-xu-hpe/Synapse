@@ -16,6 +16,7 @@ pip install -e ".[dev]"
 python -m synapse version
 python -m synapse status
 python -m synapse rebuild-index
+python -m synapse dedupe-session-summaries
 python -m synapse serve --run-server
 pytest
 ```
@@ -144,11 +145,51 @@ Startup checks plus the server runtime:
 python -m synapse serve --run-server
 ```
 
+## REST API
+
+When the server runs (`serve --run-server`), two REST endpoints are available alongside MCP:
+
+### POST /api/search
+
+```json
+{"query": "...", "top_k": 3, "exclude_session_key": "..."}
+```
+
+`exclude_session_key` is optional: the node derived from that session key is removed from the results and candidates.
+
+### POST /api/write
+
+Without `session_key`, the write goes through the sampling-backed decider (LLM). If an ACTIVE node with the same title and byte-identical content already exists, it is returned as `unchanged` without calling the LLM.
+
+With an optional `session_key`, the write is a deterministic keyed upsert — no LLM involved:
+
+```json
+{"session_key": "omp-session-123", "title": "Session summary — x", "content": "...", "type": "transient"}
+```
+
+- node id is derived from the key (`mem_session_<16 hex of sha1(key)>`), so repeated writes for the same session converge on one node
+- absent → `created`; identical title+content → `unchanged`; different → `updated` in place (markdown + index + re-embed)
+- concurrent same-key writes serialize; concurrent identical unkeyed writes are guarded (exactly one node)
+
 ## Lifecycle
 
 Lifecycle maintenance — stale orphan eviction, superseded archival, disputed review, missing link discovery, and archive condensation — is handled by the `run_dreamer` MCP tool.
 
-There are no separate CLI commands for janitor or condensation; invoke `run_dreamer` through an MCP client with sampling support.
+Superseded archival resolves the `superseded_by` chain to its terminal node: a node is archived when the terminal is ACTIVE with a file on disk, when the terminal is missing from the index (already archived or deleted), or when `superseded_by` is missing entirely. Nodes whose terminal is DISPUTED (live disagreement) or whose chain is cyclic are kept.
+
+## Maintenance commands
+
+Archive duplicate/stale session summaries (`Session summary — %` titles): exact duplicates keep the newest copy, prefix-subsumed older versions are archived, and stale superseded nodes are cleaned up. Dry-run by default:
+
+```bash
+python -m synapse dedupe-session-summaries
+```
+
+Execute (writes a JSON manifest of archived ids + original paths into `.archive/` for reversibility):
+
+```bash
+python -m synapse dedupe-session-summaries --apply
+```
 
 ## Service management
 
