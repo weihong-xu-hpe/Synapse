@@ -349,14 +349,20 @@ def _create_rest_search_handler(service: SynapseServerService):
                 content={"error": {"code": "INVALID_QUERY", "message": "Search query must not be blank", "details": {}}},
             )
         top_k = int(body.get("top_k", 3))
-        result = await run_in_threadpool(service.search_memory, query, top_k)
+        exclude_session_key = body.get("exclude_session_key")
+        result = await run_in_threadpool(
+            service.search_memory,
+            query,
+            top_k,
+            exclude_session_key=str(exclude_session_key) if exclude_session_key else None,
+        )
         return JSONResponse(status_code=200, content=result)
 
     return search_memory
 
 
 def _create_rest_write_handler(service: SynapseServerService):
-    """Thin REST wrapper around service.write_memory for non-MCP clients (e.g. omp hooks)."""
+    """Thin REST wrapper for non-MCP clients (e.g. omp hooks)."""
 
     async def write_memory(request: Request) -> JSONResponse:
         body = await request.json()
@@ -366,6 +372,21 @@ def _create_rest_write_handler(service: SynapseServerService):
                 status_code=400,
                 content={"error": {"code": "INVALID_TITLE", "message": "Title must not be blank", "details": {}}},
             )
+        session_key = body.get("session_key")
+        if session_key and str(session_key).strip():
+            result = await run_in_threadpool(
+                service.upsert_session_memory,
+                session_key=str(session_key),
+                title=title,
+                content=str(body.get("content", "")),
+                node_type=body.get("type", "transient"),
+                links=body.get("links"),
+                sensitivity=body.get("sensitivity", "internal"),
+            )
+            return JSONResponse(status_code=200, content=result)
+
+        # Unkeyed path: write_memory itself guards against concurrent
+        # identical writes (lock held across guard -> decider -> integrate).
         result = await run_in_threadpool(
             service.write_memory,
             title,
@@ -379,6 +400,7 @@ def _create_rest_write_handler(service: SynapseServerService):
         return JSONResponse(status_code=200, content=result)
 
     return write_memory
+
 
 def _create_auth_logging_middleware(config, service: SynapseServerService, logger):
     async def auth_and_logging(request: Request, call_next):

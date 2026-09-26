@@ -241,7 +241,8 @@ def test_run_streamable_server_uses_runtime_factory_and_runner(tmp_path: Path) -
     runtime_paths = bootstrap_runtime_directories(config)
     captured: dict[str, object] = {}
 
-    def fake_runner(app, *, host: str, port: int, log_level: str) -> None:
+    def fake_runner(app, *, host: str, port: int, log_level: str, log_config: dict | None = None) -> None:
+        del log_config
         captured["app"] = app
         captured["host"] = host
         captured["port"] = port
@@ -996,3 +997,235 @@ def test_root_handler_advertises_rest_endpoints(tmp_path: Path) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["rest"] == {"search": "/api/search", "write": "/api/write"}
+
+
+def test_keyed_upsert_create_unchanged_update(tmp_path: Path) -> None:
+    """session_key upsert: create -> identical is unchanged -> changed updates in place."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/write",
+            json={
+                "session_key": "session-abc",
+                "title": "Session summary — test",
+                "content": "First version of the session.",
+                "type": "transient",
+            },
+        )
+        assert first.status_code == 200
+        body = first.json()
+        node_id = body["node"]["id"]
+        assert body["action"] == "created"
+        assert node_id.startswith("mem_session_")
+        assert body["session_key"] == "session-abc"
+
+        second = client.post(
+            "/api/write",
+            json={
+                "session_key": "session-abc",
+                "title": "Session summary — test",
+                "content": "First version of the session.",
+                "type": "transient",
+            },
+        )
+        assert second.status_code == 200
+        assert second.json()["action"] == "unchanged"
+        assert second.json()["node"]["id"] == node_id
+
+        third = client.post(
+            "/api/write",
+            json={
+                "session_key": "session-abc",
+                "title": "Session summary — test",
+                "content": "Second version with more detail.",
+                "type": "transient",
+            },
+        )
+        assert third.status_code == 200
+        assert third.json()["action"] == "updated"
+        assert third.json()["node"]["id"] == node_id
+        assert third.json()["node"]["content"] == "Second version with more detail."
+
+    # Exactly one node for the key, and the key persisted in frontmatter.
+    node_file = runtime_paths.active / f"{node_id}.md"
+    assert node_file.exists()
+    assert "session_key: session-abc" in node_file.read_text(encoding="utf-8")
+
+    # Metrics recorded with session-upsert provider.
+    import sqlite3
+    db = sqlite3.connect(runtime_paths.base / "synapse.db")
+    rows = db.execute(
+        "SELECT sampling_provider, COUNT(*) FROM write_memory_events WHERE node_id = ? GROUP BY sampling_provider",
+        (node_id,),
+    ).fetchall()
+    db.close()
+    assert rows == [("session-upsert", 3)]
+
+
+def test_keyed_upsert_concurrent_same_key_creates_one_node(tmp_path: Path) -> None:
+    """Concurrent same-key writes serialize: exactly one node, last write wins."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    import threading
+
+    statuses: list[str] = []
+    errors: list[Exception] = []
+    barrier = threading.Barrier(4)
+
+    def worker(index: int) -> None:
+        barrier.wait()
+        try:
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/api/write",
+                    json={
+                        "session_key": "concurrent-key",
+                        "title": "Session summary — concurrent",
+                        "content": f"Version {index}.",
+                        "type": "transient",
+                    },
+                )
+                statuses.append(resp.json()["action"])
+        except Exception as exc:  # pragma: no cover - diagnostic
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    session_files = list(runtime_paths.active.glob("mem_session_*.md"))
+    assert len(session_files) == 1
+    assert statuses.count("created") == 1
+    assert statuses.count("unchanged") + statuses.count("updated") == 3
+
+
+def test_unkeyed_write_identical_content_guard(tmp_path: Path) -> None:
+    """Unkeyed write with an existing identical ACTIVE node returns unchanged, no decider."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    app = create_app(config, runtime_paths=runtime_paths, sampling_client=FakeSamplingClient())
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/write",
+            json={"title": "Guard Fixture", "content": "Identical body.", "type": "transient"},
+        )
+        assert first.status_code == 200
+
+        second = client.post(
+            "/api/write",
+            json={"title": "Guard Fixture", "content": "Identical body.", "type": "transient"},
+        )
+        assert second.status_code == 200
+        payload = second.json()
+        assert payload["action"] == "unchanged"
+        assert payload["node"]["title"] == "Guard Fixture"
+
+
+def test_rest_search_exclude_session_key(tmp_path: Path) -> None:
+    """exclude_session_key removes the derived node from results."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    with TestClient(app) as client:
+        up = client.post(
+            "/api/write",
+            json={
+                "session_key": "exclude-me",
+                "title": "Session summary — exclude",
+                "content": "Distinctive exclude-marker content for the session node.",
+                "type": "transient",
+            },
+        )
+        assert up.status_code == 200
+        session_node_id = up.json()["node"]["id"]
+
+        with_results = client.post(
+            "/api/search",
+            json={"query": "exclude-marker content session node", "top_k": 5},
+        )
+        ids_with = [item["node_id"] for item in with_results.json()["results"]]
+        assert session_node_id in ids_with
+
+        without = client.post(
+            "/api/search",
+            json={
+                "query": "exclude-marker content session node",
+                "top_k": 5,
+                "exclude_session_key": "exclude-me",
+            },
+        )
+        ids_without = [item["node_id"] for item in without.json()["results"]]
+        assert session_node_id not in ids_without
+
+
+def test_unkeyed_concurrent_identical_writes_create_one_node(tmp_path: Path) -> None:
+    """Two concurrent identical unkeyed writes with a slow decider: exactly one
+    node created, the other returns the guard payload (no duplicate)."""
+
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    class SlowDecider:
+        name = "slow-fake"
+
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+            raise AssertionError("unexpected sampling")
+
+        def decide_memory_write(self, request):
+            sleep(0.3)  # widen the race window
+            return MemoryWriteSamplingDecision(
+                action="create",
+                target_node_ids=(),
+                reasoning="slow create",
+                confidence=0.9,
+            )
+
+    app = create_app(config, runtime_paths=runtime_paths, sampling_client=SlowDecider())
+
+    statuses: list[object] = []
+    errors: list[Exception] = []
+    import threading
+
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        barrier.wait()
+        try:
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/api/write",
+                    json={"title": "Race Fixture", "content": "Same body both times.", "type": "transient"},
+                )
+                statuses.append(resp.json())
+        except Exception as exc:  # pragma: no cover - diagnostic
+            errors.append(exc)
+
+    threads = [Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    actions = sorted(s.get("action", "<decider-path>") for s in statuses if isinstance(s, dict))
+    assert actions.count("unchanged") == 1, statuses
+    created = [s for s in statuses if isinstance(s, dict) and "decision" in s]
+    assert len(created) == 1
+
+    # Exactly one node file for the title.
+    node_files = list(runtime_paths.active.glob("*race_fixture*.md"))
+    assert len(node_files) == 1

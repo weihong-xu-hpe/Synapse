@@ -133,6 +133,7 @@ class StreamableRuntime:
             host=host or self.config.server.host,
             port=port or self.config.server.port,
             log_level=log_level,
+            log_config=_uvicorn_log_config(),
         )
 
 
@@ -151,6 +152,50 @@ def create_streamable_runtime(
         logger=logger,
         sampling_client=sampling_client,
     )
+
+
+def _uvicorn_log_config() -> dict[str, Any]:
+    """Uvicorn logging config that timestamps access/error lines.
+
+    launchd captures stdout/stderr raw; without timestamps the service logs
+    cannot be correlated with anything. Mirrors uvicorn's default dict config
+    with explicit asctime formatters.
+    """
+
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "()": "uvicorn.logging.DefaultFormatter",
+                "fmt": "%(levelprefix)s %(asctime)s %(message)s",
+                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+                "use_colors": None,
+            },
+            "access": {
+                "()": "uvicorn.logging.AccessFormatter",
+                "fmt": '%(levelprefix)s %(asctime)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+            },
+        },
+        "handlers": {
+            "default": {
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stderr",
+            },
+            "access": {
+                "formatter": "access",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            },
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "uvicorn.error": {"level": "INFO"},
+            "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
+        },
+    }
 
 
 def create_streamable_app(

@@ -13,9 +13,14 @@ from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 LOG_FILES = {
     "synapse.mcp-daemon": "mcp-daemon.log",
     "synapse.file-watcher": "file-watcher.log",
-    "synapse.janitor": "janitor.log",
     "synapse.audit": "audit.log",
 }
+
+# Module loggers without a dedicated file. They propagate to the "synapse"
+# parent logger, whose handler writes them to this rotating JSON file —
+# otherwise they fall through to root/stderr (untimestamped launchd capture).
+GENERIC_LOG_FILE = "synapse.log"
+GENERIC_LOGGER_PARENT = "synapse"
 
 
 class JsonLineFormatter(logging.Formatter):
@@ -80,7 +85,6 @@ def configure_logging(config: SynapseConfig, runtime_paths: RuntimePaths | None 
 
     for logger_name, file_name in LOG_FILES.items():
         logger = logging.getLogger(logger_name)
-        logger.setLevel(logging.INFO)
         logger.propagate = False
         _reset_handlers(logger)
 
@@ -93,5 +97,19 @@ def configure_logging(config: SynapseConfig, runtime_paths: RuntimePaths | None 
         handler.setFormatter(formatter)
         logger.addHandler(handler)
         configured[logger_name] = logger
+
+    parent = logging.getLogger(GENERIC_LOGGER_PARENT)
+    parent.setLevel(logging.INFO)
+    parent.propagate = False
+    _reset_handlers(parent)
+    parent_handler = RotatingFileHandler(
+        paths.logs / GENERIC_LOG_FILE,
+        maxBytes=max_bytes,
+        backupCount=config.logging.retention_days,
+        encoding="utf-8",
+    )
+    parent_handler.setFormatter(formatter)
+    parent.addHandler(parent_handler)
+    configured[GENERIC_LOGGER_PARENT] = parent
 
     return configured

@@ -108,6 +108,9 @@ class NodeMetadata(BaseModel):
     status: NodeStatus = NodeStatus.ACTIVE
     supersedes: list[str] = Field(default_factory=list)
     superseded_by: str | None = None
+    # Session-keyed upsert provenance (bridge integration). Persisted in
+    # frontmatter so Markdown stays canonical and rebuilds preserve it.
+    session_key: str | None = None
     tags: list[str] = Field(default_factory=list)
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
 

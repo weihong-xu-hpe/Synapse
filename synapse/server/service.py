@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import re
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -95,7 +97,6 @@ class SyncFailedError(SynapseServiceError):
 
 class SynapseServerService:
     """High-level operations exposed through the Synapse server layer."""
-
     def __init__(
         self,
         config,
@@ -111,6 +112,11 @@ class SynapseServerService:
             f"synapse_sampling_client_{id(self)}",
             default=sampling_client,
         )
+        # Serializes concurrent session-keyed upserts of the same key, and
+        # unkeyed writes of the same (title, content-hash) pair.
+        self._session_key_locks: dict[str, threading.Lock] = {}
+        self._session_key_locks_guard = threading.Lock()
+        self._content_write_locks: dict[str, threading.Lock] = {}
 
     @property
     def sampling_client(self) -> SamplingClient | None:
@@ -126,14 +132,21 @@ class SynapseServerService:
     def reset_sampling_client(self, token: object) -> None:
         self._sampling_client_var.reset(token)
 
-    def search_memory(self, query: str, top_k: int = 3) -> dict[str, Any]:
+    def search_memory(self, query: str, top_k: int = 3, *, exclude_session_key: str | None = None) -> dict[str, Any]:
         if not query.strip():
             raise SynapseServiceError("INVALID_QUERY", "Search query must not be blank")
         response = self._run_retrieval_search(query, top_k=top_k, update_access=True)
+        excluded_id: str | None = None
+        if exclude_session_key and exclude_session_key.strip():
+            excluded_id = self._session_node_id(exclude_session_key.strip())
         payload: dict[str, Any] = {
             "query": response.query,
             "top_k": top_k,
-            "results": [self._serialize_retrieval_item(item) for item in response.results],
+            "results": [
+                self._serialize_retrieval_item(item)
+                for item in response.results
+                if excluded_id is None or item.node.id != excluded_id
+            ],
             "context": response.context,
         }
         self._log_tool_call("search_memory", {"query": query, "top_k": top_k}, payload)
@@ -266,6 +279,63 @@ class SynapseServerService:
         query_hint: str | None = None,
         similarity_threshold: float = 0.3,
     ) -> dict[str, Any]:
+        clean_title = title.strip()
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        # Hold the (title, content-hash) lock across guard check -> decider ->
+        # integrate so two concurrent identical writes cannot both pass the
+        # guard and both create a node.
+        lock_key = f"{clean_title}::{content_hash}"
+        lock = self._lock_for(self._content_write_locks, self._session_key_locks_guard, lock_key)
+        with lock:
+            guard = self._find_identical_active_node(clean_title, content)
+            if guard is not None:
+                payload = {
+                    "node": self._serialize_node(guard),
+                    "action": "unchanged",
+                    "title": clean_title,
+                }
+                self._log_tool_call(
+                    "write_memory_dedupe_guard",
+                    {"title": clean_title, "content_hash": content_hash[:12]},
+                    payload,
+                )
+                return payload
+
+            return self._write_memory_locked(
+                title=clean_title,
+                content=content,
+                node_type=node_type,
+                links=links,
+                sensitivity=sensitivity,
+                query_hint=query_hint,
+                similarity_threshold=similarity_threshold,
+            )
+
+    def _find_identical_active_node(self, title: str, content: str) -> Node | None:
+        """ACTIVE node with the same title and byte-identical content, if any."""
+
+        with self._store() as store:
+            candidates = [
+                node
+                for node in store.list_nodes({"status": NodeStatus.ACTIVE, "title": title})
+                if node.content == content
+            ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda n: n.metadata.created_at)
+
+    def _write_memory_locked(
+        self,
+        *,
+        title: str,
+        content: str,
+        node_type: NodeType | str = NodeType.TRANSIENT,
+        links: list[str] | None = None,
+        sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
+        query_hint: str | None = None,
+        similarity_threshold: float = 0.3,
+    ) -> dict[str, Any]:
+        clean_title = title.strip()
         normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
         section_count = sum(1 for line in content.splitlines() if line.lstrip().startswith("##"))
         warnings: list[dict[str, str]] = []
@@ -278,7 +348,7 @@ class SynapseServerService:
             )
 
         payload = self._decide_memory_write_payload(
-            title=title,
+            title=clean_title,
             content=content,
             node_type=node_type,
             links=links,
@@ -374,6 +444,124 @@ class SynapseServerService:
         payload = report.to_dict()
         self._log_tool_call("run_dreamer", {"batch_size": batch_size}, payload)
         return payload
+
+    def _lock_for(self, locks: dict[str, threading.Lock], guard: threading.Lock, key: str) -> threading.Lock:
+        with guard:
+            lock = locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                locks[key] = lock
+            return lock
+
+    @staticmethod
+    def _session_node_id(session_key: str) -> str:
+        return f"mem_session_{hashlib.sha1(session_key.encode('utf-8')).hexdigest()[:16]}"
+
+    def upsert_session_memory(
+        self,
+        *,
+        session_key: str,
+        title: str,
+        content: str,
+        node_type: NodeType | str = NodeType.TRANSIENT,
+        links: list[str] | None = None,
+        sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
+    ) -> dict[str, Any]:
+        """Deterministic keyed upsert (no LLM decider).
+
+        The node id is derived from the session key, so repeated writes for the
+        same session converge on one node: absent -> create, identical
+        content+title -> unchanged, different -> overwrite in place (markdown +
+        index + re-embed through the normal sync path).
+        """
+
+        clean_key = session_key.strip()
+        if not clean_key:
+            raise SynapseServiceError("INVALID_SESSION_KEY", "session_key must not be blank")
+        clean_title = title.strip()
+        if not clean_title:
+            raise SynapseServiceError("INVALID_TITLE", _INVALID_TITLE_MESSAGE)
+
+        node_id = self._session_node_id(clean_key)
+        lock = self._lock_for(self._session_key_locks, self._session_key_locks_guard, node_id)
+        with lock:
+            normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
+            normalized_sensitivity = (
+                sensitivity if isinstance(sensitivity, SensitivityLevel) else SensitivityLevel(str(sensitivity))
+            )
+            normalized_links = self._normalize_links(links or [])
+
+            existing_path = self.runtime_paths.active / f"{node_id}.md"
+            existing: Node | None = None
+            if existing_path.exists():
+                existing = self._load_node(node_id)
+
+            if existing is not None and existing.title == clean_title and existing.content == content:
+                action = "unchanged"
+                stored_node = existing
+                sync_result: SyncBatchResult | None = None
+            elif existing is not None:
+                action = "updated"
+                metadata = existing.metadata.model_copy(
+                    update={"title": clean_title, "session_key": clean_key}
+                )
+                node = existing.model_copy(
+                    update={"content": content, "metadata": metadata}
+                )
+                absolute_path = write_node_file(node, base_path=self.runtime_paths.base)
+                sync_result = self._sync_paths([absolute_path])
+                stored_node = self._load_node(node_id)
+            else:
+                action = "created"
+                metadata = NodeMetadata(
+                    id=node_id,
+                    title=clean_title,
+                    type=normalized_type,
+                    sensitivity=normalized_sensitivity,
+                    session_key=clean_key,
+                )
+                node = Node(
+                    metadata=metadata,
+                    content=self._embed_links(content, normalized_links),
+                    file_path=Path("active") / f"{node_id}.md",
+                )
+                absolute_path = write_node_file(node, base_path=self.runtime_paths.base)
+                sync_result = self._sync_paths([absolute_path])
+                stored_node = self._load_node(node_id)
+
+            self._record_session_upsert_metric(node_id, normalized_type.value, action)
+            payload = {
+                "node": self._serialize_node(stored_node),
+                "action": action,
+                "session_key": clean_key,
+            }
+            if sync_result is not None:
+                payload["sync"] = self._serialize_sync_result(sync_result)
+            self._log_tool_call(
+                "upsert_session_memory",
+                {"session_key": clean_key, "title": clean_title},
+                payload,
+            )
+            return payload
+
+    def _record_session_upsert_metric(self, node_id: str, node_type: str, action: str) -> None:
+        try:
+            with self._store() as store:
+                store.record_write_memory_event(
+                    WriteMemoryEventMetrics(
+                        created_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                        node_id=node_id,
+                        node_type=node_type,
+                        action=action,
+                        candidate_count=0,
+                        similarity_threshold=0.0,
+                        warning_codes=(),
+                        sampling_provider="session-upsert",
+                        execution_succeeded=True,
+                    )
+                )
+        except (OSError, ValueError, sqlite3.DatabaseError) as exc:  # metrics must never break writes
+            self.logger.warning("Failed to record session-upsert metrics", exc_info=exc)
 
     def write_node(
         self,
@@ -550,11 +738,20 @@ class SynapseServerService:
 
     def _embed_query(self, query: str) -> list[float] | None:
         engine = create_embedding_engine(self.config.embedding, providers=self.config.providers)
+        backend = getattr(engine, "backend_name", "")
+        if backend == "unavailable":
+            return None
         try:
             vector = engine.embed(query)
         except (OSError, RuntimeError, ValueError):
             return None
-        return vector or None
+        if not vector:
+            return None
+        if backend == "remote_api" and not engine.is_available():
+            # Degraded batch → deterministic hash vector; must not be mixed
+            # with real provider vectors (see sync/manager._embed_for_persistence).
+            return None
+        return vector
 
     def _run_retrieval_search(self, query: str, *, top_k: int, update_access: bool) -> Any:
         with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as pipeline:
