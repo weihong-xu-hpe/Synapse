@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import threading
+from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -15,10 +17,52 @@ from synapse.models import Node, NodeMetadata, NodeStatus
 from synapse.storage.markdown import extract_wiki_links
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 FALLBACK_VECTOR_BACKEND = "python-fallback"
 SQLITE_VEC_BACKEND = "sqlite-vec"
 UTC_SUFFIX = "+00:00"
+
+
+class _ProcessVectorCache:
+    """Process-level cache of parsed node vectors, shared across store instances.
+
+    The server constructs a fresh SQLiteNodeStore per request, so an
+    instance-level cache never warms up. This cache is keyed by resolved db
+    path + embedding dimension and guarded by a lock (requests run in the
+    threadpool).
+
+    Invalidation invariant: every mutation of nodes_vec bumps the DB-stored
+    generation counter ``schema_meta.vector_generation`` via triggers (FK
+    cascade actions fire child triggers too). Readers compare the cached
+    generation against one cheap ``SELECT`` — authoritative across processes,
+    connections, and cascade deletes.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, int], tuple[int, dict[str, array]]] = {}
+
+    @staticmethod
+    def _key(db_path: Path, dimension: int) -> tuple[str, int]:
+        return (str(db_path.resolve()), dimension)
+
+    def get(self, db_path: Path, dimension: int, generation: int) -> dict[str, array] | None:
+        with self._lock:
+            entry = self._entries.get(self._key(db_path, dimension))
+        if entry is not None and entry[0] == generation:
+            return entry[1]
+        return None
+
+    def put(self, db_path: Path, dimension: int, generation: int, vectors: dict[str, array]) -> None:
+        with self._lock:
+            self._entries[self._key(db_path, dimension)] = (generation, vectors)
+
+    def drop(self, db_path: Path, dimension: int) -> None:
+        with self._lock:
+            self._entries.pop(self._key(db_path, dimension), None)
+
+
+_VECTOR_CACHE = _ProcessVectorCache()
 
 
 @dataclass(slots=True, frozen=True)
@@ -98,7 +142,7 @@ class SQLiteNodeStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedding_dimension = embedding_dimension
-        self._connection = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        self._connection = sqlite3.connect(self.db_path, detect_types=sqlite3.PARSE_DECLTYPES, timeout=30)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._connection.execute("PRAGMA journal_mode=WAL")
@@ -139,109 +183,178 @@ class SQLiteNodeStore:
             cursor.close()
 
     def _ensure_schema(self) -> None:
+        # Probe without a write transaction first: opening an existing,
+        # healthy database must perform zero writes (every request constructs
+        # a store, and a write here would hold the single WAL writer lock).
+        needs_setup = self._schema_needs_setup()
+        if not needs_setup:
+            return
         with self.transaction() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS nodes (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    file_path TEXT NOT NULL UNIQUE,
-                    source_mtime TEXT,
-                    content TEXT NOT NULL,
-                    type TEXT DEFAULT 'transient',
-                    status TEXT DEFAULT 'active',
-                    sensitivity TEXT DEFAULT 'internal',
-                    supersedes TEXT,
-                    superseded_by TEXT,
-                    created_at TEXT NOT NULL,
-                    last_accessed TEXT NOT NULL,
-                    access_count INTEGER DEFAULT 0,
-                    tags TEXT DEFAULT '[]'
-                )
-                """
-            )
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
+            self._create_schema(connection)
             self._ensure_node_columns(connection)
-            connection.execute(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-                    title,
-                    content,
-                    tags,
-                    content='nodes',
-                    content_rowid='rowid'
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS edges (
-                    source_id TEXT NOT NULL,
-                    target_id TEXT NOT NULL,
-                    PRIMARY KEY (source_id, target_id),
-                    FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
-                    FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE
-                )
-                """
-            )
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dreamer_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT NOT NULL,
-                    duration_ms INTEGER NOT NULL,
-                    batch_size INTEGER NOT NULL,
-                    stale_scanned INTEGER NOT NULL,
-                    superseded_scanned INTEGER NOT NULL,
-                    disputed_scanned INTEGER NOT NULL,
-                    missing_link_pairs_scanned INTEGER NOT NULL,
-                    triage_keep INTEGER NOT NULL,
-                    triage_condense INTEGER NOT NULL,
-                    triage_archive INTEGER NOT NULL,
-                    links_added INTEGER NOT NULL,
-                    conflicts_superseded INTEGER NOT NULL,
-                    conflicts_both_valid INTEGER NOT NULL,
-                    archived INTEGER NOT NULL,
-                    condensed INTEGER NOT NULL,
-                    warnings INTEGER NOT NULL,
-                    sampling_failures INTEGER NOT NULL
-                )
-                """
-            )
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_dreamer_runs_started_at ON dreamer_runs(started_at)")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS write_memory_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL,
-                    node_id TEXT,
-                    node_type TEXT NOT NULL,
-                    action TEXT,
-                    candidate_count INTEGER NOT NULL,
-                    similarity_threshold REAL NOT NULL,
-                    warning_codes TEXT NOT NULL,
-                    sampling_provider TEXT NOT NULL,
-                    execution_succeeded INTEGER NOT NULL
-                )
-                """
-            )
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_write_memory_events_created_at ON write_memory_events(created_at)")
             self._ensure_vector_table(connection)
             self._ensure_fts_triggers(connection)
+            self._ensure_vector_generation_triggers(connection)
+            stored_version = self._get_meta(connection, "schema_version")
+            stored_dimension = self._get_meta(connection, "embedding_dimension")
+            stored_backend = self._get_meta(connection, "vector_backend")
+            fts_new = self._get_meta(connection, "fts_ready") != str(SCHEMA_VERSION)
             self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
             self._set_meta(connection, "vector_backend", self._vector_backend)
             self._set_meta(connection, "embedding_dimension", str(self.embedding_dimension))
-            connection.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild')")
+            self._set_meta(connection, "fts_ready", str(SCHEMA_VERSION))
+            # Rebuild the external-content FTS index only when it may be out
+            # of sync: fresh database, schema change, dimension/backend change,
+            # or the FTS tables were created just now without content.
+            dimension_changed = stored_dimension not in {None, str(self.embedding_dimension)}
+            backend_changed = stored_backend not in {None, self._vector_backend}
+            if fts_new or dimension_changed or backend_changed or stored_version != str(SCHEMA_VERSION):
+                connection.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild')")
+
+    def _get_meta(self, connection: sqlite3.Connection, key: str) -> str | None:
+        row = connection.execute("SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        return str(row["value"])
+
+    def _schema_needs_setup(self) -> bool:
+        """Return True when the database needs DDL, meta writes, or an FTS rebuild."""
+
+        try:
+            tables = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')"
+                ).fetchall()
+            }
+        except sqlite3.DatabaseError:
+            return True
+        required = {
+            "schema_meta",
+            "nodes",
+            "nodes_fts",
+            "edges",
+            "dreamer_runs",
+            "write_memory_events",
+            "nodes_vec",
+            "nodes_ai",
+            "nodes_ad",
+            "nodes_au",
+            "nodes_vec_ai",
+            "nodes_vec_au",
+            "nodes_vec_ad",
+        }
+        if not required.issubset(tables):
+            return True
+        if "schema_meta" not in tables:
+            return True
+        stored_version = self.get_meta("schema_version")
+        stored_dimension = self.get_meta("embedding_dimension")
+        stored_backend = self.get_meta("vector_backend")
+        fts_ready = self.get_meta("fts_ready")
+        return (
+            stored_version != str(SCHEMA_VERSION)
+            or stored_dimension != str(self.embedding_dimension)
+            or stored_backend != self._vector_backend
+            or fts_ready != str(SCHEMA_VERSION)
+        )
+
+    def _create_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                file_path TEXT NOT NULL UNIQUE,
+                source_mtime TEXT,
+                content TEXT NOT NULL,
+                type TEXT DEFAULT 'transient',
+                status TEXT DEFAULT 'active',
+                sensitivity TEXT DEFAULT 'internal',
+                supersedes TEXT,
+                superseded_by TEXT,
+                created_at TEXT NOT NULL,
+                last_accessed TEXT NOT NULL,
+                access_count INTEGER DEFAULT 0,
+                tags TEXT DEFAULT '[]'
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+                title,
+                content,
+                tags,
+                content='nodes',
+                content_rowid='rowid'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS edges (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                PRIMARY KEY (source_id, target_id),
+                FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dreamer_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                batch_size INTEGER NOT NULL,
+                stale_scanned INTEGER NOT NULL,
+                superseded_scanned INTEGER NOT NULL,
+                disputed_scanned INTEGER NOT NULL,
+                missing_link_pairs_scanned INTEGER NOT NULL,
+                triage_keep INTEGER NOT NULL,
+                triage_condense INTEGER NOT NULL,
+                triage_archive INTEGER NOT NULL,
+                links_added INTEGER NOT NULL,
+                conflicts_superseded INTEGER NOT NULL,
+                conflicts_both_valid INTEGER NOT NULL,
+                archived INTEGER NOT NULL,
+                condensed INTEGER NOT NULL,
+                warnings INTEGER NOT NULL,
+                sampling_failures INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_dreamer_runs_started_at ON dreamer_runs(started_at)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS write_memory_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                node_id TEXT,
+                node_type TEXT NOT NULL,
+                action TEXT,
+                candidate_count INTEGER NOT NULL,
+                similarity_threshold REAL NOT NULL,
+                warning_codes TEXT NOT NULL,
+                sampling_provider TEXT NOT NULL,
+                execution_succeeded INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_write_memory_events_created_at ON write_memory_events(created_at)")
 
     def _ensure_node_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -286,6 +399,32 @@ class SQLiteNodeStore:
                 VALUES ('delete', old.rowid, old.title, old.content, old.tags);
                 INSERT INTO nodes_fts(rowid, title, content, tags)
                 VALUES (new.rowid, new.title, new.content, new.tags);
+            END;
+            """
+        )
+
+    def _ensure_vector_generation_triggers(self, connection: sqlite3.Connection) -> None:
+        """Install triggers that bump schema_meta.vector_generation on any
+        nodes_vec mutation (including FK ON DELETE CASCADE deletes from nodes,
+        which fire these child triggers). The process-level vector cache
+        validates its entries against this counter.
+        """
+
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS nodes_vec_ai AFTER INSERT ON nodes_vec BEGIN
+                INSERT INTO schema_meta(key, value) VALUES ('vector_generation', '1')
+                ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS nodes_vec_au AFTER UPDATE ON nodes_vec BEGIN
+                INSERT INTO schema_meta(key, value) VALUES ('vector_generation', '1')
+                ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS nodes_vec_ad AFTER DELETE ON nodes_vec BEGIN
+                INSERT INTO schema_meta(key, value) VALUES ('vector_generation', '1')
+                ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1;
             END;
             """
         )
@@ -362,6 +501,7 @@ class SQLiteNodeStore:
             self._upsert_embedding(connection, node_id, embedding)
 
     def _upsert_embedding(self, connection: sqlite3.Connection, node_id: str, embedding: list[float]) -> None:
+        self._invalidate_vector_cache()
         normalized = _normalize_embedding(embedding, self.embedding_dimension)
         connection.execute(
             """
@@ -408,6 +548,7 @@ class SQLiteNodeStore:
 
     def delete_embedding(self, node_id: str) -> None:
         with self.transaction() as connection:
+            self._invalidate_vector_cache()
             connection.execute("DELETE FROM nodes_vec WHERE id = ?", (node_id,))
 
     def update_access(self, node_ids: list[str]) -> None:
@@ -465,11 +606,68 @@ class SQLiteNodeStore:
             return [str(row["source_id"]) for row in rows]
         raise ValueError("direction must be 'outgoing' or 'incoming'")
 
+    def vector_search(self, embedding: list[float], limit: int = 10) -> list[tuple[str, float]]:
+        if not embedding:
+            return []
+        normalized_query = _normalize_embedding(embedding, self.embedding_dimension)
+        vectors = self._load_vectors_cached()
+        scored: list[tuple[str, float]] = []
+        for node_id, candidate_vector in vectors.items():
+            distance = _cosine_distance(normalized_query, list(candidate_vector))
+            scored.append((node_id, distance))
+        scored.sort(key=lambda item: (item[1], item[0]))
+        return scored[:limit]
+
+    def _current_vector_generation(self) -> int:
+        row = self._connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'vector_generation'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def _load_vectors_cached(self) -> dict[str, array]:
+        """Return {node_id: packed vector} shared process-wide.
+
+        Invalidation invariant: every nodes_vec mutation (insert/update/delete,
+        including FK ON DELETE CASCADE deletes from nodes — cascade actions fire
+        child triggers) bumps schema_meta.vector_generation via triggers. Each
+        read validates its cached generation with one cheap SELECT, which is
+        authoritative across processes and connections. Vectors are stored as
+        pre-normalized array('d') (8 bytes/float → ~16 MB for 2k×1024).
+        """
+
+        generation = self._current_vector_generation()
+        cached = _VECTOR_CACHE.get(self.db_path, self.embedding_dimension, generation)
+        if cached is not None:
+            return cached
+        rows = self._connection.execute(
+            "SELECT id, embedding FROM nodes_vec WHERE dimension = ?",
+            (self.embedding_dimension,),
+        ).fetchall()
+        vectors: dict[str, array] = {}
+        for row in rows:
+            try:
+                vectors[str(row["id"])] = array("d", json.loads(str(row["embedding"])))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        _VECTOR_CACHE.put(self.db_path, self.embedding_dimension, generation, vectors)
+        return vectors
+
+    def _invalidate_vector_cache(self) -> None:
+        # The DB-stored generation is the source of truth; dropping the process
+        # entry only avoids a stale hit if a same-tick write hasn't committed.
+        _VECTOR_CACHE.drop(self.db_path, self.embedding_dimension)
+
+
     def list_nodes(self, filters: dict[str, Any] | None = None) -> list[Node]:
         filters = filters or {}
         clauses: list[str] = []
         values: list[Any] = []
-        for key in ("tier", "status", "type"):
+        for key in ("tier", "status", "type", "title"):
             if key in filters and filters[key] is not None:
                 clauses.append(f"{key} = ?")
                 values.append(filters[key].value if hasattr(filters[key], "value") else filters[key])
@@ -532,21 +730,6 @@ class SQLiteNodeStore:
         ).fetchall()
         return [(str(row["node_id"]), float(row["score"])) for row in rows]
 
-    def vector_search(self, embedding: list[float], limit: int = 10) -> list[tuple[str, float]]:
-        if not embedding:
-            return []
-        normalized_query = _normalize_embedding(embedding, self.embedding_dimension)
-        rows = self._connection.execute(
-            "SELECT id, embedding FROM nodes_vec WHERE dimension = ?",
-            (self.embedding_dimension,),
-        ).fetchall()
-        scored: list[tuple[str, float]] = []
-        for row in rows:
-            candidate_vector = json.loads(str(row["embedding"]))
-            distance = _cosine_distance(normalized_query, candidate_vector)
-            scored.append((str(row["id"]), distance))
-        scored.sort(key=lambda item: (item[1], item[0]))
-        return scored[:limit]
 
     def get_neighbors(self, node_ids: list[str], depth: int = 1) -> list[str]:
         if depth < 1 or not node_ids:
@@ -605,6 +788,20 @@ class SQLiteNodeStore:
             )
             for row in rows
         }
+
+    def get_node_ids_without_vectors(self) -> list[str]:
+        """Return ids of nodes that have no persisted embedding (degraded writes)."""
+
+        rows = self._connection.execute(
+            """
+            SELECT n.id
+            FROM nodes AS n
+            LEFT JOIN nodes_vec AS v ON v.id = n.id
+            WHERE v.id IS NULL
+            ORDER BY n.id ASC
+            """
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
 
     def find_orphan_candidates(
         self,
@@ -996,6 +1193,7 @@ class SQLiteNodeStore:
             if str(key) in preserve_keys
         }
         with self.transaction() as connection:
+            self._invalidate_vector_cache()
             connection.execute("DELETE FROM edges")
             connection.execute("DELETE FROM nodes_vec")
             connection.execute("DELETE FROM nodes")
@@ -1010,7 +1208,7 @@ class SQLiteNodeStore:
     def rebuild_from_nodes(
         self,
         nodes: list[Node],
-        embeddings: list[list[float]],
+        embeddings: Sequence[list[float] | None],
         *,
         embedding_fingerprint: str,
         source_mtimes: Sequence[datetime | None] | None = None,

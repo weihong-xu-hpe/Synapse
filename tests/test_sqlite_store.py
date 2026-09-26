@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -7,6 +9,7 @@ import pytest
 
 from synapse.models import Node, NodeMetadata, NodeStatus, NodeType, SensitivityLevel
 from synapse.storage import DreamerRunMetrics, SQLiteNodeStore, WriteMemoryEventMetrics
+from synapse.storage.sqlite import _cosine_distance
 
 
 NOW = datetime(2026, 3, 7, 12, 0, tzinfo=UTC)
@@ -305,3 +308,102 @@ def test_missing_link_similarity_histogram_counts_unlinked_recent_pairs(tmp_path
 
     assert histogram == {"0.70": 1, "0.90": 1}
     assert [(left.id, right.id) for left, right in pairs] == [(alpha.id, beta.id)]
+
+
+def test_reopening_existing_db_performs_no_writes(tmp_path: Path) -> None:
+    """Healthy DB reopen must not write: every request constructs a store, and
+    a write per construction would hold the single WAL writer lock."""
+    db_path = tmp_path / "synapse.db"
+    node = make_node(
+        node_id="mem_reopen_probe",
+        title="Reopen Probe",
+        content="Body for reopen probe.",
+        file_name="mem_reopen_probe.md",
+    )
+
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        store.upsert_node(node, embedding=[1.0, 0.0, 0.0])
+
+    external = sqlite3.connect(db_path)
+    data_version_before = external.execute("PRAGMA data_version").fetchone()[0]
+    external.close()
+
+    with SQLiteNodeStore(db_path, embedding_dimension=3):
+        pass
+
+    external = sqlite3.connect(db_path)
+    data_version_after = external.execute("PRAGMA data_version").fetchone()[0]
+    external.close()
+    assert data_version_after == data_version_before
+
+
+def test_vector_cache_invalidates_after_upsert_from_second_connection(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+
+    def make(node_id: str, title: str) -> Node:
+        return make_node(node_id=node_id, title=title, content=f"Body of {title}.", file_name=f"{node_id}.md")
+
+    store_a = SQLiteNodeStore(db_path, embedding_dimension=3)
+    store_b = SQLiteNodeStore(db_path, embedding_dimension=3)
+    try:
+        store_a.upsert_node(make("mem_a", "Alpha"), embedding=[1.0, 0.0, 0.0])
+        first = store_a.vector_search([0.0, 1.0, 0.0], limit=2)
+        assert first[0][0] != "mem_b"
+
+        # A DIFFERENT store instance (own connection) upserts a matching node;
+        # store_a's process-level cache must invalidate via the DB generation.
+        store_b.upsert_node(make("mem_b", "Beta"), embedding=[0.0, 1.0, 0.0])
+        second = store_a.vector_search([0.0, 1.0, 0.0], limit=2)
+        assert second[0][0] == "mem_b"
+
+        # Cascade delete via nodes (FK ON DELETE CASCADE removes the nodes_vec
+        # row and fires the generation trigger) must invalidate store_a's cache.
+        store_b.delete_node("mem_b")
+        third = store_a.vector_search([0.0, 1.0, 0.0], limit=2)
+        assert third[0][0] != "mem_b"
+        assert all(node_id != "mem_b" for node_id, _ in third)
+
+        # A third, fresh instance must observe the same state.
+        store_c = SQLiteNodeStore(db_path, embedding_dimension=3)
+        try:
+            fourth = store_c.vector_search([0.0, 1.0, 0.0], limit=2)
+            assert fourth == third
+        finally:
+            store_c.close()
+    finally:
+        store_a.close()
+        store_b.close()
+
+
+def test_vector_cache_ranking_matches_uncached_path(tmp_path: Path) -> None:
+    """Cached search results must be identical to a fresh uncached scan."""
+    db_path = tmp_path / "synapse.db"
+    store = SQLiteNodeStore(db_path, embedding_dimension=3)
+    try:
+        for i, (nid, vec) in enumerate([
+            ("mem_a", [1.0, 0.0, 0.0]),
+            ("mem_b", [0.9, 0.1, 0.0]),
+            ("mem_c", [0.0, 1.0, 0.0]),
+            ("mem_d", [0.8, 0.6, 0.0]),
+        ]):
+            store.upsert_node(
+                make_node(node_id=nid, title=f"Node {nid}", content=f"Body {nid}.", file_name=f"{nid}.md"),
+                embedding=vec,
+            )
+        query = [0.95, 0.05, 0.0]
+        magnitude = sum(v * v for v in query) ** 0.5
+        normalized_query = [v / magnitude for v in query]
+        cached = store.vector_search(query, limit=4)          # populates cache
+        again = store.vector_search(query, limit=4)           # from cache
+        # Uncached ground truth: parse straight from the DB.
+        rows = store.connection.execute(
+            "SELECT id, embedding FROM nodes_vec WHERE dimension = 3"
+        ).fetchall()
+        truth = sorted(
+            ((str(r["id"]), _cosine_distance(normalized_query, json.loads(str(r["embedding"])))) for r in rows),
+            key=lambda item: (item[1], item[0]),
+        )
+        assert again == cached
+        assert again == truth
+    finally:
+        store.close()
