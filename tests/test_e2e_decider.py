@@ -1,4 +1,4 @@
-"""E2E gate tests for LocalLLMDecider against the real internal LLM endpoint.
+"""E2E gate tests for LocalLLMDecider against a real OpenAI-compatible LLM endpoint.
 
 These tests are marked ``live`` and skipped by default (see pyproject.toml
 ``addopts = "-q -m 'not live'"``). Run them manually with::
@@ -133,7 +133,7 @@ def test_live_decider_fallback_endpoint_works(live_fallback_reachable) -> None:
     # Primary endpoint deliberately broken so the decider must fall back.
     settings = DeciderSettings(
         provider="local_llm",
-        base_url="http://10.235.33.60:80/invalid-path",
+        base_url="http://127.0.0.1:9/invalid-path",
         model="deepseek-v4-pro",
         api_key_env="",
         fallback_base_url=LIVE_FALLBACK_URL,
