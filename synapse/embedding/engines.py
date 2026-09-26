@@ -9,6 +9,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
+from collections.abc import Iterator
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -16,12 +17,38 @@ from urllib import request as urllib_request
 from synapse.config import EmbeddingSettings, ProviderSettings, RerankerSettings
 from synapse.interfaces import EmbeddingEngine, RerankerEngine
 
+JSON_MIME_TYPE = "application/json"
+API_KEY_PLACEHOLDER = "{api_key}"
+
 
 LOGGER = logging.getLogger(__name__)
 _TOKEN_PATTERN = re.compile(r"\w+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-JSON_MIME_TYPE = "application/json"
-API_KEY_PLACEHOLDER = "{api_key}"
 _REMOTE_EMBEDDING_REQUEST_BATCH_SIZE = 32
+# Conservative chars-per-token estimate: bge-family tokenizers average ~3-4 chars
+# per token on mixed English/code text. Under-estimating tokens (higher chars
+# value) risks exceeding the server's ubatch; 3 keeps every request safe.
+_CHARS_PER_TOKEN = 3
+
+
+def _split_by_char_budget(texts: Sequence[str], *, max_batch_docs: int, max_batch_chars: int) -> Iterator[list[str]]:
+    """Group documents into request batches under a document-count and char budget.
+
+    A single document longer than the whole budget is still sent alone — the
+    reranker truncates oversized documents, and embedding callers rely on one
+    vector per input document.
+    """
+
+    batch: list[str] = []
+    batch_chars = 0
+    for text in texts:
+        if batch and (len(batch) >= max_batch_docs or batch_chars + len(text) > max_batch_chars):
+            yield batch
+            batch = []
+            batch_chars = 0
+        batch.append(text)
+        batch_chars += len(text)
+    if batch:
+        yield batch
 
 
 @dataclass(slots=True, frozen=True)
@@ -235,6 +262,7 @@ class RemoteAPIEmbeddingEngine:
     fallback_engine: EmbeddingEngine
     backend_name: str = "remote_api"
     last_known_available: bool | None = None
+    max_batch_tokens: int = 8192
 
     def is_available(self) -> bool:
         return bool(self.last_known_available)
@@ -247,14 +275,20 @@ class RemoteAPIEmbeddingEngine:
         if not texts:
             return []
 
-        # A large list input can exceed the HTTP provider's request processing
-        # budget even when every individual document fits its context window.
-        # Keep requests bounded so one timeout does not replace the entire
-        # rebuild with deterministic fallback vectors.
+        # Keep requests bounded by document count and a conservative char
+        # budget so no single request exceeds the server's physical batch.
+        # A single document longer than the model context is truncated: one
+        # vector per input document must be returned.
         vectors: list[list[float]] = []
         all_batches_succeeded = True
-        for batch_start in range(0, len(texts), _REMOTE_EMBEDDING_REQUEST_BATCH_SIZE):
-            batch = texts[batch_start : batch_start + _REMOTE_EMBEDDING_REQUEST_BATCH_SIZE]
+        max_batch_chars = self.max_batch_tokens * _CHARS_PER_TOKEN
+        bounded_texts = [_truncate_to_char_budget(text, self.max_batch_tokens) for text in texts]
+        failure: ProviderError | None = None
+        for batch in _split_by_char_budget(
+            bounded_texts,
+            max_batch_docs=_REMOTE_EMBEDDING_REQUEST_BATCH_SIZE,
+            max_batch_chars=max_batch_chars,
+        ):
             try:
                 batch_vectors = _request_embedding_vectors(
                     client=self.client,
@@ -265,13 +299,20 @@ class RemoteAPIEmbeddingEngine:
                     expected_dimension=self.dimension,
                 )
             except ProviderError as exc:
+                # Never substitute deterministic hash vectors: callers must
+                # store/retrieve nothing rather than poison the vector space.
                 all_batches_succeeded = False
                 LOGGER.warning("Remote embedding provider unavailable: %s", exc)
-                vectors.extend(self.fallback_engine.embed_batch(batch))
+                if failure is None:
+                    failure = exc
             else:
                 vectors.extend(batch_vectors)
         self.last_known_available = all_batches_succeeded
+        if failure is not None and not all_batches_succeeded:
+            raise failure
         return vectors
+
+
 
 
 @dataclass(slots=True)
@@ -285,6 +326,10 @@ class RemoteAPIRerankerEngine:
     fallback_engine: RerankerEngine
     backend_name: str = "remote_api"
     last_known_available: bool | None = None
+    max_batch_tokens: int = 8192
+    # Per-document truncation: rerank latency scales with total candidate
+    # tokens, and the first few hundred tokens carry the ranking signal.
+    max_doc_tokens: int = 512
 
     def is_available(self) -> bool:
         return bool(self.last_known_available)
@@ -302,8 +347,11 @@ class RemoteAPIRerankerEngine:
                 client=self.client,
                 endpoint=self.endpoint,
                 model_name=self.model_name,
-                query=query,
-                documents=documents,
+                query=_truncate_to_char_budget(query, self.max_batch_tokens),
+                documents=[
+                    _truncate_to_char_budget(document, self.max_doc_tokens)
+                    for document in documents
+                ],
                 timeout_seconds=self.timeout_seconds,
             )
         except ProviderError as exc:
@@ -316,9 +364,17 @@ class RemoteAPIRerankerEngine:
         return ranked
 
 
+def _truncate_to_char_budget(text: str, max_tokens: int, *, chars_per_token: int = _CHARS_PER_TOKEN) -> str:
+    """Truncate text to a conservative token budget (chars ≈ tokens × chars_per_token)."""
+
+    max_chars = max_tokens * chars_per_token
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
+
+
 EmbeddingFactory = Callable[[EmbeddingSettings, EmbeddingModelSpec], EmbeddingEngine | None]
 RerankerFactory = Callable[[RerankerSettings, RerankerModelSpec], RerankerEngine | None]
-
 
 @dataclass(slots=True)
 class EngineRegistry:
@@ -381,6 +437,7 @@ def create_embedding_engine(
         endpoint=remote_api.embedding_endpoint,
         timeout_seconds=settings.timeout_seconds,
         fallback_engine=fallback_engine,
+        max_batch_tokens=spec.max_tokens,
     )
 
 
@@ -423,6 +480,8 @@ def create_reranker_engine(
         ),
         endpoint=remote_api.rerank_endpoint,
         timeout_seconds=settings.timeout_seconds,
+        max_batch_tokens=spec.max_tokens,
+        max_doc_tokens=settings.max_doc_tokens,
         fallback_engine=fallback_engine,
     )
 

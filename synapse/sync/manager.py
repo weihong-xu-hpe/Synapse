@@ -263,7 +263,46 @@ class SyncManager:
             if Path(indexed_path) not in disk_snapshot:
                 self.queue_event("delete", self.runtime_paths.base / indexed_path)
 
-        return self.drain_pending(force=True)
+        result = self.drain_pending(force=True)
+        result = self._reembed_vectorless_nodes(result)
+        return result
+
+    def _reembed_vectorless_nodes(self, result: SyncBatchResult) -> SyncBatchResult:
+        """Retry embedding for nodes stored without a vector by earlier degraded writes.
+
+        Runs at startup only (cheap when there is nothing to do); a vector-less
+        node whose file still exists is re-synced, which re-embeds it via the
+        normal upsert path.
+        """
+
+        if getattr(self._embedding_engine, "backend_name", "") != "remote_api":
+            return result
+        store = self._get_store()
+        missing = store.get_node_ids_without_vectors()
+        if not missing:
+            return result
+        retried = 0
+        still_missing: list[str] = []
+        for node_id in missing:
+            node = store.get_node(node_id)
+            if node is None:
+                continue
+            path = self.runtime_paths.base / node.file_path
+            if not path.exists():
+                continue
+            embedding = self._embed_for_persistence(node, path)
+            if embedding is None:
+                still_missing.append(node_id)
+                continue
+            store.upsert_embedding(node_id, embedding)
+            retried += 1
+        if retried or still_missing:
+            self._logger.warning(
+                "Re-embedded %d previously degraded node(s); %d still without vector",
+                retried,
+                len(still_missing),
+            )
+        return result
 
     def sync_paths(self, paths: list[str | Path]) -> SyncBatchResult:
         for path in paths:
@@ -283,17 +322,32 @@ class SyncManager:
     def _sync_upsert(self, path: Path) -> Node:
         node = self._load_node_for_sync(path)
         file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
-        embedding = None
-        try:
-            embedding = self._embedding_engine.embed(render_node_document(node))
-        except (OSError, RuntimeError, ValueError) as exc:
-            self._logger.warning("Embedding failed for %s: %s", path, exc)
+        embedding = self._embed_for_persistence(node, path)
 
         store = self._get_store()
         store.upsert_node(node, embedding=embedding, source_mtime=file_mtime)
         if embedding is None:
             store.delete_embedding(node.id)
         return node
+
+    def _embed_for_persistence(self, node: Node, path: Path) -> list[float] | None:
+        """Embed a node for index persistence; None means "store without vector".
+
+        Invariant: deterministic fallback (hash) vectors must never enter the
+        same index as real provider vectors. The remote engine signals a
+        degraded batch via last_known_available=False; per-batch fallback
+        vectors are detected in embed_batch itself and mapped to None here.
+        """
+
+        engine = self._embedding_engine
+        backend = getattr(engine, "backend_name", "")
+        if backend == "unavailable":
+            return None
+        try:
+            return engine.embed(render_node_document(node))
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._logger.warning("Embedding failed for %s (stored without vector): %s", path, exc)
+            return None
 
     def _sync_delete(self, path: Path) -> int:
         relative_path = self._relative_to_base(path)

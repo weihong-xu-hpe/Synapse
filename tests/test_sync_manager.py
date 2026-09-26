@@ -28,6 +28,7 @@ class Clock:
 class FakeEmbeddingEngine:
     model_name = "fake-embedding"
     dimension = 3
+    backend_name = "fake"
 
     def embed(self, text: str) -> list[float]:
         if "Broken" in text:

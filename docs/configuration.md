@@ -43,6 +43,7 @@ timeout_seconds = 30
 provider = "remote_api"
 model = "bge-reranker-v2-m3"
 max_candidates = 9
+max_doc_tokens = 512
 timeout_seconds = 30
 
 # Both embedding and reranking use [providers.remote_api].
@@ -167,6 +168,7 @@ Controls reranking.
 - `model`
 - `max_candidates`
 - `timeout_seconds`
+- `max_doc_tokens` — per-document truncation for rerank requests (default 512). Rerank latency scales with total candidate tokens; the first few hundred tokens carry the ranking signal.
 
 ### `[providers.remote_api]`
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Iterable, Sequence
@@ -14,6 +16,9 @@ from synapse.storage import SQLiteNodeStore
 from synapse.utils.documents import render_node_document
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 
+
+
+LOGGER = logging.getLogger(__name__)
 
 STATUS_MULTIPLIERS: dict[NodeStatus, float] = {
     NodeStatus.ACTIVE: 1.0,
@@ -164,8 +169,16 @@ class RetrievalPipeline:
         bounded_candidates = list(candidates)[: self.config.reranker.max_candidates]
         if not bounded_candidates:
             return []
+        reranker = self._reranker_engine
+        backend = getattr(reranker, "backend_name", "")
         documents = [render_node_document(node) for node in bounded_candidates]
-        ranked = self._reranker_engine.rerank(query, documents, limit=len(documents))
+        ranked = reranker.rerank(query, documents, limit=len(documents))
+        if backend == "remote_api" and not reranker.is_available():
+            # Deterministic fallback returned all-zero scores: reordering by
+            # them would shuffle candidates arbitrarily. Keep the incoming
+            # (RRF) order and log the degradation.
+            LOGGER.warning("Reranker degraded; keeping RRF order for %d candidates", len(bounded_candidates))
+            return [(node, 0.0) for node in bounded_candidates]
         rerank_scores = {bounded_candidates[index].id: score for index, score in ranked if 0 <= index < len(bounded_candidates)}
         results = [(node, rerank_scores.get(node.id, 0.0)) for node in bounded_candidates]
         results.sort(key=lambda item: (-item[1], item[0].id))
@@ -226,11 +239,21 @@ class RetrievalPipeline:
         ).strip()
 
     def _embed_query(self, query: str) -> list[float] | None:
+        engine = self._embedding_engine
+        backend = getattr(engine, "backend_name", "")
+        if backend == "unavailable":
+            return None
         try:
-            vector = self._embedding_engine.embed(query)
+            vector = engine.embed(query)
         except (OSError, RuntimeError, ValueError):
             return None
         if not vector:
+            return None
+        if backend == "remote_api" and not engine.is_available():
+            # Remote provider degraded this batch to deterministic hash
+            # vectors; searching with them would silently poison the vector
+            # leg. Skip it — FTS + rerank still serve the query.
+            LOGGER.warning("Skipping vector search leg: remote embedding provider degraded")
             return None
         return vector
 

@@ -127,7 +127,22 @@ def rebuild_index(
     nodes = scan_markdown_nodes(paths.active, relative_to=paths.base)
     engine = create_embedding_engine(config.embedding, providers=config.providers)
     texts = [render_node_document(node) for node in nodes]
-    embeddings = engine.embed_batch(texts) if texts else []
+    try:
+        raw_embeddings = engine.embed_batch(texts) if texts else []
+    except Exception as exc:  # ProviderError from a fully-down remote provider
+        LOGGER.warning("Embedding provider failed during rebuild: %s", exc)
+        raw_embeddings = []
+    # A remote provider that degraded mid-rebuild returns deterministic hash
+    # vectors for the failed batches. Persisting them would poison the vector
+    # space; store those nodes WITHOUT a vector instead (re-embedded by the
+    # next successful startup sync).
+    if getattr(engine, "backend_name", "") == "remote_api" and engine.is_available() is False:
+        embeddings: list[list[float] | None] = [None] * len(texts)
+    elif len(raw_embeddings) != len(texts):
+        # embed_batch raised mid-way and returned nothing usable.
+        embeddings = [None] * len(texts)
+    else:
+        embeddings = list(raw_embeddings)
     source_mtimes: list[datetime | None] = [
         datetime.fromtimestamp((paths.base / node.file_path).stat().st_mtime, tz=UTC)
         for node in nodes
@@ -188,7 +203,18 @@ def probe_embedding_engine(config: SynapseConfig) -> EmbeddingProbeReport:
     backend = getattr(engine, "backend_name", probe_settings.provider)
     try:
         vector = engine.embed("synapse health probe")
-    except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover - defensive network/runtime handling
+    except (OSError, RuntimeError, ValueError) as exc:
+        # A configured remote provider that is down is "degraded" (FTS +
+        # rerank still serve queries), not fully "unavailable" — unless the
+        # provider is not remote at all.
+        if backend in {"remote_api", "ollama"}:
+            return EmbeddingProbeReport(
+                status="degraded",
+                backend=str(backend),
+                available=False,
+                dimension=probe_settings.dimension or 0,
+                message=f"Configured provider unavailable: {exc}",
+            )
         return EmbeddingProbeReport(
             status="unavailable",
             backend=str(backend),

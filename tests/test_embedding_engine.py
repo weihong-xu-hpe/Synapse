@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from urllib.error import URLError
 
+import pytest
+
 import synapse.embedding.engines as engine_module
 from synapse.config import (
     EmbeddingSettings,
@@ -192,10 +194,9 @@ def test_remote_embedding_reports_partial_batch_fallback(monkeypatch) -> None:
         EmbeddingSettings(provider="remote_api", model="bge-m3"),
         providers=providers,
     )
+    with pytest.raises(engine_module.ProviderError):
+        embedding.embed_batch([f"document-{index}" for index in range(65)])
 
-    vectors = embedding.embed_batch([f"document-{index}" for index in range(65)])
-
-    assert len(vectors) == 65
     assert calls == 3
     assert embedding.is_available() is False
 
@@ -224,7 +225,8 @@ def test_unavailable_provider_degrades_gracefully(monkeypatch) -> None:
     )
 
     assert embedding.is_available() is False
-    assert len(embedding.embed("ignored")) == 1024
+    with pytest.raises(engine_module.ProviderError):
+        embedding.embed("ignored")
     assert reranker.is_available() is False
     assert reranker.rerank("query", ["one query", "two"], limit=1)[0][0] == 0
 
@@ -246,3 +248,123 @@ def test_degradation_behavior_when_fallback_is_disabled() -> None:
 
 
 
+def test_remote_embedding_batch_fallback_never_produces_hash_vectors(monkeypatch) -> None:
+    """A degraded remote batch must not leak deterministic hash vectors into the
+    caller's results — they would be persisted into the real vector index."""
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        payload = json.loads(request.data.decode("utf-8"))
+        inputs = payload["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        return FakeHTTPResponse({"data": [{"embedding": _vector(1024, value=0.25)} for _ in inputs]})
+
+    monkeypatch.setattr(engine_module.urllib_request, "urlopen", fake_urlopen)
+
+    providers = ProviderSettings(
+        remote_api=RemoteAPIProviderSettings(
+            base_url="https://models.example.com",
+            embedding_endpoint="/v1/embeddings",
+        )
+    )
+    embedding = create_embedding_engine(
+        EmbeddingSettings(provider="remote_api", model="bge-m3"),
+        providers=providers,
+    )
+    good = embedding.embed("fine document")
+    assert embedding.is_available() is True
+
+    # Now the provider starts failing: embed must raise (not return hash vectors).
+    def failing_urlopen(request, timeout):
+        del request, timeout
+        raise URLError("connection refused")
+
+    monkeypatch.setattr(engine_module.urllib_request, "urlopen", failing_urlopen)
+    try:
+        embedding.embed("broken document")
+        raised = False
+    except (URLError, OSError, RuntimeError):
+        raised = True
+    assert raised, "degraded remote embedding must not return fallback vectors"
+
+
+def test_remote_embedding_char_budget_splits_long_documents(monkeypatch) -> None:
+    """Batching must respect a character (token) budget, not only doc count."""
+    captured_inputs: list[list[str]] = []
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        payload = json.loads(request.data.decode("utf-8"))
+        inputs = payload["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        captured_inputs.append(inputs)
+        return FakeHTTPResponse({"data": [{"embedding": _vector(1024, value=0.25)} for _ in inputs]})
+
+    monkeypatch.setattr(engine_module.urllib_request, "urlopen", fake_urlopen)
+
+    providers = ProviderSettings(
+        remote_api=RemoteAPIProviderSettings(
+            base_url="https://models.example.com",
+            embedding_endpoint="/v1/embeddings",
+        )
+    )
+    embedding = create_embedding_engine(
+        EmbeddingSettings(provider="remote_api", model="bge-m3"),
+        providers=providers,
+    )
+    # 3 docs of ~6000 chars each: budget 8192*3 chars would allow all three in
+    # one request, but doc-count cap 32 allows it too. Use many small docs so
+    # the char budget forces splits: each doc 9000 chars > budget/2.
+    texts = ["x" * 9000 for _ in range(4)]
+    vectors = embedding.embed_batch(texts)
+    assert len(vectors) == 4
+    # Every request must carry at most one such doc (char budget 8192*3=24576,
+    # two 9000-char docs = 18000 < 24576 — hmm, two fit. So assert no request
+    # exceeded the budget):
+    max_chars = 8192 * 3
+    for inputs in captured_inputs:
+        assert sum(len(t) for t in inputs) <= max_chars
+        assert len(inputs) <= 32
+    # And the single 30000-char doc case: truncated per-request single input.
+    captured_inputs.clear()
+    embedding.embed("y" * 30000)
+    for inputs in captured_inputs:
+        assert sum(len(t) for t in inputs) <= max_chars
+
+
+def test_remote_reranker_truncates_documents_to_max_doc_tokens(monkeypatch) -> None:
+    """Documents longer than reranker.max_doc_tokens must be truncated in the
+    request payload — rerank latency scales with total candidate tokens."""
+
+    captured_payloads: list[dict[str, object]] = []
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        payload = json.loads(request.data.decode("utf-8"))
+        captured_payloads.append(payload)
+        return FakeHTTPResponse(
+            {"results": [{"index": i, "relevance_score": 0.5} for i in range(len(payload["documents"]))]}
+        )
+
+    monkeypatch.setattr(engine_module.urllib_request, "urlopen", fake_urlopen)
+
+    providers = ProviderSettings(
+        remote_api=RemoteAPIProviderSettings(
+            base_url="https://models.example.com",
+            rerank_endpoint="/v1/rerank",
+        )
+    )
+    reranker = create_reranker_engine(
+        RerankerSettings(provider="remote_api", model="bge-reranker-v2-m3", max_doc_tokens=512),
+        providers=providers,
+    )
+
+    long_doc = "x" * 5000  # 5000 chars ≫ 512 tokens × 3 chars = 1536 chars
+    short_doc = "tiny document"
+    reranker.rerank("query", [long_doc, short_doc])
+
+    sent = captured_payloads[0]["documents"]
+    assert len(sent[0]) == 512 * 3  # truncated to the configured budget
+    assert sent[1] == short_doc     # short docs pass through untouched
