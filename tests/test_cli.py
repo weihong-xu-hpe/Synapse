@@ -186,7 +186,7 @@ def test_cli_phase3_commands_create_runtime_logs_and_report_health(tmp_path: Pat
     assert (runtime_base / ".audit").exists()
     assert (runtime_base / ".logs" / "mcp-daemon.log").exists()
     assert (runtime_base / ".logs" / "file-watcher.log").exists()
-    assert (runtime_base / ".logs" / "janitor.log").exists()
+    assert (runtime_base / ".logs" / "synapse.log").exists()
     assert (runtime_base / ".logs" / "audit.log").exists()
 
 

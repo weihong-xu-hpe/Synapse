@@ -551,41 +551,94 @@ class Dreamer:
         store.upsert_node(updated)
         write_node_file(updated, base_path=self.runtime_paths.base)
 
+    def _resolve_supersession_chain(
+        self, node: Node, store: SQLiteNodeStore, *, max_depth: int = 64
+    ) -> tuple[Node | None, str]:
+        """Follow superseded_by to the terminal node of the chain (cycle-safe).
+
+        Chained supersession (A superseded by B, B superseded by C, ...) left
+        most superseded nodes un-archivable because only the direct successor
+        was consulted. The terminal node is the meaningful successor.
+
+        Returns (terminal_node, outcome) where outcome is:
+          "terminal"          — a node with no superseded_by was reached
+          "missing_successor" — the chain references a node absent from the index
+          "cycle"             — the chain loops back on itself
+        """
+
+        current = node
+        seen: set[str] = {node.id}
+        for _ in range(max_depth):
+            successor_id = current.metadata.superseded_by
+            if not successor_id:
+                return current, "terminal"
+            if successor_id in seen:
+                return current, "cycle"
+            successor = store.get_node(successor_id)
+            if successor is None:
+                return current, "missing_successor"
+            seen.add(successor.id)
+            current = successor
+        return current, "cycle"
+
     def _archive_superseded(
         self,
         superseded: list[Node],
         store: SQLiteNodeStore,
         warnings: list[DreamerWarning],
     ) -> list[str]:
-        """Validate and archive superseded nodes (same logic as old NightlyJanitor)."""
+        """Archive a superseded node when its supersession chain:
+          - terminates at an ACTIVE node with an existing file; OR
+          - terminates at a node missing from the index (already archived or
+            deleted — the terminal is just as obsolete as the node itself); OR
+          - has no superseded_by at all (chain end with no successor).
+        Keep the node only when the terminal is DISPUTED (a live disagreement)
+        or the chain is cyclic (logged as a warning).
+        """
         valid: list[Node] = []
         for node in superseded:
-            superseder_id = node.metadata.superseded_by
-            if not superseder_id:
+            if not node.metadata.superseded_by:
+                valid.append(node)
+                continue
+
+            terminal, outcome = self._resolve_supersession_chain(node, store)
+            if outcome == "cycle":
                 warnings.append(
                     DreamerWarning(
-                        code="invalid_superseder",
+                        code="cyclic_supersession",
                         node_id=node.id,
-                        message=f"Cannot archive superseded node '{node.id}': superseded_by is missing.",
+                        message=(
+                            f"Cannot archive superseded node '{node.id}': supersession chain is cyclic."
+                        ),
                     )
                 )
                 continue
-
-            superseder = store.get_node(superseder_id)
-            superseder_path = self.runtime_paths.base / superseder.file_path if superseder is not None else None
-            if (
-                superseder is None
-                or superseder.metadata.status is not NodeStatus.ACTIVE
-                or superseder_path is None
-                or not superseder_path.exists()
-            ):
+            if outcome == "missing_successor":
+                # Terminal of the chain references a node that is no longer in
+                # the index (archived or deleted): just as obsolete as the node.
+                valid.append(node)
+                continue
+            terminal_path = self.runtime_paths.base / terminal.file_path
+            if terminal.metadata.status is NodeStatus.DISPUTED:
+                warnings.append(
+                    DreamerWarning(
+                        code="disputed_superseder",
+                        node_id=node.id,
+                        message=(
+                            f"Cannot archive superseded node '{node.id}': chain terminal "
+                            f"'{terminal.id}' is disputed (live disagreement)."
+                        ),
+                    )
+                )
+                continue
+            if terminal.metadata.status is not NodeStatus.ACTIVE or not terminal_path.exists():
                 warnings.append(
                     DreamerWarning(
                         code="invalid_superseder",
                         node_id=node.id,
                         message=(
-                            f"Cannot archive superseded node '{node.id}': superseder '{superseder_id}' "
-                            "is missing or not active."
+                            f"Cannot archive superseded node '{node.id}': chain terminal "
+                            f"'{terminal.id}' is not active."
                         ),
                     )
                 )

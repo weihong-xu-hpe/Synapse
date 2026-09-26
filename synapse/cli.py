@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -347,6 +350,168 @@ def status(ctx: typer.Context) -> None:
     _echo_service_status(_build_service_manager(state).status())
     for warning in health.warnings:
         typer.echo(f"Warning: {warning}")
+
+
+@app.command("dedupe-session-summaries")
+def dedupe_session_summaries(
+    ctx: typer.Context,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Execute the archival. Default is a dry-run report."),
+    ] = False,
+) -> None:
+    """Archive duplicate/stale session-summary nodes using the Dreamer archive primitive.
+
+    Rules over ACTIVE nodes titled 'Session summary — %':
+      A. exact duplicate content (sha256) -> keep newest created_at, archive the rest;
+      B. whitespace-normalized content is a strict prefix of a newer kept same-title node -> archive;
+      C. superseded nodes whose supersession chain terminal is ACTIVE (or superseded_by missing) -> archive.
+
+    Non-summary ACTIVE nodes are never touched. --apply writes a JSON manifest
+    (archived ids + original paths) into the archive dir for reversibility.
+    """
+
+    import json
+
+    from synapse.lifecycle.dreamer import Dreamer
+    from synapse.models import Node, NodeStatus
+    from synapse.storage import SQLiteNodeStore, archive_node_path
+
+    state = _state_from_context(ctx)
+    state.loggers[AUDIT_LOGGER_NAME].info(
+        "Dedupe session summaries invoked", extra={"apply": apply}
+    )
+    paths = state.runtime_paths
+    config = state.config
+
+    dreamer = Dreamer(
+        config,
+        runtime_paths=paths,
+        sampling_client=LocalLLMDecider(config.decider),
+        logger=state.loggers[DAEMON_LOGGER_NAME],
+    )
+    try:
+        store = dreamer._get_store()
+        active = store.list_nodes({"status": NodeStatus.ACTIVE})
+        superseded = store.find_by_status(NodeStatus.SUPERSEDED)
+        summaries = [n for n in active if n.title.startswith("Session summary — ")]
+        curated = [n for n in active if not n.title.startswith("Session summary — ")]
+
+        plan: dict[str, Node] = {}  # node_id -> Node to archive
+
+        # Rule A: exact duplicate content per title; keep newest created_at.
+        by_title: dict[str, list[Node]] = {}
+        for node in summaries:
+            by_title.setdefault(node.title, []).append(node)
+        for title, group in by_title.items():
+            by_hash: dict[str, list[Node]] = {}
+            for node in group:
+                digest = hashlib.sha256(node.content.encode("utf-8")).hexdigest()
+                by_hash.setdefault(digest, []).append(node)
+            for digest, dupes in by_hash.items():
+                if len(dupes) < 2:
+                    continue
+                dupes.sort(key=lambda n: n.metadata.created_at, reverse=True)
+                for older in dupes[1:]:
+                    plan[older.id] = older
+
+        # Rule B: normalized content strictly prefixes a newer kept same-title node.
+        def _normalized(text: str) -> str:
+            return " ".join(text.split())
+
+        for title, group in by_title.items():
+            kept = [n for n in group if n.id not in plan]
+            kept.sort(key=lambda n: n.metadata.created_at)
+            for node in kept:
+                node_norm = _normalized(node.content)
+                for other in kept:
+                    if other.id == node.id or other.id in plan:
+                        continue
+                    if other.metadata.created_at <= node.metadata.created_at:
+                        continue
+                    other_norm = _normalized(other.content)
+                    if node_norm and node_norm != other_norm and other_norm.startswith(node_norm):
+                        plan[node.id] = node
+                        break
+
+        # Rule C: superseded nodes archivable under the fixed dreamer rule.
+        rule_c: list[str] = []
+        for node in superseded:
+            if node.id in plan:
+                continue
+            if not node.metadata.superseded_by:
+                plan[node.id] = node
+                rule_c.append(node.id)
+                continue
+            terminal, outcome = dreamer._resolve_supersession_chain(node, store)
+            if outcome in {"missing_successor", "terminal"}:
+                # missing_successor: terminal archived/deleted — obsolete.
+                # terminal with no superseded_by: end of chain.
+                # Archive unless the terminal node itself is DISPUTED.
+                if terminal is not None and terminal.metadata.status is NodeStatus.DISPUTED:
+                    continue
+                plan[node.id] = node
+                rule_c.append(node.id)
+            elif outcome == "cycle":
+                continue  # cyclic chain: keep, dreamer logs it
+
+        # Safety assertion: only summaries (rule A/B) or superseded (rule C) planned.
+        planned_ids = set(plan)
+        curated_touched = curated and planned_ids.intersection(n.id for n in curated)
+        if curated_touched:
+            typer.echo(f"ABORT: non-summary active nodes would be touched: {sorted(curated_touched)[:5]}")
+            raise typer.Exit(code=1)
+
+        by_rule = {"A_exact_duplicates": 0, "B_prefix_duplicates": 0, "C_superseded_chain_active": 0}
+        for node in plan.values():
+            if node.metadata.status is NodeStatus.SUPERSEDED:
+                by_rule["C_superseded_chain_active"] += 1
+            elif node.id in rule_c:
+                by_rule["C_superseded_chain_active"] += 1
+            else:
+                # Distinguish A vs B by re-checking prefix rule
+                is_prefix = False
+                for other in by_title.get(node.title, []):
+                    if other.id == node.id or other.id in plan and other is not node:
+                        continue
+                    if other.metadata.created_at > node.metadata.created_at and _normalized(other.content).startswith(_normalized(node.content)) and _normalized(node.content) != _normalized(other.content):
+                        is_prefix = True
+                        break
+                by_rule["B_prefix_duplicates" if is_prefix else "A_exact_duplicates"] += 1
+
+        typer.echo(f"Active summaries: {len(summaries)} | Curated active (untouched): {len(curated)} | Superseded total: {len(superseded)}")
+        typer.echo(f"Planned archives: {len(plan)} (A: {by_rule['A_exact_duplicates']}, B: {by_rule['B_prefix_duplicates']}, C: {by_rule['C_superseded_chain_active']})")
+        for node in sorted(plan.values(), key=lambda n: n.id)[:10]:
+            typer.echo(f"  sample: {node.id} ({node.metadata.status.value}) {node.title[:50]}")
+
+        if not apply:
+            typer.echo("Dry-run only. Re-run with --apply to execute.")
+            return
+
+        archived = dreamer._archive_nodes(list(plan.values()), reason="dedupe", warnings=[])
+        # Remove archived nodes from the derived index; startup sync/rebuild refreshes the rest.
+        for node in archived:
+            store.delete_node(node.id)
+
+        manifest = {
+            "archived_at": datetime.now(UTC).isoformat(),
+            "count": len(archived),
+            "nodes": [
+                {
+                    "id": node.id,
+                    "title": node.title,
+                    "original_path": (paths.base / node.file_path).as_posix(),
+                    "archive_path": archive_node_path(paths.archive, node.id).as_posix(),
+                }
+                for node in archived
+            ],
+        }
+        manifest_path = paths.archive / "dedupe-manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        typer.echo(f"Archived {len(archived)} node(s). Manifest: {manifest_path}")
+        state.loggers[AUDIT_LOGGER_NAME].info("Dedupe session summaries applied", extra={"archived": len(archived)})
+    finally:
+        dreamer.close()
 
 
 @app.command()
