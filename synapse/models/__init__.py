@@ -10,7 +10,7 @@ from synapse.models.node import (
 	WordCountValidation,
 	count_text_words,
 	generate_node_id,
-	slugify_title,
+	slugify_english_title,
 	validate_word_count,
 )
 
@@ -24,6 +24,6 @@ __all__ = [
 	"WordCountValidation",
 	"count_text_words",
 	"generate_node_id",
-	"slugify_title",
+	"slugify_english_title",
 	"validate_word_count",
 ]

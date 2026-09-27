@@ -14,6 +14,8 @@ from synapse.lifecycle.dreamer import (
 	LinkDecision,
 	TriageDecision,
 )
+from synapse.lifecycle.distiller import Distiller
+from synapse.lifecycle.distiller_scheduler import DistillerScheduler
 from synapse.lifecycle.scheduler import DreamerScheduler
 
 __all__ = [
@@ -26,6 +28,8 @@ __all__ = [
 	"DreamerReport",
 	"DreamerWarning",
 	"DreamerScheduler",
+	"Distiller",
+	"DistillerScheduler",
 	"LinkDecision",
 	"TriageDecision",
 ]

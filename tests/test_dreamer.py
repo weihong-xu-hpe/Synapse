@@ -124,12 +124,13 @@ def test_condensation_product_is_okf_format() -> None:
     condenser = DeterministicArchiveCondenser()
     draft = condenser.synthesize(nodes, now=datetime.now(UTC))
 
-    # OKF requires these three sections.
+    # OKF requires these three sections plus Takeaway/Sources (docs/okf.md).
     assert "## Context" in draft.content
     assert "## Decision" in draft.content
     assert "## Consequences" in draft.content
-    # Source provenance is preserved as an appendix section.
-    assert "## Merged From" in draft.content
+    assert "## Takeaway" in draft.content
+    # Source provenance lives in the typed ## Sources section.
+    assert "## Sources" in draft.content
     assert "[[mem_aaa]]" in draft.content
     assert "[[mem_bbb]]" in draft.content
 

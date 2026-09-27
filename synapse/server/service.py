@@ -1093,6 +1093,52 @@ class SynapseServerService:
             },
         }
 
+    def _curated_supersede_targets(self, target_node_ids: list[str]) -> list[str]:
+        """Supersede targets that are CURATED knowledge (persistent, no distiller provenance).
+
+        A node is distiller-produced when any ``sources`` entry points at a
+        session transcript (``mem_session_*`` id or a legacy session-summary
+        node id / session reference). Such distilled nodes may supersede each
+        other; curated nodes may not be superseded by backfill.
+        """
+
+        with self._store() as store:
+            nodes = store.get_nodes(target_node_ids)
+        curated: list[str] = []
+        for node in nodes:
+            if node.metadata.type is not NodeType.PERSISTENT:
+                continue
+            if self._has_distiller_provenance(node):
+                continue
+            curated.append(node.id)
+        return curated
+
+    @staticmethod
+    def _has_distiller_provenance(node: Node) -> bool:
+        from synapse.okf.transcripts import SESSION_ID_PREFIX, LEGACY_TITLE_PREFIX
+
+        for source in node.metadata.sources:
+            source_id = source.strip()
+            if source_id.startswith(SESSION_ID_PREFIX) or source_id.startswith(LEGACY_TITLE_PREFIX):
+                return True
+            # "session:<key>" style references emitted by the distiller prompt.
+            if source_id.casefold().startswith("session:"):
+                return True
+        return False
+
+    def _transcript_targets(self, target_node_ids: tuple[str, ...]) -> list[str]:
+        """Target ids that are session transcripts (never valid complement/supersede targets).
+
+        Uses the shared predicate so legacy ``Session summary …`` transcripts
+        (no ``mem_session_`` prefix, no ``session_key``) are caught too.
+        """
+
+        from synapse.okf.transcripts import is_session_transcript
+
+        with self._store() as store:
+            nodes = store.get_nodes(list(target_node_ids))
+        return [node.id for node in nodes if is_session_transcript(node)]
+
     def _normalize_sampling_decision(
         self,
         decision: MemoryWriteSamplingDecision,
@@ -1116,6 +1162,19 @@ class SynapseServerService:
                 "Sampling targeted nodes that were not present in the candidate set",
                 status_code=502,
                 details={"invalid_target_node_ids": invalid_targets, "candidate_ids": candidate_ids},
+            )
+
+        transcript_targets = self._transcript_targets(target_node_ids)
+        if transcript_targets:
+            raise SynapseServiceError(
+                "INVALID_SAMPLING_RESPONSE",
+                "complement/supersede may only target persistent knowledge nodes, never session transcripts",
+                status_code=502,
+                details={
+                    "transcript_target_node_ids": transcript_targets,
+                    "candidate_ids": candidate_ids,
+                    "action": action.value,
+                },
             )
 
         if action is IntegrateAction.CREATE and target_node_ids:

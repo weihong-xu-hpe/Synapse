@@ -19,12 +19,16 @@ from synapse.deployment import ServiceActionResult, ServiceLogView, ServiceManag
 from synapse.indexing import collect_health_status, rebuild_index as rebuild_sqlite_index, run_startup_checks
 from synapse.lifecycle import Dreamer
 from synapse.server.decider import LocalLLMDecider
+from synapse.storage import SQLiteNodeStore
 from synapse.utils import RuntimePaths, bootstrap_runtime_directories, configure_logging
+from typing import Any
 
 
 app = typer.Typer(help="Synapse local hybrid memory CLI.", no_args_is_help=True)
 dreamer_app = typer.Typer(help="Run Dreamer memory lifecycle operations.", no_args_is_help=True)
+distiller_app = typer.Typer(help="Run the session distiller (transcripts → OKF knowledge).", no_args_is_help=True)
 app.add_typer(dreamer_app, name="dreamer")
+app.add_typer(distiller_app, name="distill")
 AUDIT_LOGGER_NAME = "synapse.audit"
 DAEMON_LOGGER_NAME = "synapse.mcp-daemon"
 
@@ -205,6 +209,204 @@ def run_dreamer(
     typer.echo(f"Archived: {len(report.archived)}")
     typer.echo(f"Condensed: {len(report.condensed)}")
     typer.echo(f"Warnings: {len(report.warnings)}")
+
+
+@distiller_app.command("run")
+def run_distiller(
+    ctx: typer.Context,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Plan and report without writing anything.")] = False,
+    apply: Annotated[bool, typer.Option("--apply", help="Execute writes (default for an explicit run).")] = False,
+    limit: Annotated[int | None, typer.Option("--limit", min=1, help="Max transcripts to process this run.")] = None,
+    node_id: Annotated[str | None, typer.Option("--id", help="Distill one specific transcript node id.")] = None,
+    legacy_groups: Annotated[
+        Path | None,
+        typer.Option("--legacy-groups", help="JSON file of legacy session groups (backfill mode)."),
+    ] = None,
+    report_path: Annotated[
+        Path | None,
+        typer.Option("--report", help="Write the run report JSON to this path."),
+    ] = None,
+) -> None:
+    """Run one distillation sweep (or a legacy-group backfill).
+
+    Backfill mode (--legacy-groups) defaults to supersede-downgrade ON so
+    curated knowledge is never superseded without owner approval. The live
+    sweep (scheduler) runs with downgrade OFF.
+    """
+
+    state = _state_from_context(ctx)
+    logger = state.loggers[DAEMON_LOGGER_NAME]
+    execute = apply or not dry_run
+    if dry_run and apply:
+        raise typer.BadParameter("Use either --dry-run or --apply, not both.")
+
+    from synapse.lifecycle.distiller import Distiller
+
+    distiller = Distiller(
+        state.config,
+        runtime_paths=state.runtime_paths,
+        sampling_client=LocalLLMDecider(state.config.decider),
+        logger=logger,
+    )
+    try:
+        if legacy_groups is not None:
+            report = _run_legacy_backfill(
+                distiller,
+                groups_path=legacy_groups,
+                dry_run=dry_run or not execute,
+                limit=limit,
+                node_id=node_id,
+            )
+        elif node_id is not None:
+            report = _run_single(distiller, node_id=node_id, dry_run=dry_run or not execute)
+        else:
+            report = distiller.run(
+                limit=limit,
+                dry_run=dry_run or not execute,
+                downgrade_supersede=legacy_groups is not None or execute,
+            )
+    finally:
+        distiller.close()
+
+    summary = report.summary()
+    if report_path is not None:
+        report_path.write_text(json.dumps({"summary": summary, "details": report.details}, ensure_ascii=False, indent=2), encoding="utf-8")
+        typer.echo(f"Report written: {report_path}")
+    typer.echo("Distiller run completed.")
+    typer.echo(f"Transcripts scanned/distilled/skipped: {summary['transcripts_scanned']}/{summary['transcripts_distilled']}/{summary['transcripts_skipped']}")
+    typer.echo(f"Items extracted/invalid: {summary['items_extracted']}/{summary['items_invalid']}")
+    typer.echo(f"Decider actions: {summary['decider']}")
+    if summary["downgraded"]:
+        typer.echo("Supersede downgrades (backfill safety):")
+        for entry in summary["downgraded"]:
+            typer.echo(f"  - {entry['item_title']} (targets: {entry.get('target_node_ids')})")
+    typer.echo(f"Archived transcripts: {summary['archived_transcripts']}")
+    typer.echo(f"LLM failures: {summary['llm_failures']}")
+
+
+def _run_legacy_backfill(
+    distiller: Any,
+    *,
+    groups_path: Path,
+    dry_run: bool,
+    limit: int | None,
+    node_id: str | None,
+) -> Any:
+    """Backfill: distill the representative of each legacy session group."""
+
+    from synapse.lifecycle.distiller import content_sha256, is_fully_distilled
+
+    groups = json.loads(groups_path.read_text(encoding="utf-8"))
+    if node_id is not None:
+        groups = [g for g in groups if g.get("representative_id") == node_id]
+    if limit is not None:
+        groups = groups[:limit]
+
+    report = None
+    for group in groups:
+        representative_id = str(group.get("representative_id") or "")
+        member_ids = [str(m) for m in group.get("member_ids", [])]
+        transcript = distiller._load_transcript_from_disk(representative_id)
+        if transcript is None:
+            with distiller._get_store() as store:
+                transcript = store.get_node(representative_id)
+        if transcript is None:
+            continue
+        if is_fully_distilled(transcript):
+            continue
+        if dry_run:
+            single = distiller.run(limit=0, dry_run=True)
+            single.transcripts_scanned = 0
+        else:
+            single = distiller._run_one_transcript(transcript, downgrade_supersede=True)
+        # Stamp non-representative members as distilled-by-representative so
+        # they are never picked up by the live sweep (archive them only after
+        # the group representative distilled successfully).
+        if not dry_run and single.transcripts_distilled > 0:
+            for member_id in member_ids:
+                if member_id == representative_id:
+                    continue
+                member = distiller._load_transcript_from_disk(member_id)
+                if member is None:
+                    continue
+                distiller._stamp_transcript(member, [])
+        if report is None:
+            report = single
+        else:
+            report.transcripts_scanned += single.transcripts_scanned
+            report.transcripts_distilled += single.transcripts_distilled
+            report.transcripts_skipped += single.transcripts_skipped
+            report.items_extracted += single.items_extracted
+            report.items_invalid += single.items_invalid
+            report.decider_creates += single.decider_creates
+            report.decider_complements += single.decider_complements
+            report.decider_supersedes += single.decider_supersedes
+            report.decider_downgrades += single.decider_downgrades
+            report.llm_failures += single.llm_failures
+            report.downgraded.extend(single.downgraded)
+            report.details.extend(single.details)
+    return report or _empty_report()
+
+
+def _run_single(distiller: Any, *, node_id: str, dry_run: bool) -> Any:
+    from synapse.lifecycle.distiller import is_fully_distilled
+
+    transcript = distiller._load_transcript_from_disk(node_id)
+    if transcript is None:
+        with distiller._get_store() as store:
+            transcript = store.get_node(node_id)
+    if transcript is None:
+        raise typer.Exit(code=1)
+    if is_fully_distilled(transcript):
+        typer.echo(f"Node {node_id} is already fully distilled; nothing to do.")
+        return _empty_report()
+    return distiller._run_one_transcript(transcript, dry_run=dry_run, downgrade_supersede=True)
+
+
+def _empty_report() -> Any:
+    from synapse.lifecycle.distiller import DistillerReport
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return DistillerReport(started_at=now, completed_at=now, duration_ms=0)
+
+
+@distiller_app.command("status")
+def distiller_status(ctx: typer.Context) -> None:
+    """Show distiller configuration, queue depth, and recent run metrics."""
+
+    state = _state_from_context(ctx)
+    settings = state.config.distiller
+    typer.echo(f"Distiller enabled: {settings.enabled}")
+    typer.echo(f"Interval: {settings.interval_minutes} min, idle threshold: {settings.idle_minutes} min")
+    typer.echo(f"Retention: {settings.retention_days} days (distilled-only gate)")
+    typer.echo(f"Downgrade-supersede: {settings.downgrade_supersede}, enforce-OKF: {settings.enforce_okf}")
+
+    from synapse.lifecycle.distiller import Distiller, is_fully_distilled
+
+    distiller = Distiller(state.config, runtime_paths=state.runtime_paths)
+    try:
+        queue = distiller.select_transcripts(limit=None)
+        typer.echo(f"Undistilled idle transcripts queued: {len(queue)}")
+        for node in queue[:10]:
+            typer.echo(f"  - {node.id} ({node.title})")
+    finally:
+        distiller.close()
+
+    with SQLiteNodeStore(
+        state.runtime_paths.base / "synapse.db",
+        embedding_dimension=state.config.embedding.dimension or 0,
+    ) as store:
+        rows = store._connection.execute(
+            "SELECT started_at, transcripts_distilled, items_extracted, llm_failures, archived_transcripts "
+            "FROM distiller_runs ORDER BY started_at DESC LIMIT 5"
+        ).fetchall()
+    if rows:
+        typer.echo("Recent runs:")
+        for row in rows:
+            typer.echo(f"  {row['started_at']} distilled={row['transcripts_distilled']} items={row['items_extracted']} failures={row['llm_failures']} archived={row['archived_transcripts']}")
+    else:
+        typer.echo("No distiller runs recorded yet.")
 
 
 @app.command("rebuild-index")

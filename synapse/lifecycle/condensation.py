@@ -60,9 +60,8 @@ class DeterministicArchiveCondenser:
         source_lines = [f"- [[{node.id}]] — {node.title}" for node in nodes]
         tag_lines = [f"- {tag}" for tag in common_tags] or ["- No dominant tag cluster detected."]
 
-        # OKF-structured content: every persistent node (including sleep
-        # products) uses Context / Decision / Consequences sections so the
-        # store is uniformly OKF.
+        # OKF-structured content (docs/okf.md, okf_type=decision): the
+        # condensation product is typed, with Takeaway + Sources sections.
         context_lines = [
             f"- **{node.title}** (`{node.id}`): {self._summarize(node.content)}"
             for node in nodes
@@ -79,6 +78,11 @@ class DeterministicArchiveCondenser:
                 "",
                 f"Synthesized on {now.isoformat().replace(UTC_SUFFIX, 'Z')} from {len(nodes)} archived note(s).",
                 "",
+                "## Takeaway",
+                "",
+                f"Merged {len(nodes)} archived note(s) ({', '.join(node.title for node in nodes[:3])}"
+                f"{'…' if len(nodes) > 3 else ''}) into a single persistent record.",
+                "",
                 "## Context",
                 *context_lines,
                 "",
@@ -89,7 +93,7 @@ class DeterministicArchiveCondenser:
                 "- Consolidated record supersedes the archived sources for active retrieval.",
                 "- Original archive files remain available for audit and rollback.",
                 "",
-                "## Merged From",
+                "## Sources",
                 *source_lines,
             ]
         ).strip()

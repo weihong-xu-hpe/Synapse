@@ -167,6 +167,32 @@ class DreamerSettings(BaseModel):
     thresholds: DreamerThresholdSettings = Field(default_factory=DreamerThresholdSettings)
 
 
+class DistillerSettings(BaseModel):
+    """Session-distiller configuration (spec: docs/okf.md)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    interval_minutes: int = Field(default=10, ge=1)
+    idle_minutes: int = Field(default=30, ge=1)
+    retention_days: int = Field(default=45, ge=1)
+    max_transcript_chars: int = Field(default=16_000, ge=1000)
+    max_items_per_transcript: int = Field(default=5, ge=1, le=20)
+    # When true, a decider supersede targeting an existing non-distilled
+    # persistent node is downgraded to complement (backfill safety; default ON
+    # for backfill/CLI --apply over legacy groups, OFF for the live sweep).
+    downgrade_supersede: bool = True
+    # Rejection timeline flag (NOT active in this change): when true, fatal
+    # okf_* codes reject persistent writes instead of warning. Default off.
+    enforce_okf: bool = False
+    # Reasoning models (glm-5.3-flash) spend thinking tokens from the same
+    # budget: a 9k-char zh transcript measured 13k reasoning tokens before any
+    # content. 16000 leaves room for the JSON payload after thinking.
+    llm_max_tokens: int = Field(default=16_000, ge=200)
+    max_transcripts_per_run: int = Field(default=5, ge=1, le=50)
+    backoff_sweeps: int = Field(default=3, ge=0)
+
+
 class SynapseConfig(BaseModel):
     """Validated Synapse runtime configuration."""
 
@@ -183,6 +209,7 @@ class SynapseConfig(BaseModel):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     decider: DeciderSettings = Field(default_factory=DeciderSettings)
     dreamer: DreamerSettings = Field(default_factory=DreamerSettings)
+    distiller: DistillerSettings = Field(default_factory=DistillerSettings)
 
     _config_path: Path = PrivateAttr(default=Path(DEFAULT_CONFIG_FILE_NAME))
     _project_root: Path = PrivateAttr(default=Path.cwd())
