@@ -157,6 +157,22 @@ When the server runs (`serve --run-server`), two REST endpoints are available al
 
 `exclude_session_key` is optional: the node derived from that session key is removed from the results and candidates.
 
+#### How search scores results (Phase 1)
+
+The pipeline fuses three signals, then reranks and applies sign-safe additive penalties:
+
+1. **Lexical leg** — FTS5 with **OR semantics** (an implicit AND made multi-word queries miss). Chinese runs are expanded to **overlapping bigrams** in a shadow index (`nodes_fts_bigram`, maintained on every upsert and rebuilt automatically on schema migration), so unsegmented Chinese like `记忆库` matches without an exact character run. English words and code identifiers (`nodes_vec`, `sqlite.py`) pass through unchanged.
+2. **Dense leg** — bge-m3 embeddings. Long multi-part recall queries (the bridge joins the last 3 user messages with `\n---\n`) are **additionally embedded per message** and fused with **max-fusion** (each candidate keeps its best per-list rank) so one specific rank-1 match is not drowned by transcripts that appear in every list.
+3. **Reranker** — the full fused top-`[reranker] max_candidates` (default 9) is reranked; graph-hop neighbours only **append** when slots remain, they never displace fused hits.
+
+Final score = raw reranker logit + `ln` of decay/status multipliers (additive in logit space, so a stale or superseded irrelevant result can never be multiplied *up* toward 0):
+
+- **Persistent knowledge** gets a fixed small penalty (`-0.2`) regardless of access age — knowledge is not punished for not being accessed recently.
+- **Transient material** decays additively by `ln(0.98^days-since-access)`.
+- **Superseded** nodes get `ln(0.1)`, **disputed** `ln(0.5)` — strictly below active nodes at equal relevance.
+
+`score > 0` still means "relevant enough to inject" for clients that filter on it (the omp bridge). Excluded nodes (represented transcripts, `exclude_session_key`) are filtered **before** fusion, so they cannot consume fused candidate slots.
+
 ### POST /api/write
 
 Without `session_key`, the write goes through the sampling-backed decider (LLM). If an ACTIVE node with the same title and byte-identical content already exists, it is returned as `unchanged` without calling the LLM.
@@ -170,6 +186,18 @@ With an optional `session_key`, the write is a deterministic keyed upsert — no
 - node id is derived from the key (`mem_session_<16 hex of sha1(key)>`), so repeated writes for the same session converge on one node
 - absent → `created`; identical title+content → `unchanged`; different → `updated` in place (markdown + index + re-embed)
 - concurrent same-key writes serialize; concurrent identical unkeyed writes are guarded (exactly one node)
+
+`## Related` sections are merged, never duplicated: complement/supersede links extend the existing trailing `## Related` block with deduplicated `[[id]]` bullets (historical duplicates can be normalized with `SynapseServerService.merge_related_sections`).
+
+#### Evaluation harness
+
+Golden-set evaluation runs the real retrieval pipeline against whatever DB the config points at:
+
+```sh
+python -m synapse eval --golden <path-to-golden.json> [--report out.json] [--top-k 5] [--runs 1]
+```
+
+Metrics: Recall@5 / MRR@10 (raw and among `score > 0` results — the bridge's injection criterion), top-1 relevance, lexical zero-hit rate, positive-score rate, false-injection rate on no-memory queries, p50/p95 latency — overall and per language slice (`zh` / `en` / `mixed` / `code` / `recall` / `none`). `synapse/eval/golden.example.json` is a synthetic example; real golden sets with actual queries/node ids belong **outside** the repo (e.g. `~/.synapse/eval/`).
 
 ## Lifecycle
 

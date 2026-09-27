@@ -1350,6 +1350,44 @@ class SynapseServerService:
         normalized = " ".join(tokens).strip()
         return normalized or query.strip()
 
+    @staticmethod
+    def merge_related_sections(content: str) -> str:
+        """Merge every ``## Related`` section into one trailing section.
+
+        Historical `_embed_links` appended a NEW ``## Related`` block on every
+        complement, so active nodes accumulated duplicates (112 nodes, one
+        transcript with 30). This normalizer keeps a single trailing section
+        with deduplicated ``[[id]]`` bullets in order of first appearance;
+        all other content (and its order) is preserved verbatim.
+        """
+
+        text = content.strip()
+        if "## Related" not in text:
+            return text
+        # Remove every '## Related' section: the heading plus following bullet
+        # lines (and intra-section blank lines). A non-bullet, non-blank line
+        # ends the section, so interleaved body text is preserved.
+        pattern = re.compile(r"(?ms)^## Related\s*\n(?:(?:[ \t]*-[ \t][^\n]*\n?|[ \t]*\n(?![ \t]*\n))*)")
+        bullets: list[str] = []
+        seen: set[str] = set()
+        non_related = pattern.sub("", text)
+        for match in pattern.finditer(text):
+            for line in match.group(0).splitlines()[1:]:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                bullet = stripped if stripped.startswith("- ") else f"- {stripped}"
+                if bullet not in seen:
+                    seen.add(bullet)
+                    bullets.append(bullet)
+        cleaned = re.sub(r"\n{3,}", "\n\n", non_related).strip()
+        if not bullets:
+            return cleaned
+        related_block = "## Related\n" + "\n".join(bullets)
+        if not cleaned:
+            return related_block
+        return f"{cleaned}\n\n{related_block}"
+
     def _embed_links(self, content: str, links: list[str]) -> str:
         normalized_content = content.strip()
         if not links:
@@ -1359,6 +1397,12 @@ class SynapseServerService:
         if not missing_links:
             return normalized_content
 
+        # Merge into an EXISTING trailing '## Related' section (dedup handled
+        # here for the common single-section case) instead of appending a new
+        # duplicate heading.
+        if "## Related" in normalized_content:
+            merged = self.merge_related_sections(normalized_content)
+            return f"{merged}\n" + "\n".join(f"- [[{link}]]" for link in missing_links)
         related_block = "## Related\n" + "\n".join(f"- [[{link}]]" for link in missing_links)
         if not normalized_content:
             return related_block
