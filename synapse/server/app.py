@@ -350,11 +350,13 @@ def _create_rest_search_handler(service: SynapseServerService):
             )
         top_k = int(body.get("top_k", 3))
         exclude_session_key = body.get("exclude_session_key")
+        include = str(body.get("include", "default"))
         result = await run_in_threadpool(
             service.search_memory,
             query,
             top_k,
             exclude_session_key=str(exclude_session_key) if exclude_session_key else None,
+            include=include,
         )
         return JSONResponse(status_code=200, content=result)
 

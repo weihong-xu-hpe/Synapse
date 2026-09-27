@@ -6,7 +6,7 @@ import logging
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from synapse.config import SynapseConfig
 from synapse.embedding import create_embedding_engine, create_reranker_engine
@@ -99,8 +99,13 @@ class RetrievalPipeline:
         *,
         top_k: int | None = None,
         update_access: bool = True,
+        result_filter: Callable[[Node], bool] | None = None,
     ) -> RetrievalResponse:
-        """Run the full retrieval pipeline and update access only for final results."""
+        """Run the full retrieval pipeline and update access only for final results.
+
+        ``result_filter`` drops candidates BEFORE scoring and the top_k cut so
+        excluded nodes leave no holes — the next ranked results fill the slots.
+        """
 
         request = query if isinstance(query, SearchQuery) else SearchQuery(text=str(query), top_k=top_k or self.config.retrieval.top_k)
         final_top_k = top_k or request.top_k or self.config.retrieval.top_k
@@ -112,6 +117,8 @@ class RetrievalPipeline:
         anchor_id_set = set(anchor_ids)
         candidate_ids = anchor_ids + [node_id for node_id in neighbor_ids if node_id not in anchor_id_set]
         candidate_nodes = self._get_store().get_nodes(candidate_ids)
+        if result_filter is not None:
+            candidate_nodes = [node for node in candidate_nodes if result_filter(node)]
         anchor_score_map = {anchor.node.id: anchor.score for anchor in anchors}
         reranked = self.rerank_candidates(request.text, candidate_nodes)
 
@@ -128,6 +135,7 @@ class RetrievalPipeline:
         anchor_items = tuple(
             self._score_candidate(anchor.node, anchor.score, anchor_score=anchor.score, is_anchor=True)
             for anchor in anchors
+            if result_filter is None or result_filter(anchor.node)
         )
         context = self._assemble_context(final_results)
         return RetrievalResponse(

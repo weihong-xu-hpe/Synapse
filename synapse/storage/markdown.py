@@ -260,6 +260,12 @@ def archive_node_path(archive_path: str | Path, node_id: str) -> Path:
 
 
 
+def _is_session_transcript(node: Node) -> bool:
+    from synapse.okf.transcripts import is_session_transcript
+
+    return is_session_transcript(node)
+
+
 def write_node_file(
     node: Node,
     *,
@@ -271,7 +277,9 @@ def write_node_file(
     """Serialize and atomically write a node to disk."""
 
     validation = node.word_count_validation()
-    if validation.warning:
+    if validation.warning and not _is_session_transcript(node):
+        # Session transcripts legitimately exceed the knowledge-node word
+        # guideline (the bridge sends up to 16k chars); stay silent for them.
         logger.warning(validation.warning, extra={"node_id": node.metadata.id})
 
     if output_path is not None:
