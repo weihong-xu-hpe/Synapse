@@ -154,6 +154,12 @@ class SynapseMCPServer:
         arguments = parsed.model_dump()
         if "type" in arguments:
             arguments["node_type"] = arguments.pop("type")
+        # Usage attribution (search_events / write_memory_events.route): these
+        # two tools arrived through the MCP tool surface.
+        if tool.name == "search_memory":
+            arguments["source"] = "mcp"
+        elif tool.name == "write_memory":
+            arguments["route"] = "mcp"
         with self._use_sampling_client(sampling_client):
             result = tool.handler(**arguments)
         return self._build_tool_result(result)

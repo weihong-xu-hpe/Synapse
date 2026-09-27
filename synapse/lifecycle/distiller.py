@@ -486,6 +486,7 @@ class Distiller:
                 project=self._transcript_project(transcript),
                 downgrade_supersede=downgrade_supersede,
                 node_id=forced_node_id,
+                route="distiller",
             )
         except SynapseServiceError as exc:
             guard_fired = (

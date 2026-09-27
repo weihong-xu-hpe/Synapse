@@ -351,12 +351,16 @@ def _create_rest_search_handler(service: SynapseServerService):
         top_k = int(body.get("top_k", 3))
         exclude_session_key = body.get("exclude_session_key")
         include = str(body.get("include", "default"))
+        # Source attribution for search_events: the omp bridge is the only
+        # caller that sends exclude_session_key.
+        source = "bridge" if exclude_session_key else "rest"
         result = await run_in_threadpool(
             service.search_memory,
             query,
             top_k,
             exclude_session_key=str(exclude_session_key) if exclude_session_key else None,
             include=include,
+            source=source,
         )
         return JSONResponse(status_code=200, content=result)
 
@@ -390,18 +394,20 @@ def _create_rest_write_handler(service: SynapseServerService):
         # Unkeyed path: write_memory itself guards against concurrent
         # identical writes (lock held across guard -> decider -> integrate).
         result = await run_in_threadpool(
-            service.write_memory,
-            title,
-            str(body.get("content", "")),
-            body.get("type", "transient"),
-            body.get("links"),
-            body.get("sensitivity", "internal"),
-            body.get("query_hint"),
-            float(body.get("similarity_threshold", 0.3)),
-            body.get("okf_type"),
-            body.get("okf_version"),
-            body.get("sources"),
-            body.get("project"),
+            lambda: service.write_memory(
+                title=title,
+                content=str(body.get("content", "")),
+                node_type=body.get("type", "transient"),
+                links=body.get("links"),
+                sensitivity=body.get("sensitivity", "internal"),
+                query_hint=body.get("query_hint"),
+                similarity_threshold=float(body.get("similarity_threshold", 0.3)),
+                okf_type=body.get("okf_type"),
+                okf_version=body.get("okf_version"),
+                sources=body.get("sources"),
+                project=body.get("project"),
+                route="rest",
+            ),
         )
         return JSONResponse(status_code=200, content=result)
 

@@ -11,6 +11,7 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from synapse.embedding import create_embedding_engine
@@ -27,6 +28,7 @@ from synapse.server.sampling import (
 )
 from synapse.storage import (
     SQLiteNodeStore,
+    SearchEventMetrics,
     WriteMemoryEventMetrics,
     extract_wiki_links,
     split_frontmatter,
@@ -42,6 +44,17 @@ _REDACTED_FIELDS = {"auth_token", "authorization", "content"}
 _SUPERSEDES_REASON_PATTERN = re.compile(r"^> \*\*Supersedes\*\*: \[\[[^\]]+\]\](?: — (?P<reason>.+))?$")
 _INVALID_TITLE_MESSAGE = "Node title must not be blank"
 _ACTIVE_ARCHITECTURE_DOC = "docs/design/streamable-mcp-single-path-architecture.md"
+
+
+def _query_cjk_ratio(text: str) -> float:
+    """Share of CJK characters in a query — cheap corpus signal for search events."""
+
+    if not text:
+        return 0.0
+    cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff" or "\u3040" <= char <= "\u30ff")
+    return round(cjk / len(text), 4)
+
+
 _SAMPLING_REQUIREMENTS_MESSAGE = (
     "This high-level tool requires a sampling-capable MCP host/client that can complete sampling/createMessage. "
     f"See {_ACTIVE_ARCHITECTURE_DOC}."
@@ -152,7 +165,9 @@ class SynapseServerService:
         *,
         exclude_session_key: str | None = None,
         include: str = "default",
+        source: str = "api",
     ) -> dict[str, Any]:
+        started = perf_counter()
         if not query.strip():
             raise SynapseServiceError("INVALID_QUERY", "Search query must not be blank")
         # Filtering happens inside the pipeline BEFORE scoring/top_k so
@@ -172,8 +187,66 @@ class SynapseServerService:
             "results": [self._serialize_retrieval_item(item) for item in response.results],
             "context": response.context,
         }
+        self._record_search_event(
+            query=query,
+            source=source,
+            exclude_session_key=exclude_session_key,
+            top_k=top_k,
+            include=include,
+            latency_ms=(perf_counter() - started) * 1000.0,
+            payload=payload,
+        )
         self._log_tool_call("search_memory", {"query": query, "top_k": top_k, "include": include}, payload)
         return payload
+
+    def _record_search_event(
+        self,
+        *,
+        query: str,
+        source: str,
+        exclude_session_key: str | None,
+        top_k: int,
+        include: str,
+        latency_ms: float,
+        payload: dict[str, Any],
+    ) -> None:
+        """Persist one search usage event. Must never break the read path."""
+
+        try:
+            results = [
+                {
+                    "rank": rank,
+                    "node_id": item.get("node_id"),
+                    "type": (item.get("node") or {}).get("metadata", {}).get("type"),
+                    "okf_type": (item.get("node") or {}).get("metadata", {}).get("okf_type"),
+                    "rerank_logit": item.get("rerank_logit"),
+                    "score": item.get("score"),
+                    "inject": bool(item.get("inject")),
+                }
+                for rank, item in enumerate(payload.get("results", []), start=1)
+            ]
+            event_query = query.strip()
+            with self._store() as store:
+                store.record_search_event(
+                    SearchEventMetrics(
+                        ts=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                        source=source,
+                        session_hash=hashlib.sha1(exclude_session_key.strip().encode("utf-8")).hexdigest()[:12]
+                        if exclude_session_key and exclude_session_key.strip()
+                        else None,
+                        query=event_query,
+                        query_chars=len(event_query),
+                        cjk_ratio=_query_cjk_ratio(event_query),
+                        top_k=top_k,
+                        include=include,
+                        latency_ms=round(latency_ms, 3),
+                        lexical_hit_count=None,
+                        results=tuple(results),
+                    )
+                )
+                store.prune_search_events(retention_days=self.config.observability.search_events_retention_days)
+        except (OSError, ValueError, sqlite3.DatabaseError) as exc:  # metrics must never break reads
+            self.logger.warning("Failed to record search event", exc_info=exc)
 
     def _include_result(self, node: Node, include: str) -> bool:
         """Default search excludes distilled-current transcripts.
@@ -351,6 +424,7 @@ class SynapseServerService:
         project: str | None = None,
         node_id: str | None = None,
         downgrade_supersede: bool = False,
+        route: str | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -367,6 +441,15 @@ class SynapseServerService:
                     "action": "unchanged",
                     "title": clean_title,
                 }
+                # Coverage fix (2026-09-27): the dedupe-guard early return
+                # previously wrote NO write_memory_events row, silently
+                # undercounting identical writes.
+                self._record_route_write_event(
+                    node_id=guard.id,
+                    node_type=guard.metadata.type.value,
+                    action="unchanged",
+                    route=route,
+                )
                 self._log_tool_call(
                     "write_memory_dedupe_guard",
                     {"title": clean_title, "content_hash": content_hash[:12]},
@@ -388,6 +471,7 @@ class SynapseServerService:
                 project=project,
                 node_id=node_id,
                 downgrade_supersede=downgrade_supersede,
+                route=route,
             )
 
     def _find_identical_active_node(self, title: str, content: str) -> Node | None:
@@ -419,6 +503,7 @@ class SynapseServerService:
         project: str | None = None,
         node_id: str | None = None,
         downgrade_supersede: bool = False,
+        route: str | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         warnings: list[dict[str, str]] = []
@@ -536,6 +621,7 @@ class SynapseServerService:
                 similarity_threshold=similarity_threshold,
                 warning_codes=[warning["code"] for warning in warnings],
                 execution_succeeded=False,
+                route=route,
             )
             raise SynapseServiceError(
                 "EXECUTION_FAILED_AFTER_DECISION",
@@ -558,6 +644,7 @@ class SynapseServerService:
             similarity_threshold=similarity_threshold,
             warning_codes=[warning["code"] for warning in warnings],
             execution_succeeded=True,
+            route=route,
         )
 
         result = {
@@ -704,6 +791,18 @@ class SynapseServerService:
             return payload
 
     def _record_session_upsert_metric(self, node_id: str, node_type: str, action: str) -> None:
+        self._record_route_write_event(node_id=node_id, node_type=node_type, action=action, route="session_upsert")
+
+    def _record_route_write_event(
+        self,
+        *,
+        node_id: str | None,
+        node_type: str,
+        action: str,
+        route: str | None,
+    ) -> None:
+        """Record a lightweight write event with route attribution (no decider evidence)."""
+
         try:
             with self._store() as store:
                 store.record_write_memory_event(
@@ -715,12 +814,13 @@ class SynapseServerService:
                         candidate_count=0,
                         similarity_threshold=0.0,
                         warning_codes=(),
-                        sampling_provider="session-upsert",
+                        sampling_provider="",
                         execution_succeeded=True,
+                        route=route,
                     )
                 )
         except (OSError, ValueError, sqlite3.DatabaseError) as exc:  # metrics must never break writes
-            self.logger.warning("Failed to record session-upsert metrics", exc_info=exc)
+            self.logger.warning("Failed to record write-route metrics", exc_info=exc)
 
     def write_node(
         self,
@@ -752,6 +852,12 @@ class SynapseServerService:
         absolute_path = write_node_file(node, base_path=self.runtime_paths.base)
         sync_result = self._sync_paths([absolute_path])
         stored_node = self._load_node(node_id)
+        self._record_route_write_event(
+            node_id=node_id,
+            node_type=normalized_type.value,
+            action="create",
+            route="write_node",
+        )
         payload = {
             "node": self._serialize_node(stored_node),
             "sync": self._serialize_sync_result(sync_result),
@@ -1493,6 +1599,7 @@ class SynapseServerService:
         similarity_threshold: float,
         warning_codes: list[str],
         execution_succeeded: bool,
+        route: str | None = None,
     ) -> None:
         try:
             with self._store() as store:
@@ -1507,6 +1614,7 @@ class SynapseServerService:
                         warning_codes=tuple(warning_codes),
                         sampling_provider=str(evidence.get("sampling_provider") or ""),
                         execution_succeeded=execution_succeeded,
+                        route=route,
                     )
                 )
         except (OSError, ValueError, sqlite3.DatabaseError) as exc:  # pragma: no cover - metrics must never break writes
