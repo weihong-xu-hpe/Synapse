@@ -50,7 +50,7 @@ archive_retention_days = 90
 custom_patterns = []
 
 [logging]
-retention_days = 7
+backup_count = 7
 max_file_size_mb = 50
 log_dir = "./.synapse/.logs"
 
@@ -80,3 +80,10 @@ link_weaving_recency_days = 30
 superseded_archive_days = 7
 low_structure_chars = 100
 max_missing_link_pairs_per_run = 100
+
+[observability]
+# search_events rows older than this are pruned on write (local private DB).
+search_events_retention_days = 180
+# JSONL histories (private, outside the repo by default).
+# eval_history_path = "~/.synapse/eval/history.jsonl"
+# audit_history_path = "~/.synapse/eval/audit-history.jsonl"

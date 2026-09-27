@@ -554,6 +554,107 @@ def status(ctx: typer.Context) -> None:
         typer.echo(f"Warning: {warning}")
 
 
+def _echo_json_block(payload: dict[str, Any]) -> None:
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+metrics_app = typer.Typer(help="Observability metrics operations.", no_args_is_help=True)
+app.add_typer(metrics_app, name="metrics")
+
+
+@metrics_app.command("snapshot")
+def metrics_snapshot(
+    ctx: typer.Context,
+    backfill_days: Annotated[
+        int,
+        typer.Option("--backfill-days", min=0, max=30, help="Also backfill this many past days if rows are missing."),
+    ] = 2,
+) -> None:
+    """Write the daily metrics snapshot (today + recent backfill), then print it."""
+
+    from synapse.observability import collect_daily_snapshot, write_missing_snapshots
+
+    state = _state_from_context(ctx)
+    written = write_missing_snapshots(state.config, state.runtime_paths, backfill_days=backfill_days)
+    if written:
+        typer.echo(f"Snapshots written: {', '.join(written)}")
+    else:
+        typer.echo("Snapshots already up to date.")
+    today = datetime.now().astimezone().date()
+    with SQLiteNodeStore(
+        state.runtime_paths.base / "synapse.db",
+        embedding_dimension=state.config.embedding.dimension or 0,
+    ) as store:
+        _echo_json_block(collect_daily_snapshot(state.config, state.runtime_paths, day=today, store=store))
+
+
+@app.command()
+def report(
+    ctx: typer.Context,
+    since: Annotated[
+        str,
+        typer.Option("--since", help="Lookback window, e.g. 30d, 12w, 6m."),
+    ] = "30d",
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Write the markdown report to this file (also prints a summary).", dir_okay=False, resolve_path=True),
+    ] = None,
+) -> None:
+    """Render the lookback markdown report for the owner's upgrade review."""
+
+    from synapse.observability import parse_since_days, render_report
+
+    state = _state_from_context(ctx)
+    since_days = parse_since_days(since)
+    content = render_report(state.config, state.runtime_paths, since_days=since_days, out_path=out)
+    if out is not None:
+        typer.echo(f"Report written: {out}")
+    typer.echo(content)
+
+
+audit_app = typer.Typer(help="Observability audits.", no_args_is_help=True)
+app.add_typer(audit_app, name="audit")
+
+
+@audit_app.command("injections")
+def audit_injections(
+    ctx: typer.Context,
+    since: Annotated[
+        str,
+        typer.Option("--since", help="Lookback window, e.g. 30d."),
+    ] = "30d",
+    sample: Annotated[
+        int,
+        typer.Option("--sample", min=1, help="Max injected results to judge with the LLM."),
+    ] = 30,
+    report_path: Annotated[
+        Path | None,
+        typer.Option("--report", help="Write the full audit markdown to this path.", dir_okay=False, resolve_path=True),
+    ] = None,
+) -> None:
+    """LLM-judge a sample of injected search results for relevance."""
+
+    from synapse.observability import parse_since_days, run_injection_audit
+
+    state = _state_from_context(ctx)
+    since_days = parse_since_days(since)
+    logger = state.loggers[AUDIT_LOGGER_NAME]
+    logger.info("Injection audit invoked", extra={"since_days": since_days, "sample": sample})
+    summary = run_injection_audit(
+        state.config,
+        state.runtime_paths,
+        since_days=since_days,
+        sample_size=sample,
+        report_path=report_path,
+    )
+    if report_path is not None:
+        typer.echo(f"Audit report written: {report_path}")
+    typer.echo(f"Judged: {summary['judged']} of {summary['candidates_available']} candidates")
+    typer.echo(f"Precision (related, >=1): {summary['precision_related']} {summary['precision_related_wilson95']}")
+    typer.echo(f"Precision (useful, =2): {summary['precision_useful']} {summary['precision_useful_wilson95']}")
+    typer.echo(f"History appended: {state.config.observability.audit_history_path}")
+
+
 @app.command("dedupe-session-summaries")
 def dedupe_session_summaries(
     ctx: typer.Context,
@@ -809,12 +910,22 @@ def eval_run(
         Path | None,
         typer.Option("--report", help="Write the JSON report to this path.", dir_okay=False, resolve_path=True),
     ] = None,
+    history: Annotated[
+        Path | None,
+        typer.Option(
+            "--history",
+            help="Append a one-line JSON run record to this JSONL file (default ~/.synapse/eval/history.jsonl).",
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
     top_k: Annotated[int, typer.Option("--top-k", min=1, help="top_k used for retrieval during eval.")] = 5,
     runs: Annotated[int, typer.Option("--runs", min=1, help="Runs per query; metrics use the median run.")] = 1,
 ) -> None:
     """Run golden-set queries through the real retrieval pipeline and print metrics."""
 
     from synapse.eval import load_golden, run_eval, write_report
+    from synapse.eval.history import DEFAULT_HISTORY_PATH, append_history_line
 
     state = _state_from_context(ctx)
     queries = load_golden(golden)
@@ -824,6 +935,14 @@ def eval_run(
     if report is not None:
         write_report(result, report)
         typer.echo(f"Report written to {report}")
+    history_path = history if history is not None else DEFAULT_HISTORY_PATH
+    line = append_history_line(
+        history_path,
+        payload,
+        golden_path=golden,
+        repo_dir=Path(__file__).resolve().parent.parent,
+    )
+    typer.echo(f"History appended to {history_path} (ts={line['ts']})")
     typer.echo(json.dumps(payload["overall"], indent=2, ensure_ascii=False))
     for name, metrics in sorted(payload["slices"].items()):
         typer.echo(f"--- {name}: " + json.dumps(metrics, ensure_ascii=False))

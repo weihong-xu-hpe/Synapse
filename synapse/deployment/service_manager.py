@@ -180,6 +180,61 @@ class ServiceManager:
         }
         return plistlib.dumps(payload, sort_keys=False).decode("utf-8")
 
+    AUDIT_LAUNCHD_LABEL = "com.synapse.audit"
+
+    @property
+    def audit_plist_path(self) -> Path:
+        return self.home_directory / "Library" / "LaunchAgents" / f"{self.AUDIT_LAUNCHD_LABEL}.plist"
+
+    @property
+    def audit_program_arguments(self) -> list[str]:
+        return [
+            str(self.python_path),
+            "-m",
+            "synapse",
+            "audit",
+            "injections",
+            "--since",
+            "30d",
+            "--sample",
+            "30",
+            "--report",
+            str(self.runtime_paths.logs / "audit-latest.md"),
+        ]
+
+    def render_audit_launchd_plist(self) -> str:
+        """Render the monthly injection-audit LaunchAgent plist (day 1, 10:00)."""
+
+        payload = {
+            "Label": self.AUDIT_LAUNCHD_LABEL,
+            "ProgramArguments": self.audit_program_arguments,
+            "WorkingDirectory": str(self.working_directory),
+            "StartCalendarInterval": {"Day": 1, "Hour": 10, "Minute": 0},
+            "StandardOutPath": str(self.runtime_paths.logs / "audit-job.log"),
+            "StandardErrorPath": str(self.runtime_paths.logs / "audit-job.log"),
+            "EnvironmentVariables": {
+                "SYNAPSE_CONFIG_PATH": str(self.config_path),
+            },
+        }
+        return plistlib.dumps(payload, sort_keys=False).decode("utf-8")
+
+    def install_audit_launchd(self) -> Path:
+        """Write (macOS only) and bootstrap the monthly audit LaunchAgent."""
+
+        if self.platform != "macos":
+            raise RuntimeError("The audit LaunchAgent is only supported on macOS")
+        plist_path = self.audit_plist_path
+        plist_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_path.write_text(self.render_audit_launchd_plist(), encoding="utf-8")
+        try:
+            plist_path.chmod(0o644)
+        except OSError:
+            pass
+        domain = f"gui/{self.user_id}"
+        self._run_command(["launchctl", "bootout", domain, str(plist_path)])
+        self._run_command(["launchctl", "bootstrap", domain, str(plist_path)])
+        return plist_path
+
     def render_systemd_service(self) -> str:
         """Render a systemd user service unit."""
 

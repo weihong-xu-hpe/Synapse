@@ -198,10 +198,79 @@ With an optional `session_key`, the write is a deterministic keyed upsert — no
 Golden-set evaluation runs the real retrieval pipeline against whatever DB the config points at:
 
 ```sh
-python -m synapse eval --golden <path-to-golden.json> [--report out.json] [--top-k 5] [--runs 1]
+python -m synapse eval --golden <path-to-golden.json> [--report out.json] [--history history.jsonl] [--top-k 5] [--runs 1]
 ```
 
+`--history` appends one JSON line per run to a JSONL file (default `~/.synapse/eval/history.jsonl`): `{ts, git_sha, golden_sha256, n_queries, overall, slices, stale_labels, queries_without_labels}`. Label drift against live data is handled before scoring: superseded labels follow `superseded_by` to the terminal active node, archived/missing labels are dropped and counted in `stale_labels`, and queries whose labels are all stale are reported in `queries_without_labels` rather than scored as misses.
+
 Metrics: Recall@5 / MRR@10 (raw and among `score > 0` results — the bridge's injection criterion), top-1 relevance, lexical zero-hit rate, positive-score rate, false-injection rate on no-memory queries, p50/p95 latency — overall and per language slice (`zh` / `en` / `mixed` / `code` / `recall` / `none`). `synapse/eval/golden.example.json` is a synthetic example; real golden sets with actual queries/node ids belong **outside** the repo (e.g. `~/.synapse/eval/`).
+
+#### Weekly scheduled eval (launchd)
+
+Create `~/Library/LaunchAgents/com.synapse.eval.plist` (fill the placeholders; expand `~` to absolute paths — launchd does not):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.synapse.eval</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string><REPO>/scripts/eval_launch.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>10</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SYNAPSE_CONFIG_PATH</key><string>/Users/<you>/.synapse/config.local.toml</string>
+  </dict>
+  <key>WorkingDirectory</key><string><REPO></string>
+  <key>StandardOutPath</key><string>/Users/<you>/.synapse/.logs/eval-job.log</string>
+  <key>StandardErrorPath</key><string>/Users/<you>/.synapse/.logs/eval-job.log</string>
+</dict>
+</plist>
+```
+
+The wrapper computes the date-stamped report path:
+
+```sh
+#!/bin/sh
+# scripts/eval_launch.sh — launchd entrypoint for the weekly eval
+set -eu
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LOGDIR="${HOME}/.synapse/eval/reports"
+mkdir -p "${LOGDIR}" "${HOME}/.synapse/.logs"
+exec "${REPO}/.venv/bin/python" -m synapse eval \
+  --golden "${HOME}/.synapse/eval/golden-v1.json" \
+  --history "${HOME}/.synapse/eval/history.jsonl" \
+  --report "${LOGDIR}/$(date +%F).json"
+```
+
+Load and trigger manually: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.eval.plist`, then `launchctl kickstart gui/$(id -u)/com.synapse.eval`. Remove with `bootout` when no longer wanted.
+
+## Observability (usage analytics & lookback)
+
+Every search and write is recorded locally (SQLite tables `search_events`, `write_memory_events.route`, `metrics_snapshots` — schema v7) so the owner can look back after 1–2 months and decide the next upgrade direction. All data stays on the machine; query text is stored in the private local DB only. Full key reference: `docs/configuration.md` § `[observability]`.
+
+- **Search events** — one row per `search_memory` call with `source` (`bridge` / `rest` / `mcp`), session hash, query text, CJK ratio, latency, and per-result `inject` decisions. Eval runs bypass the service layer and are never recorded (usage statistics stay eval-free). Rows older than `search_events_retention_days` (default 180) are pruned on write.
+- **Daily snapshots** — written automatically after each distiller sweep (idempotent per local day, 2-day backfill when the machine slept); `python -m synapse metrics snapshot` runs/prints one manually.
+- **Write attribution** — `write_memory_events.route` distinguishes `mcp`, `rest`, `session_upsert`, `distiller`, `write_node`; the dedupe-guard `unchanged` path is now recorded too.
+
+Lookback commands:
+
+```sh
+python -m synapse report --since 30d --out lookback.md   # markdown summary (weekly buckets, inject rates, growth, eval trend)
+python -m synapse audit injections --since 30d --sample 30 --report audit.md   # LLM-judged injection precision
+python -m synapse metrics snapshot                        # today's raw metrics JSON
+```
+
+The injection audit samples `inject=true` results from bridge/mcp searches, asks the configured `[decider]` LLM to grade relevance (0 irrelevant / 1 related / 2 directly useful), reports precision with a Wilson 95% interval (per source, per okf_type), lists the worst cases, and appends to `~/.synapse/eval/audit-history.jsonl`. On macOS, `ServiceManager(config).install_audit_launchd()` generates `~/Library/LaunchAgents/com.synapse.audit.plist` (monthly, day 1 at 10:00); see `docs/configuration.md` for the exact steps.
 
 ## Lifecycle
 
@@ -313,6 +382,13 @@ Check:
 ### service logs are missing
 
 This usually means the daemon has not been installed or started yet.
+
+### where logs live
+
+- `synapse.log`, `mcp-daemon.log`, `file-watcher.log`, `audit.log` — rotating JSON logs in `[logging] log_dir` (default `.synapse/.logs`).
+- `uvicorn.log` — server/app log (uvicorn default + error records), rotating, same `[logging]` limits; error-level records are also mirrored to stderr so launchd still captures crashes in `service-error.log`.
+- `uvicorn-access.log` — HTTP access log, rotating, same `[logging]` limits; access lines no longer go to stdout/stderr.
+- `service.log` / `service-error.log` — raw launchd capture of the service's stdout/stderr (not rotated; should now stay near-empty since uvicorn logs are routed to files).
 
 ### index issues
 

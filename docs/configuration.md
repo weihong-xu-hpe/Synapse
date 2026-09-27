@@ -74,7 +74,7 @@ archive_retention_days = 90
 custom_patterns = []
 
 [logging]
-retention_days = 7
+backup_count = 7
 max_file_size_mb = 50
 log_dir = "./.synapse/.logs"
 
@@ -212,7 +212,11 @@ Custom regex redaction rules for remote-bound payloads.
 
 ### `[logging]`
 
-Controls local log retention and file-size limits.
+Controls local log rotation and file-size limits.
+
+- `backup_count` (int, ≥1, default `7`) — number of rotated backup files kept per log file (a **file count**, not days; each file rotates when it reaches `max_file_size_mb`). The previous name `retention_days` is no longer accepted.
+- `max_file_size_mb` (int, ≥1, default `50`) — rotation threshold per log file
+- `log_dir` — directory for rotated log files (`synapse.log`, `mcp-daemon.log`, `file-watcher.log`, `audit.log`, plus `uvicorn.log` and `uvicorn-access.log` written by the HTTP server)
 
 ### `[decider]`
 
@@ -279,6 +283,40 @@ Controls the session distiller — the server-side pipeline that converts sessio
 - `backoff_sweeps` (int, default `3`) — sweeps a failing transcript is skipped before retry
 
 Maintenance commands: `python -m synapse distill status | run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`.
+
+### `[observability]`
+
+Controls the local usage-analytics tables (schema v7) and the lookback reports. All data stays in the local SQLite DB / private JSONL files — nothing is transmitted.
+
+- `search_events_retention_days` (int, ≥1, default `180`) — `search_events` rows older than this are pruned on each write (one cheap DELETE; indexes keep it bounded)
+- `eval_history_path` — JSONL history of eval runs (default `~/.synapse/eval/history.jsonl`); relative paths resolve against the config file's directory
+- `audit_history_path` — JSONL history of injection audits (default `~/.synapse/eval/audit-history.jsonl`)
+
+What gets recorded:
+
+- **`search_events`** (one row per `search_memory` call): timestamp, `source` (`bridge` when the REST call carries `exclude_session_key`, else `rest`; `mcp` for the MCP tool), sha1-prefix `session_hash`, query text + char count + CJK ratio, top_k, include, latency, and the returned results as JSON (rank, node_id, type, okf_type, rerank_logit, score, inject). Eval runs call `RetrievalPipeline.search` directly and are **never recorded** — eval stays out of usage statistics by construction.
+- **`metrics_snapshots`** (one row per local day, written by the distiller sweep; idempotent per day with 2-day backfill for slept-through boundaries; `python -m synapse metrics snapshot` runs it manually): node counts by status/type/okf_type/project, transcript distillation state, the day's write mix by route + decider action, distiller yield/failures/downgrades, search stats (count by source, p50/p95 latency, inject rate, zero-inject share, top injected node ids), Dreamer runs, and DB/active/archive sizes.
+- **`write_memory_events.route`** (new column): write attribution — `mcp`, `rest`, `session_upsert`, `distiller`, `write_node`. The dedupe-guard `unchanged` early return now also records an event (it previously wrote nothing, undercounting identical writes). Legacy rows have `route = NULL`.
+
+Commands:
+
+- `python -m synapse metrics snapshot [--backfill-days N]` — write/print the daily snapshot
+- `python -m synapse report --since 30d [--out file.md]` — markdown lookback (weekly search/latency buckets, inject rate per source, zero-injection sessions, most/least injected knowledge, knowledge growth, write mix, decider actions + downgrades, distiller/Dreamer yield, storage growth, eval trend from the eval history JSONL, injection-audit history). Works with partial/empty data.
+- `python -m synapse audit injections --since 30d --sample 30 [--report path]` — samples injected results (`inject=true`, sources bridge/mcp) from `search_events`, asks the configured `[decider]` LLM to judge relevance (0 irrelevant / 1 related / 2 directly useful + one-line reason), prints a Wilson-interval precision estimate (per source and per okf_type), lists the worst cases, and appends a summary line to `audit_history_path`.
+
+Monthly schedule (macOS): the `synapse install --service` flow does not manage the audit job; generate and load it explicitly:
+
+```sh
+python - <<'PY'
+from synapse.config import load_config
+from synapse.deployment.service_manager import ServiceManager
+config = load_config()  # SYNAPSE_CONFIG_PATH or ./config.toml
+print(ServiceManager(config).install_audit_launchd())
+PY
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.synapse.audit.plist
+```
+
+The agent runs `python -m synapse audit injections --since 30d --sample 30` on day 1 of each month at 10:00, logging to `~/.synapse/.synapse/.logs/audit-job.log` (relative to the configured log dir).
 
 ## Environment variables
 
