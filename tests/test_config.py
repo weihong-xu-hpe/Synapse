@@ -28,7 +28,7 @@ archive_path = "./.synapse/.archive"
     assert config.embedding.provider == "remote_api"
     assert config.embedding.dimension == 1024
     assert config.reranker.provider == "remote_api"
-    assert config.logging.retention_days == 7
+    assert config.logging.backup_count == 7
     assert config.decay.janitor_days == 30
     assert config.decay.archive_retention_days == 90
     assert config.decider.provider == "local_llm"
@@ -47,6 +47,38 @@ archive_path = "./.synapse/.archive"
     assert config.dreamer.thresholds.low_structure_chars == 100
     assert config.dreamer.thresholds.max_missing_link_pairs_per_run == 100
     assert config.resolve_path(config.memory.base_path) == (tmp_path / ".synapse").resolve()
+
+
+def test_logging_backup_count_roundtrip(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[logging]
+backup_count = 12
+""".strip(),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    assert config.logging.backup_count == 12
+
+
+def test_logging_old_retention_days_key_fails_clearly(tmp_path: Path) -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[logging]
+retention_days = 7
+""".strip(),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        load_config(config_path)
+    message = str(exc_info.value)
+    assert "retention_days" in message
+    assert "backup_count" in message or "Extra inputs" in message
 
 
 def test_load_config_honors_env_override_and_bootstraps_runtime(tmp_path: Path, monkeypatch) -> None:

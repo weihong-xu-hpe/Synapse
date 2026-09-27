@@ -147,7 +147,7 @@ class SanitizationSettings(BaseModel):
 class LoggingSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    retention_days: int = Field(default=7, ge=1)
+    backup_count: int = Field(default=7, ge=1)
     max_file_size_mb: int = Field(default=50, ge=1)
     log_dir: Path = Path("./.synapse/.logs")
 
@@ -218,6 +218,26 @@ class DistillerSettings(BaseModel):
     backoff_sweeps: int = Field(default=3, ge=0)
 
 
+class ObservabilitySettings(BaseModel):
+    """Observability settings (search events, metrics snapshots, reports)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # search_events rows older than this are pruned on write (local private DB).
+    search_events_retention_days: int = Field(default=180, ge=1)
+    # Eval run history (written by `synapse eval`, private, outside the repo).
+    # Relative paths resolve against the config file's directory.
+    eval_history_path: Path = Path("~/.synapse/eval/history.jsonl").expanduser()
+    # Injection-audit history (written by `synapse audit injections`).
+    audit_history_path: Path = Path("~/.synapse/eval/audit-history.jsonl").expanduser()
+
+    def resolved_eval_history_path(self, config: SynapseConfig) -> Path:
+        return config.resolve_path(self.eval_history_path)
+
+    def resolved_audit_history_path(self, config: SynapseConfig) -> Path:
+        return config.resolve_path(self.audit_history_path)
+
+
 class SynapseConfig(BaseModel):
     """Validated Synapse runtime configuration."""
 
@@ -235,6 +255,7 @@ class SynapseConfig(BaseModel):
     decider: DeciderSettings = Field(default_factory=DeciderSettings)
     dreamer: DreamerSettings = Field(default_factory=DreamerSettings)
     distiller: DistillerSettings = Field(default_factory=DistillerSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
     _config_path: Path = PrivateAttr(default=Path(DEFAULT_CONFIG_FILE_NAME))
     _project_root: Path = PrivateAttr(default=Path.cwd())

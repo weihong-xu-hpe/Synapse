@@ -17,7 +17,7 @@ from synapse.models import Node, NodeMetadata, NodeStatus
 from synapse.storage.markdown import extract_wiki_links
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 FALLBACK_VECTOR_BACKEND = "python-fallback"
 SQLITE_VEC_BACKEND = "sqlite-vec"
 UTC_SUFFIX = "+00:00"
@@ -132,6 +132,9 @@ class WriteMemoryEventMetrics:
     warning_codes: tuple[str, ...]
     sampling_provider: str
     execution_succeeded: bool
+    # Attribution: "mcp" (agent tool call), "rest" (REST /api/write unkeyed),
+    # "session_upsert" (REST keyed), "distiller", "eval_write", None = legacy.
+    route: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -152,6 +155,23 @@ class DistillerRunMetrics:
     decider_downgrades: int
     llm_failures: int
     archived_transcripts: int
+
+
+@dataclass(slots=True, frozen=True)
+class SearchEventMetrics:
+    """Persisted summary of one search request (service-layer usage signal)."""
+
+    ts: str
+    source: str
+    session_hash: str | None
+    query: str
+    query_chars: int
+    cjk_ratio: float
+    top_k: int
+    include: str
+    latency_ms: float
+    lexical_hit_count: int | None
+    results: tuple[dict[str, Any], ...]
 
 
 OKF_META_FIELDS = ("okf_type", "okf_version", "sources", "project", "distilled_hash", "distilled_at", "distilled_node_ids")
@@ -231,6 +251,7 @@ class SQLiteNodeStore:
         with self.transaction() as connection:
             self._create_schema(connection)
             self._ensure_node_columns(connection)
+            self._ensure_observability_columns(connection)
             self._ensure_vector_table(connection)
             self._ensure_fts_triggers(connection)
             self._ensure_vector_generation_triggers(connection)
@@ -295,6 +316,8 @@ class SQLiteNodeStore:
             "dreamer_runs",
             "distiller_runs",
             "write_memory_events",
+            "search_events",
+            "metrics_snapshots",
             "nodes_vec",
             "nodes_ai",
             "nodes_ad",
@@ -458,6 +481,46 @@ class SQLiteNodeStore:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_distiller_runs_started_at ON distiller_runs(started_at)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                source TEXT NOT NULL,
+                session_hash TEXT,
+                query TEXT NOT NULL,
+                query_chars INTEGER NOT NULL,
+                cjk_ratio REAL NOT NULL,
+                top_k INTEGER NOT NULL,
+                include TEXT NOT NULL,
+                latency_ms REAL NOT NULL,
+                lexical_hit_count INTEGER,
+                results TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_search_events_ts ON search_events(ts)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_search_events_source ON search_events(source)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metrics_snapshots (
+                date TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+
+    def _ensure_observability_columns(self, connection: sqlite3.Connection) -> None:
+        """Migration helpers for observability tables (schema v7 additions)."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(write_memory_events)").fetchall()
+        }
+        if "route" not in columns:
+            # Existing rows predate route attribution; NULL = legacy/unknown.
+            connection.execute("ALTER TABLE write_memory_events ADD COLUMN route TEXT")
 
     def _ensure_node_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -1266,8 +1329,8 @@ class SQLiteNodeStore:
                 """
                 INSERT INTO write_memory_events (
                     created_at, node_id, node_type, action, candidate_count,
-                    similarity_threshold, warning_codes, sampling_provider, execution_succeeded
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    similarity_threshold, warning_codes, sampling_provider, execution_succeeded, route
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metrics.created_at,
@@ -1279,8 +1342,118 @@ class SQLiteNodeStore:
                     json.dumps(list(metrics.warning_codes)),
                     metrics.sampling_provider,
                     int(metrics.execution_succeeded),
+                    metrics.route,
                 ),
             )
+
+    def record_search_event(self, metrics: SearchEventMetrics) -> None:
+        """Persist one search request for usage analytics (local private DB)."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO search_events (
+                    ts, source, session_hash, query, query_chars, cjk_ratio,
+                    top_k, include, latency_ms, lexical_hit_count, results
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    metrics.ts,
+                    metrics.source,
+                    metrics.session_hash,
+                    metrics.query,
+                    metrics.query_chars,
+                    metrics.cjk_ratio,
+                    metrics.top_k,
+                    metrics.include,
+                    metrics.latency_ms,
+                    metrics.lexical_hit_count,
+                    json.dumps(list(metrics.results), ensure_ascii=False),
+                ),
+            )
+
+    def prune_search_events(self, *, retention_days: int) -> int:
+        """Delete search_events older than the retention window; return deleted count."""
+        cutoff = _utc_cutoff(retention_days)
+        with self.transaction() as connection:
+            cursor = connection.execute("DELETE FROM search_events WHERE ts < ?", (cutoff,))
+            return cursor.rowcount
+
+    def record_metrics_snapshot(self, *, date: str, created_at: str, payload: dict[str, Any]) -> bool:
+        """Insert today's snapshot row. Returns False when the date row already exists."""
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO metrics_snapshots (date, created_at, payload) VALUES (?, ?, ?)
+                """,
+                (date, created_at, json.dumps(payload, ensure_ascii=False)),
+            )
+            return cursor.rowcount > 0
+
+    def get_metrics_snapshots(self, *, since_date: str | None = None) -> list[dict[str, Any]]:
+        """Return snapshot rows ({date, created_at, payload}) oldest first."""
+        if since_date is None:
+            rows = self._connection.execute(
+                "SELECT date, created_at, payload FROM metrics_snapshots ORDER BY date"
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                "SELECT date, created_at, payload FROM metrics_snapshots WHERE date >= ? ORDER BY date",
+                (since_date,),
+            ).fetchall()
+        snapshots = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload"]))
+            except json.JSONDecodeError:
+                continue
+            snapshots.append({"date": str(row["date"]), "created_at": str(row["created_at"]), "payload": payload})
+        return snapshots
+
+    def search_events_stats(self, *, since: str) -> dict[str, Any]:
+        """Aggregate search stats since an ISO cutoff, grouped by source."""
+        row = self._connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN json_array_length(results) > 0 THEN 1 ELSE 0 END) AS with_results,
+                AVG(latency_ms) AS avg_latency
+            FROM search_events WHERE ts >= ?
+            """,
+            (since,),
+        ).fetchone()
+        by_source: dict[str, dict[str, Any]] = {}
+        source_rows = self._connection.execute(
+            """
+            SELECT source, COUNT(*) AS count, AVG(latency_ms) AS avg_latency,
+                   SUM(CASE WHEN json_array_length(results) = 0 THEN 1 ELSE 0 END) AS zero_result
+            FROM search_events WHERE ts >= ? GROUP BY source
+            """,
+            (since,),
+        ).fetchall()
+        for src in source_rows:
+            by_source[str(src["source"])] = {
+                "count": int(src["count"] or 0),
+                "avg_latency_ms": _round_optional(src["avg_latency"]),
+                "zero_result_count": int(src["zero_result"] or 0),
+            }
+        inject_row = self._connection.execute(
+            """
+            SELECT SUM(value) AS injected FROM search_events, json_each(search_events.results)
+            WHERE search_events.ts >= ? AND json_extract(json_each.value, '$.inject') = 1
+            """,
+            (since,),
+        ).fetchone()
+        total = int(row["total"] or 0) if row is not None else 0
+        with_results = int(row["with_results"] or 0) if row is not None else 0
+        injected = int(inject_row["injected"] or 0) if inject_row is not None else 0
+        return {
+            "total": total,
+            "with_results": with_results,
+            "zero_result": total - with_results,
+            "injected_results_total": injected,
+            "avg_latency_ms": _round_optional(row["avg_latency"]) if row is not None else 0.0,
+            "by_source": by_source,
+        }
 
     def get_dreamer_metrics_summary(self) -> dict[str, Any]:
         """Return aggregate Dreamer metrics for service stats payloads."""
