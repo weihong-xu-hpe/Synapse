@@ -377,3 +377,146 @@ def test_retrieval_pipeline_returns_top_k_marks_disputed_and_updates_access_only
     assert refreshed_beta is not None and refreshed_beta.metadata.access_count == 1
     assert refreshed_delta is not None and refreshed_delta.metadata.access_count == 1
     assert refreshed_gamma is not None and refreshed_gamma.metadata.access_count == 0
+
+# ---------------------------------------------------------------------------
+# Inject decision (server-side inject flag on /api/search results)
+# ---------------------------------------------------------------------------
+
+
+def _inject_config(base_dir: Path, *, floor: float, margin: float) -> Path:
+    config_path = base_dir / "config.toml"
+    config_path.write_text(
+        f"""
+[memory]
+base_path = "./.synapse"
+archive_path = "./.synapse/.archive"
+
+[embedding]
+provider = "builtin"
+model = "bge-m3"
+dimension = 3
+
+[reranker]
+provider = "builtin"
+model = "bge-reranker-v2-m3"
+max_candidates = 9
+
+[retrieval]
+rrf_k = 60
+top_k = 5
+inject_logit_floor = {floor}
+inject_relative_margin = {margin}
+""".strip(),
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def test_inject_flag_respects_floor_and_relative_margin(tmp_path: Path) -> None:
+    config = load_config(_inject_config(tmp_path, floor=-2.0, margin=2.5))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    strong = make_node(node_id="strong", title="API Gateway Design", content="Gateway architecture.", file_name="strong.md")
+    weak = make_node(node_id="weak", title="Retry Budgets", content="Retry budgets.", file_name="weak.md")
+
+    class SpreadReranker:
+        model_name = "spread"
+        def rerank(self, query, documents, limit=None):
+            scores = []
+            for index, document in enumerate(documents):
+                score = 0.9 if "API Gateway Design" in document else -3.5
+                scores.append((index, score))
+            scores.sort(key=lambda item: (-item[1], item[0]))
+            return scores[:limit] if limit is not None else scores
+        def is_available(self):
+            return True
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        store.upsert_node(strong, embedding=[1.0, 0.0, 0.0])
+        store.upsert_node(weak, embedding=[0.0, 1.0, 0.0])
+        pipeline = RetrievalPipeline(
+            config, store=store, runtime_paths=runtime_paths,
+            embedding_engine=FakeEmbeddingEngine(), reranker_engine=SpreadReranker(),
+            now_fn=lambda: NOW,
+        )
+        response = pipeline.search("gateway")
+
+    by_id = {item.node.id: item for item in response.results}
+    # Strong: logit 0.9 >= floor, within margin of best → injectable.
+    assert by_id["strong"].is_injectable is True
+    # Weak: logit -3.5 below floor → not injectable even though returned.
+    assert by_id["weak"].is_injectable is False
+
+
+def test_inject_flag_relative_margin_rescues_low_logit_query(tmp_path: Path) -> None:
+    """Long recall queries depress absolute logits; a node ranked above every
+    non-relevant result must still be injectable (diagnosis bucket C)."""
+
+    config = load_config(_inject_config(tmp_path, floor=-2.0, margin=2.5))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    relevant = make_node(node_id="rel", title="API Gateway Design", content="Gateway architecture.", file_name="rel.md")
+    filler = make_node(node_id="fill", title="Retry Budgets", content="Retry budgets.", file_name="fill.md")
+
+    class DepressedReranker:
+        model_name = "depressed"
+        def rerank(self, query, documents, limit=None):
+            scores = []
+            for index, document in enumerate(documents):
+                score = -1.5 if "API Gateway Design" in document else -3.0
+                scores.append((index, score))
+            scores.sort(key=lambda item: (-item[1], item[0]))
+            return scores[:limit] if limit is not None else scores
+        def is_available(self):
+            return True
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        store.upsert_node(relevant, embedding=[1.0, 0.0, 0.0])
+        store.upsert_node(filler, embedding=[0.0, 1.0, 0.0])
+        pipeline = RetrievalPipeline(
+            config, store=store, runtime_paths=runtime_paths,
+            embedding_engine=FakeEmbeddingEngine(), reranker_engine=DepressedReranker(),
+            now_fn=lambda: NOW,
+        )
+        response = pipeline.search("gateway")
+
+    by_id = {item.node.id: item for item in response.results}
+    # rel logit -1.5: above floor(-2) and within margin(2.5) of best(-1.5) → injectable.
+    assert by_id["rel"].is_injectable is True
+    # fill logit -3.0: below floor → dropped despite proximity? floor wins.
+    assert by_id["fill"].is_injectable is False
+
+
+def test_inject_flag_margin_drops_distant_results(tmp_path: Path) -> None:
+    config = load_config(_inject_config(tmp_path, floor=-10.0, margin=1.0))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    best = make_node(node_id="best", title="API Gateway Design", content="Gateway architecture.", file_name="best.md")
+    distant = make_node(node_id="distant", title="Retry Budgets", content="Retry budgets.", file_name="distant.md")
+
+    class SpreadReranker2:
+        model_name = "spread2"
+        def rerank(self, query, documents, limit=None):
+            scores = []
+            for index, document in enumerate(documents):
+                score = 2.0 if "API Gateway Design" in document else -0.5
+                scores.append((index, score))
+            scores.sort(key=lambda item: (-item[1], item[0]))
+            return scores[:limit] if limit is not None else scores
+        def is_available(self):
+            return True
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        store.upsert_node(best, embedding=[1.0, 0.0, 0.0])
+        store.upsert_node(distant, embedding=[0.0, 1.0, 0.0])
+        pipeline = RetrievalPipeline(
+            config, store=store, runtime_paths=runtime_paths,
+            embedding_engine=FakeEmbeddingEngine(), reranker_engine=SpreadReranker2(),
+            now_fn=lambda: NOW,
+        )
+        response = pipeline.search("gateway")
+
+    by_id = {item.node.id: item for item in response.results}
+    # distant logit -0.5: above floor(-10) but 2.5 below best(2.0) with margin 1.0 → dropped.
+    assert by_id["best"].is_injectable is True
+    assert by_id["distant"].is_injectable is False

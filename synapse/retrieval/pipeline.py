@@ -47,6 +47,10 @@ class RetrievalItem:
     decay_multiplier: float
     status_multiplier: float
     is_anchor: bool = False
+    # Server-side inject decision (see RetrievalSettings inject_* keys): True
+    # when the result clears the logit floor and relative margin. Clients
+    # (bridge) inject on this instead of the raw ``score > 0`` heuristic.
+    is_injectable: bool = False
     context_text: str = ""
     markers: tuple[str, ...] = field(default_factory=tuple)
 
@@ -150,6 +154,7 @@ class RetrievalPipeline:
             candidate_items.append(scored_item)
 
         final_results = tuple(sorted(candidate_items, key=lambda item: (-item.score, item.node.id))[:final_top_k])
+        final_results = self._apply_inject_decisions(final_results)
         if update_access and final_results:
             self._get_store().update_access([item.node.id for item in final_results])
 
@@ -332,6 +337,46 @@ class RetrievalPipeline:
         multiplier = STATUS_MULTIPLIERS.get(node.metadata.status, 1.0)
         penalty = math.log(multiplier) if multiplier > 0 else -1000.0
         return score + penalty, multiplier
+
+    def _apply_inject_decisions(self, results: tuple[RetrievalItem, ...]) -> tuple[RetrievalItem, ...]:
+        """Set ``is_injectable`` on final results (server-side inject decision).
+
+        Rule (config [retrieval]): a result is injectable when
+        ``rerank_score >= inject_logit_floor`` AND
+        ``rerank_score >= best_logit - inject_relative_margin``. The floor
+        catches degraded reranker outputs (long conversational queries depress
+        absolute logits, but so do genuinely irrelevant ones); the relative
+        margin keeps order-calibrated results injectable even when the whole
+        query sits far below zero.
+        """
+
+        settings = self.config.retrieval
+        if not results:
+            return results
+        best_logit = max(item.rerank_score for item in results)
+        floor = settings.inject_logit_floor
+        margin = settings.inject_relative_margin
+        decided: list[RetrievalItem] = []
+        for item in results:
+            injectable = (
+                item.rerank_score >= floor
+                and item.rerank_score >= best_logit - margin
+            )
+            decided.append(
+                RetrievalItem(
+                    node=item.node,
+                    score=item.score,
+                    anchor_score=item.anchor_score,
+                    rerank_score=item.rerank_score,
+                    decay_multiplier=item.decay_multiplier,
+                    status_multiplier=item.status_multiplier,
+                    is_anchor=item.is_anchor,
+                    is_injectable=injectable,
+                    context_text=item.context_text,
+                    markers=item.markers,
+                )
+            )
+        return tuple(decided)
 
     def _score_candidate(self, node: Node, rerank_score: float, *, anchor_score: float, is_anchor: bool) -> RetrievalItem:
         decayed_score, decay_multiplier = self.apply_decay(node, rerank_score)

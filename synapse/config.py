@@ -97,6 +97,26 @@ class RetrievalSettings(BaseModel):
     engine: RetrievalEngine = "sqlite"
     rrf_k: int = Field(default=60, ge=1)
     top_k: int = Field(default=3, ge=1)
+    # Inject decision (server-side, exposed as ``inject`` on each /api/search
+    # result; MCP ``score`` semantics unchanged). A result is injectable when
+    # its raw reranker logit clears ``inject_logit_floor`` AND its logit is
+    # within ``inject_relative_margin`` of the query's best logit. Long
+    # multi-message recall queries depress absolute logits while relative
+    # ordering stays correct (diagnosis 2026-09-27), so the relative margin
+    # trims far-below-best noise without rescuing genuinely irrelevant hits.
+    # Values chosen on a held-out even/odd split of the recall+none slices
+    # (floor sweep 0.0..-3.0 × margin 1.0..3.0): floor 0.25 keeps
+    # recall@5_inject equal to the legacy score>0 gate (0.444 on the recall
+    # slice, both halves) while cutting hard-none false injections 2/10 →
+    # 1/10 (even half 0, odd half 1); negative floors recover more musts but
+    # at 5-6/10 false injections — outside the owner constraint.
+    inject_logit_floor: float = Field(default=0.25)
+    inject_relative_margin: float = Field(default=2.5)
+    # Persistent knowledge receives a fixed logit-space penalty on ``score``
+    # (DECAY_PERSISTENT_PENALTY). When True, ``inject`` decisions compare the
+    # pre-penalty reranker logit directly (penalty-free), keeping knowledge
+    # competitive with fresh session summaries at the injection gate.
+    inject_ignore_persistent_penalty: bool = Field(default=True)
 
     def anchor_limit(self) -> int:
         return min(3, self.top_k)

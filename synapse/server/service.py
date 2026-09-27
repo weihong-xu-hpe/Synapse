@@ -132,6 +132,19 @@ class SynapseServerService:
     def reset_sampling_client(self, token: object) -> None:
         self._sampling_client_var.reset(token)
 
+    def _normalizer_sampling_client(self):
+        """Sampling client for write-path OKF normalization.
+
+        Prefers the pushed MCP sampling client; falls back to the configured
+        [decider] LLM (same client class the distiller uses).
+        """
+
+        if self.sampling_client is not None:
+            return self.sampling_client
+        from synapse.server.decider import LocalLLMDecider
+
+        return LocalLLMDecider(self.config.decider)
+
     def search_memory(
         self,
         query: str,
@@ -327,7 +340,7 @@ class SynapseServerService:
         self,
         title: str,
         content: str,
-        node_type: NodeType | str = NodeType.TRANSIENT,
+        node_type: NodeType | str | None = None,
         links: list[str] | None = None,
         sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
         query_hint: str | None = None,
@@ -395,7 +408,7 @@ class SynapseServerService:
         *,
         title: str,
         content: str,
-        node_type: NodeType | str = NodeType.TRANSIENT,
+        node_type: NodeType | str | None,
         links: list[str] | None = None,
         sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
         query_hint: str | None = None,
@@ -408,9 +421,44 @@ class SynapseServerService:
         downgrade_supersede: bool = False,
     ) -> dict[str, Any]:
         clean_title = title.strip()
+        warnings: list[dict[str, str]] = []
+
+        # Write-path tightening (B1/B2): explicit type wins; omitted type
+        # defaults to persistent when the body carries OKF structure. A
+        # persistent write without okf_type is normalized (deterministic
+        # template inference first, then ONE LLM call with a fidelity guard).
+        node_type_str: str | None
+        if node_type is None:
+            node_type_str = None
+        elif isinstance(node_type, NodeType):
+            node_type_str = node_type.value
+        else:
+            node_type_str = str(node_type)
+
+        from synapse.server.write_normalize import WritePathNormalizer, title_needs_repair
+
+        normalizer = WritePathNormalizer(sampling_client=self._normalizer_sampling_client())
+        normalized = normalizer.normalize(
+            title=clean_title,
+            content=content,
+            node_type=node_type_str,
+            okf_type=okf_type,
+            sources=sources,
+        )
+        clean_title = normalized.title
+        content = normalized.content
+        okf_type = normalized.okf_type
+        sources = normalized.sources if normalized.mode == "llm_normalized" else sources
+        warnings.extend(normalized.warnings)
+        if normalized.type_override is not None:
+            node_type = normalized.type_override
+        elif node_type_str is not None:
+            node_type = node_type_str
+        else:
+            node_type = "persistent" if normalized.mode in {"template_inferred", "llm_normalized"} else "transient"
+
         normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
         section_count = sum(1 for line in content.splitlines() if line.lstrip().startswith("##"))
-        warnings: list[dict[str, str]] = []
         if normalized_type is NodeType.PERSISTENT:
             warnings.extend(
                 self._okf_write_warnings(
@@ -465,7 +513,7 @@ class SynapseServerService:
 
         try:
             integrate_result = self.integrate_knowledge(
-                title=title,
+                title=clean_title,
                 content=content,
                 node_type=node_type,
                 links=links,
@@ -1298,7 +1346,11 @@ class SynapseServerService:
             "score": round(float(item.score), 6),
             "anchor_score": round(float(item.anchor_score), 6),
             "rerank_score": round(float(item.rerank_score), 6),
+            "rerank_logit": round(float(item.rerank_score), 6),
             "is_anchor": item.is_anchor,
+            # Server-side inject decision (see RetrievalSettings inject_* keys).
+            # Clients inject on this; ``score`` semantics stay unchanged.
+            "inject": bool(item.is_injectable),
             "file_path": item.node.file_path.as_posix(),
             "status": item.node.metadata.status.value,
             "markers": list(item.markers),
