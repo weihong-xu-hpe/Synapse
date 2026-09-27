@@ -91,7 +91,7 @@ def configure_logging(config: SynapseConfig, runtime_paths: RuntimePaths | None 
         handler = RotatingFileHandler(
             paths.logs / file_name,
             maxBytes=max_bytes,
-            backupCount=config.logging.retention_days,
+            backupCount=config.logging.backup_count,
             encoding="utf-8",
         )
         handler.setFormatter(formatter)
@@ -105,7 +105,7 @@ def configure_logging(config: SynapseConfig, runtime_paths: RuntimePaths | None 
     parent_handler = RotatingFileHandler(
         paths.logs / GENERIC_LOG_FILE,
         maxBytes=max_bytes,
-        backupCount=config.logging.retention_days,
+        backupCount=config.logging.backup_count,
         encoding="utf-8",
     )
     parent_handler.setFormatter(formatter)

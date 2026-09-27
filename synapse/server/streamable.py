@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI
@@ -16,6 +17,7 @@ from synapse.lifecycle.scheduler import DreamerScheduler
 from synapse.lifecycle.distiller_scheduler import DistillerScheduler
 from synapse.server.decider import LocalLLMDecider
 from synapse.server.app import create_app as create_streamable_http_app
+from synapse.utils.runtime import get_runtime_paths
 from synapse.server.streamable_runtime import (
     StreamableSessionManager,
     StreamableToolOrchestrator,
@@ -167,7 +169,7 @@ class StreamableRuntime:
             host=host or self.config.server.host,
             port=port or self.config.server.port,
             log_level=log_level,
-            log_config=_uvicorn_log_config(),
+            log_config=_uvicorn_log_config(self.config, self.runtime_paths),
         )
 
 
@@ -188,13 +190,25 @@ def create_streamable_runtime(
     )
 
 
-def _uvicorn_log_config() -> dict[str, Any]:
-    """Uvicorn logging config that timestamps access/error lines.
+def _uvicorn_log_config(config, runtime_paths=None) -> dict[str, Any]:
+    """Uvicorn logging config routing access/app logs to rotating files.
 
-    launchd captures stdout/stderr raw; without timestamps the service logs
-    cannot be correlated with anything. Mirrors uvicorn's default dict config
-    with explicit asctime formatters.
+    launchd captures stdout/stderr raw and never rotates those captures, so
+    uvicorn's access log and default/error log are routed through
+    RotatingFileHandlers in the configured log dir (same ``max_file_size_mb``
+    / ``backup_count`` as the other Synapse logs). A stderr StreamHandler is
+    kept for uvicorn error-level records only so crashes/tracebacks still
+    reach launchd's service-error.log; access lines no longer go to stdout.
+    Formatters keep explicit asctime so lines stay correlatable.
     """
+
+    paths = runtime_paths or get_runtime_paths(config)
+    log_dir = Path(paths.logs)
+    max_bytes = config.logging.max_file_size_mb * 1024 * 1024
+    backup_count = config.logging.backup_count
+    timestamp_fmt = "%(levelprefix)s %(asctime)s %(message)s"
+    access_fmt = '%(levelprefix)s %(asctime)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    datefmt = "%Y-%m-%dT%H:%M:%S%z"
 
     return {
         "version": 1,
@@ -202,30 +216,44 @@ def _uvicorn_log_config() -> dict[str, Any]:
         "formatters": {
             "default": {
                 "()": "uvicorn.logging.DefaultFormatter",
-                "fmt": "%(levelprefix)s %(asctime)s %(message)s",
-                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+                "fmt": timestamp_fmt,
+                "datefmt": datefmt,
                 "use_colors": None,
             },
             "access": {
                 "()": "uvicorn.logging.AccessFormatter",
-                "fmt": '%(levelprefix)s %(asctime)s %(client_addr)s - "%(request_line)s" %(status_code)s',
-                "datefmt": "%Y-%m-%dT%H:%M:%S%z",
+                "fmt": access_fmt,
+                "datefmt": datefmt,
             },
         },
         "handlers": {
             "default": {
                 "formatter": "default",
+                "class": "logging.handlers.RotatingFileHandler",
+                "filename": str(log_dir / "uvicorn.log"),
+                "maxBytes": max_bytes,
+                "backupCount": backup_count,
+                "encoding": "utf-8",
+                "delay": True,
+            },
+            "error_stderr": {
+                "formatter": "default",
                 "class": "logging.StreamHandler",
                 "stream": "ext://sys.stderr",
+                "level": "ERROR",
             },
             "access": {
                 "formatter": "access",
-                "class": "logging.StreamHandler",
-                "stream": "ext://sys.stdout",
+                "class": "logging.handlers.RotatingFileHandler",
+                "filename": str(log_dir / "uvicorn-access.log"),
+                "maxBytes": max_bytes,
+                "backupCount": backup_count,
+                "encoding": "utf-8",
+                "delay": True,
             },
         },
         "loggers": {
-            "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "uvicorn": {"handlers": ["default", "error_stderr"], "level": "INFO", "propagate": False},
             "uvicorn.error": {"level": "INFO"},
             "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
         },

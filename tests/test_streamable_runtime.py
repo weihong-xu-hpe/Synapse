@@ -227,3 +227,48 @@ def test_streamable_session_close_cancels_pending_sampling_requests() -> None:
     closed = manager.close_session(session.session_id)
 
     assert closed["cancelled_requests"] == 1
+
+
+def test_uvicorn_log_config_routes_logs_to_rotating_files(tmp_path: Path) -> None:
+    from synapse.server.streamable import _uvicorn_log_config
+
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    log_config = _uvicorn_log_config(config, runtime_paths)
+
+    # Access log: rotating file only — no stdout handler.
+    access = log_config["handlers"]["access"]
+    assert access["class"] == "logging.handlers.RotatingFileHandler"
+    assert access["filename"] == str(runtime_paths.logs / "uvicorn-access.log")
+    assert access["maxBytes"] == config.logging.max_file_size_mb * 1024 * 1024
+    assert access["backupCount"] == config.logging.backup_count
+
+    # Default/app log: rotating file, same limits.
+    default = log_config["handlers"]["default"]
+    assert default["class"] == "logging.handlers.RotatingFileHandler"
+    assert default["filename"] == str(runtime_paths.logs / "uvicorn.log")
+    assert default["backupCount"] == config.logging.backup_count
+
+    # Crashes/tracebacks still reach stderr for launchd capture (ERROR+ only).
+    error_stderr = log_config["handlers"]["error_stderr"]
+    assert error_stderr["class"] == "logging.StreamHandler"
+    assert error_stderr["stream"] == "ext://sys.stderr"
+    assert error_stderr["level"] == "ERROR"
+    assert "error_stderr" in log_config["loggers"]["uvicorn"]["handlers"]
+    assert "access" not in log_config["loggers"]["uvicorn"]["handlers"]
+
+    # Timestamp formatters preserved.
+    assert "%(asctime)s" in log_config["formatters"]["default"]["fmt"]
+    assert "%(asctime)s" in log_config["formatters"]["access"]["fmt"]
+
+
+def test_uvicorn_log_config_defaults_to_config_runtime_paths(tmp_path: Path) -> None:
+    from synapse.server.streamable import _uvicorn_log_config
+
+    config = load_config(write_config(tmp_path))
+    bootstrap_runtime_directories(config)
+
+    log_config = _uvicorn_log_config(config)
+
+    assert log_config["handlers"]["default"]["filename"].startswith(str(config.resolve_path(config.logging.log_dir)))
