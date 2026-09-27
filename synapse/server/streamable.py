@@ -13,6 +13,7 @@ from typing import Any, Callable
 from fastapi import FastAPI
 
 from synapse.lifecycle.scheduler import DreamerScheduler
+from synapse.lifecycle.distiller_scheduler import DistillerScheduler
 from synapse.server.decider import LocalLLMDecider
 from synapse.server.app import create_app as create_streamable_http_app
 from synapse.server.streamable_runtime import (
@@ -38,6 +39,7 @@ class StreamableRuntime:
     _session_manager: StreamableSessionManager | None = None
     _orchestrator: StreamableToolOrchestrator | None = None
     _dreamer_scheduler: DreamerScheduler | None = None
+    _distiller_scheduler: Any = None
 
     @property
     def execution_layer(self) -> Any:
@@ -91,6 +93,37 @@ class StreamableRuntime:
 
             lifespan_context = dreamer_lifespan
 
+        if self.config.distiller.enabled:
+            distiller_client = app_sampling_client or (LocalLLMDecider(self.config.decider) if self.config.decider.provider == "local_llm" else None)
+            distiller_scheduler = DistillerScheduler(
+                self.config,
+                runtime_paths=self.runtime_paths,
+                logger=self.logger,
+                sampling_client=distiller_client,
+            )
+            self._distiller_scheduler = distiller_scheduler
+
+            @asynccontextmanager
+            async def distiller_lifespan(app: FastAPI):
+                distiller_scheduler.start()
+                try:
+                    yield
+                finally:
+                    distiller_scheduler.stop()
+
+            if lifespan_context is not None:
+                dreamer_lifespan_ctx = lifespan_context
+
+                @asynccontextmanager
+                async def combined_lifespan(_app: FastAPI):
+                    async with dreamer_lifespan_ctx(_app):
+                        async with distiller_lifespan(_app):
+                            yield
+
+                lifespan_context = combined_lifespan
+            else:
+                lifespan_context = distiller_lifespan
+
         app = create_streamable_http_app(
             self.config,
             runtime_paths=self.runtime_paths,
@@ -102,6 +135,7 @@ class StreamableRuntime:
         app.state.streamable_runtime_mode = STREAMABLE_RUNTIME_MODE
         app.state.streamable_architecture_doc = STREAMABLE_ARCHITECTURE_DOC
         app.state.dreamer_scheduler = self._dreamer_scheduler
+        app.state.distiller_scheduler = self._distiller_scheduler
         if getattr(app.state, "streamable_session_manager", None) is None:
             app.state.streamable_session_manager = self.create_session_manager()
         else:

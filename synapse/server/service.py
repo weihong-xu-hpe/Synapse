@@ -132,25 +132,52 @@ class SynapseServerService:
     def reset_sampling_client(self, token: object) -> None:
         self._sampling_client_var.reset(token)
 
-    def search_memory(self, query: str, top_k: int = 3, *, exclude_session_key: str | None = None) -> dict[str, Any]:
+    def search_memory(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        exclude_session_key: str | None = None,
+        include: str = "default",
+    ) -> dict[str, Any]:
         if not query.strip():
             raise SynapseServiceError("INVALID_QUERY", "Search query must not be blank")
-        response = self._run_retrieval_search(query, top_k=top_k, update_access=True)
+        # Filtering happens inside the pipeline BEFORE scoring/top_k so
+        # excluded nodes leave no holes (next ranked results fill the slots).
         excluded_id: str | None = None
         if exclude_session_key and exclude_session_key.strip():
             excluded_id = self._session_node_id(exclude_session_key.strip())
+        response = self._run_retrieval_search(
+            query,
+            top_k=top_k,
+            update_access=True,
+            result_filter=lambda node: self._include_result(node, include) and node.id != excluded_id,
+        )
         payload: dict[str, Any] = {
             "query": response.query,
             "top_k": top_k,
-            "results": [
-                self._serialize_retrieval_item(item)
-                for item in response.results
-                if excluded_id is None or item.node.id != excluded_id
-            ],
+            "results": [self._serialize_retrieval_item(item) for item in response.results],
             "context": response.context,
         }
-        self._log_tool_call("search_memory", {"query": query, "top_k": top_k}, payload)
+        self._log_tool_call("search_memory", {"query": query, "top_k": top_k, "include": include}, payload)
         return payload
+
+    def _include_result(self, node: Node, include: str) -> bool:
+        """Default search excludes represented transcripts (shared predicates).
+
+        ``is_represented`` = distilled at the current revision AND knowledge
+        nodes produced. Legacy session summaries are covered by
+        ``is_session_transcript``. ``include=all|transcripts`` disables the
+        exclusion.
+        """
+
+        if include in {"all", "transcripts"}:
+            return True
+        from synapse.okf.transcripts import is_represented, is_session_transcript
+
+        if is_session_transcript(node) and is_represented(node):
+            return False
+        return True
 
     def integrate_knowledge(
         self,
@@ -199,6 +226,21 @@ class SynapseServerService:
 
         # Validate that all referenced targets exist before writing anything.
         target_nodes = self._load_nodes(resolved_target_ids) if resolved_target_ids else []
+
+        # Transcript guard: complement/supersede may only target persistent
+        # knowledge nodes, never session transcripts (shared predicate covers
+        # legacy "Session summary …" nodes too).
+        if normalized_action in {IntegrateAction.SUPERSEDE, IntegrateAction.COMPLEMENT}:
+            from synapse.okf.transcripts import is_session_transcript
+
+            transcript_targets = [node.id for node in target_nodes if is_session_transcript(node)]
+            if transcript_targets:
+                raise SynapseServiceError(
+                    "INVALID_TARGET",
+                    "complement/supersede may only target persistent knowledge nodes, never session transcripts",
+                    status_code=422,
+                    details={"transcript_target_node_ids": transcript_targets},
+                )
 
         metadata = NodeMetadata(
             id=node_id,
@@ -825,9 +867,9 @@ class SynapseServerService:
             return None
         return vector
 
-    def _run_retrieval_search(self, query: str, *, top_k: int, update_access: bool) -> Any:
+    def _run_retrieval_search(self, query: str, *, top_k: int, update_access: bool, result_filter=None) -> Any:
         with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as pipeline:
-            return pipeline.search(query, top_k=top_k, update_access=update_access)
+            return pipeline.search(query, top_k=top_k, update_access=update_access, result_filter=result_filter)
 
     def _search_existing_nodes_payload(self, query: str, similarity_threshold: float) -> dict[str, Any]:
         normalized_query = " ".join(str(query or "").split()).strip()
@@ -865,9 +907,19 @@ class SynapseServerService:
         best_matches: dict[str, dict[str, Any]] = {}
         per_query_limit = max(limit, self.config.retrieval.top_k)
 
+        # Write-path candidates are knowledge only: session transcripts are
+        # excluded BEFORE scoring/top_k so the decider compares a draft against
+        # knowledge nodes, never against the transcript the draft came from.
+        from synapse.okf.transcripts import is_session_transcript
+
         with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as pipeline:
             for query in normalized_queries:
-                response = pipeline.search(query, top_k=per_query_limit, update_access=False)
+                response = pipeline.search(
+                    query,
+                    top_k=per_query_limit,
+                    update_access=False,
+                    result_filter=lambda node: not is_session_transcript(node),
+                )
                 candidate_items = response.candidates or response.results
                 for item in candidate_items:
                     normalized_score = self._normalize_candidate_score(item.score)
