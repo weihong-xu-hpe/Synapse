@@ -61,6 +61,9 @@ request_timeout_seconds = 30
 engine = "sqlite"
 rrf_k = 60
 top_k = 3
+inject_logit_floor = 0.25
+inject_relative_margin = 2.5
+inject_ignore_persistent_penalty = true
 
 [decay]
 factor = 0.98
@@ -191,6 +194,9 @@ Controls hybrid retrieval.
 - `engine` — current retrieval backend (`sqlite` by default)
 - `rrf_k` — reciprocal rank fusion constant
 - `top_k` — maximum result count in final context
+- `inject_logit_floor` (float, default `0.25`) — raw rerank-logit floor for the server-side `inject` decision on search results; results below it are never marked injectable
+- `inject_relative_margin` (float, default `2.5`) — results must also sit within this margin of the query's best logit (trims far-below-best noise on long multi-part queries)
+- `inject_ignore_persistent_penalty` (bool, default `true`) — compare persistent nodes' pre-penalty logit at the injection gate instead of the penalized `score`
 
 ### `[decay]`
 

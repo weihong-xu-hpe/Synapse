@@ -175,6 +175,22 @@ LoggingSettings.log_dir 以 config.toml 所在目录为基准做相对解析（s
 - One-line notes without a takeaway or sources — a plain note, flagged `okf_untyped` on write.
 - Test/scaffolding nodes (e.g. "promotion candidate gamma") — transient by type.
 
+### 5.1 Write-path normalization (MCP / unkeyed REST writes)
+
+Agents writing through `write_memory` with `type` omitted default to **persistent** and are
+normalized into OKF by the write path (`synapse/server/write_normalize.py`):
+
+1. A body whose `##` sections match an OKF template gets `okf_type` inferred deterministically
+   (Symptom+Cause+Fix → `pitfall`, Steps → `procedure`, Context+Decision+Consequences →
+   `decision`, Details → `fact`); the body is stored unchanged.
+2. Otherwise ONE LLM call reshapes the note into a single OKF item; the agent's original text is
+   preserved verbatim under a trailing `## Original note` section (fidelity guard).
+3. On LLM failure the note is stored as submitted, downgraded to transient, with an
+   `okf_normalize_llm_failed` warning.
+4. Non-English titles get the same one-shot English title repair as the distiller.
+5. `sources` stays optional; absent sources produce a validation warning only — no pseudo-sources
+   are invented. An explicit `type` always wins over these defaults.
+
 ## 6. Machine-checkable validation rules
 
 `okf_valid(node) → list[warning]` — deterministic, no LLM. Warning codes (transition period: all

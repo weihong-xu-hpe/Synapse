@@ -97,4 +97,4 @@ def load_golden(path: str | Path) -> list[GoldenQuery]:
 def slice_of(query: GoldenQuery) -> str:
     """Slices reported in metrics: language plus the aggregate 'overall'."""
 
-    return query.language if query.language in {"zh", "en", "mixed", "code"} else "other"
+    return query.language if query.language in {"zh", "en", "mixed", "code", "later-turn"} else "other"

@@ -25,17 +25,23 @@ class QueryResult:
     latencies_ms: list[float] = field(default_factory=list)
     results_per_run: list[list[str]] = field(default_factory=list)
     positive_scores_per_run: list[list[float]] = field(default_factory=list)
+    inject_flags_per_run: list[list[bool]] = field(default_factory=list)
     recall5: float = 0.0
     mrr10: float = 0.0
     # Same metrics but counting only results the bridge would inject (score > 0).
     recall5_positive: float = 0.0
     mrr10_positive: float = 0.0
+    # Bridge-effective metric: must nodes the server's inject decision admits.
+    recall5_inject: float = 0.0
     top1_relevant: bool = False
     lexical_hits: int = 0
     positive_count: int = 0  # score > 0 among returned results (last run)
+    inject_count: int = 0  # inject=true among returned results (last run)
     returned_count: int = 0
     # For expect_no_result queries: True when NO returned result had score > 0.
     correctly_empty: bool = True
+    # Same gate but on the inject decision (server-side threshold).
+    correctly_empty_inject: bool = True
 
 
 @dataclass(slots=True)
@@ -67,6 +73,7 @@ class EvalReport:
                 "n": len(results),
                 "recall@5": round(_mean([r.recall5 for r in results]), 4),
                 "recall@5_pos": round(_mean([r.recall5_positive for r in results]), 4),
+                "recall@5_inject": round(_mean([r.recall5_inject for r in results]), 4),
                 "mrr@10": round(_mean([r.mrr10 for r in results]), 4),
                 "mrr@10_pos": round(_mean([r.mrr10_positive for r in results]), 4),
                 "top1_relevance": round(_mean([1.0 if r.top1_relevant else 0.0 for r in results]), 4),
@@ -77,6 +84,15 @@ class EvalReport:
                     _mean(
                         [
                             (r.positive_count / r.returned_count) if r.returned_count else 0.0
+                            for r in results
+                        ]
+                    ),
+                    4,
+                ),
+                "inject_rate": round(
+                    _mean(
+                        [
+                            (r.inject_count / r.returned_count) if r.returned_count else 0.0
                             for r in results
                         ]
                     ),
@@ -95,6 +111,7 @@ class EvalReport:
             "n": len(self.per_query),
             "recall@5": round(_mean([r.recall5 for r in labeled]), 4),
             "recall@5_pos": round(_mean([r.recall5_positive for r in labeled]), 4),
+            "recall@5_inject": round(_mean([r.recall5_inject for r in labeled]), 4),
             "mrr@10": round(_mean([r.mrr10 for r in labeled]), 4),
             "mrr@10_pos": round(_mean([r.mrr10_positive for r in labeled]), 4),
             "top1_relevance": round(_mean([1.0 if r.top1_relevant else 0.0 for r in labeled]), 4),
@@ -110,8 +127,22 @@ class EvalReport:
                 ),
                 4,
             ),
+            "inject_rate": round(
+                _mean(
+                    [
+                        (r.inject_count / r.returned_count) if r.returned_count else 0.0
+                        for r in self.per_query
+                    ]
+                ),
+                4,
+            ),
             "no_result_correct_rate": round(
                 _mean([1.0 if r.correctly_empty else 0.0 for r in empties]), 4
+            )
+            if empties
+            else None,
+            "no_result_correct_rate_inject": round(
+                _mean([1.0 if r.correctly_empty_inject else 0.0 for r in empties]), 4
             )
             if empties
             else None,
@@ -129,15 +160,18 @@ class EvalReport:
                     "slice": r.slice,
                     "recall@5": r.recall5,
                     "recall@5_pos": r.recall5_positive,
+                    "recall@5_inject": r.recall5_inject,
                     "mrr@10": r.mrr10,
                     "mrr@10_pos": r.mrr10_positive,
                     "top1_relevant": r.top1_relevant,
                     "lexical_hits": r.lexical_hits,
                     "positive": r.positive_count,
+                    "inject": r.inject_count,
                     "returned": r.returned_count,
                     "latency_ms": round(_mean(r.latencies_ms), 1),
                     "results": r.results_per_run[-1] if r.results_per_run else [],
                     "correctly_empty": r.correctly_empty,
+                    "correctly_empty_inject": r.correctly_empty_inject,
                 }
                 for r in self.per_query
             ],
@@ -196,9 +230,12 @@ def run_eval(
                 result.latencies_ms.append(elapsed_ms)
                 ranked_ids = [item.node.id for item in response.results]
                 scores = [item.score for item in response.results]
+                inject_flags = [bool(getattr(item, "is_injectable", False)) for item in response.results]
                 result.results_per_run.append(ranked_ids)
                 result.positive_scores_per_run.append(scores)
+                result.inject_flags_per_run.append(inject_flags)
                 result.positive_count = sum(1 for s in scores if s > 0)
+                result.inject_count = sum(1 for flag in inject_flags if flag)
                 result.returned_count = len(ranked_ids)
                 if run_index == runs - 1:
                     result.lexical_hits = _lexical_hit_count(pipeline, gq.query)
@@ -210,10 +247,12 @@ def run_eval(
             else:
                 take = 0
             ranked_ids = result.results_per_run[take]
+            inject_flags = result.inject_flags_per_run[take]
 
             if gq.expect_no_result:
                 scores = result.positive_scores_per_run[take]
                 result.correctly_empty = not any(s > 0 for s in scores)
+                result.correctly_empty_inject = not any(inject_flags)
             elif must:
                 hits = [1 if node_id in must else 0 for node_id in ranked_ids[:5]]
                 result.recall5 = sum(hits[:5]) / len(must) if must else 0.0
@@ -233,6 +272,10 @@ def run_eval(
                     (1.0 / rank for rank, node_id in enumerate(pos_ids[:10], start=1) if node_id in must),
                     0.0,
                 )
+                # Bridge-effective metrics: the server's inject decision.
+                inj_ids = [nid for nid, flag in zip(ranked_ids, inject_flags) if flag]
+                inj_hits = [1 if node_id in must else 0 for node_id in inj_ids[:5]]
+                result.recall5_inject = min(1.0, sum(inj_hits[:5]) / len(must)) if must else 0.0
                 result.top1_relevant = bool(ranked_ids) and ranked_ids[0] in must
             report.per_query.append(result)
     return report

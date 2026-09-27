@@ -171,11 +171,15 @@ Final score = raw reranker logit + `ln` of decay/status multipliers (additive in
 - **Transient material** decays additively by `ln(0.98^days-since-access)`.
 - **Superseded** nodes get `ln(0.1)`, **disputed** `ln(0.5)` — strictly below active nodes at equal relevance.
 
-`score > 0` still means "relevant enough to inject" for clients that filter on it (the omp bridge). Excluded nodes (**distilled-current transcripts** — represented or zero-item, i.e. already contributed whatever the LLM judged durable — and `exclude_session_key`) are filtered **before** fusion, so they cannot consume fused candidate slots; only not-yet-distilled transcripts remain searchable by default (`include=transcripts|all` returns everything).
+Each result carries an **`inject` flag** (server-side injection decision, plus the raw `rerank_logit`). A result is injectable when its raw reranker logit clears `[retrieval] inject_logit_floor` (default `0.25`) **and** its logit is within `[retrieval] inject_relative_margin` (default `2.5`) of the query's best logit. Long multi-message recall queries depress absolute logits while relative ordering stays correct, so the relative margin trims far-below-best noise; persistent nodes compare their pre-penalty logit (`inject_ignore_persistent_penalty`, default `true`). Clients (the omp bridge) inject only `inject: true` results; `score` semantics are unchanged (it may be negative for correctly-ranked results, so `score > 0` is **no longer** the recommended injection gate).
+
+Excluded nodes (**distilled-current transcripts** — represented or zero-item, i.e. already contributed whatever the LLM judged durable — and `exclude_session_key`) are filtered **before** fusion, so they cannot consume fused candidate slots; only not-yet-distilled transcripts remain searchable by default (`include=transcripts|all` returns everything).
 
 ### POST /api/write
 
 Without `session_key`, the write goes through the sampling-backed decider (LLM). If an ACTIVE node with the same title and byte-identical content already exists, it is returned as `unchanged` without calling the LLM.
+
+**Type defaulting (write-path tightening):** `type` is optional. An explicit `type` always wins. When omitted, the write defaults to **persistent** and is normalized into OKF: a body matching an OKF template gets its `okf_type` inferred deterministically (Symptom+Cause+Fix → `pitfall`, Steps → `procedure`, Context+Decision+Consequences → `decision`, Details → `fact`); otherwise the note is reshaped into ONE OKF item by the LLM with the original text preserved under `## Original note` (fidelity guard). On LLM failure an omitted-type write falls back to transient, stored as submitted. Non-English titles get the same one-shot English repair the distiller uses. `sources` stays optional; when absent the node just gets a validation warning — no pseudo-sources are invented.
 
 With an optional `session_key`, the write is a deterministic keyed upsert — no LLM involved:
 
