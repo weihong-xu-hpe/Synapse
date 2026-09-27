@@ -17,7 +17,7 @@ from synapse.models import Node, NodeMetadata, NodeStatus
 from synapse.storage.markdown import extract_wiki_links
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 FALLBACK_VECTOR_BACKEND = "python-fallback"
 SQLITE_VEC_BACKEND = "sqlite-vec"
 UTC_SUFFIX = "+00:00"
@@ -249,6 +249,23 @@ class SQLiteNodeStore:
             backend_changed = stored_backend not in {None, self._vector_backend}
             if fts_new or dimension_changed or backend_changed or stored_version != str(SCHEMA_VERSION):
                 connection.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild')")
+                self._rebuild_bigram_index(connection)
+
+    def _rebuild_bigram_index(self, connection: sqlite3.Connection) -> None:
+        """Rebuild the CJK-bigram shadow content and its FTS index from nodes."""
+
+        from synapse.storage.lexical import build_bigram_text
+
+        connection.execute("DELETE FROM nodes_bi_content")
+        for row in connection.execute("SELECT rowid, title, content, tags FROM nodes").fetchall():
+            bi_title, bi_content, bi_tags = build_bigram_text(
+                str(row["title"] or ""), str(row["content"] or ""), str(row["tags"] or "[]")
+            )
+            connection.execute(
+                "INSERT INTO nodes_bi_content (rowid, title, content, tags) VALUES (?, ?, ?, ?)",
+                (row["rowid"], bi_title, bi_content, bi_tags),
+            )
+        connection.execute("INSERT INTO nodes_fts_bigram(nodes_fts_bigram) VALUES ('rebuild')")
 
     def _get_meta(self, connection: sqlite3.Connection, key: str) -> str | None:
         row = connection.execute("SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
@@ -272,6 +289,8 @@ class SQLiteNodeStore:
             "schema_meta",
             "nodes",
             "nodes_fts",
+            "nodes_fts_bigram",
+            "nodes_bi_content",
             "edges",
             "dreamer_runs",
             "distiller_runs",
@@ -338,6 +357,27 @@ class SQLiteNodeStore:
                 tags,
                 content='nodes',
                 content_rowid='rowid'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts_bigram USING fts5(
+                title,
+                content,
+                tags,
+                content='nodes_bi_content',
+                content_rowid='rowid'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nodes_bi_content (
+                rowid INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]'
             )
             """
         )
@@ -467,6 +507,32 @@ class SQLiteNodeStore:
             END;
             """
         )
+        # CJK-bigram shadow index mirrors nodes_fts with bigram-expanded text
+        # (synapse/storage/lexical.py). The external-content FTS5 table reads
+        # from nodes_bi_content, which the store's Python write paths
+        # (upsert_node / delete_node) maintain with bigram-transformed text;
+        # these triggers apply the shadow content to the FTS index on every
+        # mutation of nodes_bi_content.
+        connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS nodes_bi_ai AFTER INSERT ON nodes_bi_content BEGIN
+                INSERT INTO nodes_fts_bigram(rowid, title, content, tags)
+                VALUES (new.rowid, new.title, new.content, new.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS nodes_bi_ad AFTER DELETE ON nodes_bi_content BEGIN
+                INSERT INTO nodes_fts_bigram(nodes_fts_bigram, rowid, title, content, tags)
+                VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS nodes_bi_au AFTER UPDATE ON nodes_bi_content BEGIN
+                INSERT INTO nodes_fts_bigram(nodes_fts_bigram, rowid, title, content, tags)
+                VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+                INSERT INTO nodes_fts_bigram(rowid, title, content, tags)
+                VALUES (new.rowid, new.title, new.content, new.tags);
+            END;
+            """
+        )
 
     def _ensure_vector_generation_triggers(self, connection: sqlite3.Connection) -> None:
         """Install triggers that bump schema_meta.vector_generation on any
@@ -533,6 +599,8 @@ class SQLiteNodeStore:
         *,
         source_mtime: datetime | str | None = None,
     ) -> None:
+        from synapse.storage.lexical import build_bigram_text
+
         payload = self._node_to_db_values(node, source_mtime=source_mtime)
         with self.transaction() as connection:
             connection.execute(
@@ -558,6 +626,20 @@ class SQLiteNodeStore:
                     okf_meta = excluded.okf_meta
                 """,
                 payload,
+            )
+            # Keep the CJK-bigram shadow content in sync (bigram-expanded text;
+            # the nodes_bi_* triggers copy it into the FTS5 shadow index).
+            bi_title, bi_content, bi_tags = build_bigram_text(str(payload[1]), str(payload[4]), str(payload[13]))
+            connection.execute(
+                "DELETE FROM nodes_bi_content WHERE rowid = (SELECT rowid FROM nodes WHERE id = ?)",
+                (node.id,),
+            )
+            connection.execute(
+                """
+                INSERT INTO nodes_bi_content (rowid, title, content, tags)
+                SELECT rowid, ?, ?, ? FROM nodes WHERE id = ?
+                """,
+                (bi_title, bi_content, bi_tags, node.id),
             )
             if embedding is not None:
                 self._upsert_embedding(connection, node.id, embedding)
@@ -610,7 +692,10 @@ class SQLiteNodeStore:
 
     def delete_node(self, node_id: str) -> None:
         with self.transaction() as connection:
+            row = connection.execute("SELECT rowid FROM nodes WHERE id = ?", (node_id,)).fetchone()
             connection.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+            if row is not None:
+                connection.execute("DELETE FROM nodes_bi_content WHERE rowid = ?", (row["rowid"],))
 
     def delete_embedding(self, node_id: str) -> None:
         with self.transaction() as connection:
@@ -780,7 +865,18 @@ class SQLiteNodeStore:
         return " ".join(safe_tokens)
 
     def fts_search(self, query: str, limit: int = 10) -> list[tuple[str, float]]:
-        sanitized = self._sanitize_fts_query(query)
+        """Lexical leg: OR semantics over the CJK-bigram shadow index.
+
+        The primary ``nodes_fts`` table keeps unicode61 tokens (English words,
+        code identifiers); ``nodes_fts_bigram`` mirrors every node with CJK
+        runs expanded to overlapping bigrams so Chinese queries segment
+        correctly. Both legs are queried with OR semantics (AND kills
+        multi-word queries) and ranks merged per-leg by bm25.
+        """
+
+        from synapse.storage.lexical import build_or_query
+
+        sanitized = build_or_query(query)
         if not sanitized:
             return []
         rows = self._connection.execute(
@@ -794,7 +890,27 @@ class SQLiteNodeStore:
             """,
             (sanitized, limit),
         ).fetchall()
-        return [(str(row["node_id"]), float(row["score"])) for row in rows]
+        bigram_rows = self._connection.execute(
+            """
+            SELECT nodes.id AS node_id, -bm25(nodes_fts_bigram) AS score
+            FROM nodes_fts_bigram
+            JOIN nodes ON nodes.rowid = nodes_fts_bigram.rowid
+            WHERE nodes_fts_bigram MATCH ?
+            ORDER BY score DESC, nodes.id ASC
+            LIMIT ?
+            """,
+            (sanitized, limit),
+        ).fetchall()
+        # bm25 scores are not comparable across tables; fuse by rank (RRF-style)
+        # per leg, then merge with the better rank kept for ordering.
+        merged: dict[str, float] = {}
+        for rows_leg, weight in ((rows, 1.0), (bigram_rows, 1.0)):
+            for rank, row in enumerate(rows_leg, start=1):
+                contribution = weight / (60.0 + rank)
+                merged[row["node_id"]] = merged.get(row["node_id"], 0.0) + contribution
+        ranked = sorted(merged.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        # Return pseudo-bm25 positive scores so callers keep a monotone signal.
+        return [(node_id, score * 100.0) for node_id, score in ranked]
 
 
     def get_neighbors(self, node_ids: list[str], depth: int = 1) -> list[str]:
@@ -1294,6 +1410,7 @@ class SQLiteNodeStore:
             connection.execute("DELETE FROM edges")
             connection.execute("DELETE FROM nodes_vec")
             connection.execute("DELETE FROM nodes")
+            connection.execute("DELETE FROM nodes_bi_content")
             connection.execute("DELETE FROM schema_meta")
             for key, value in preserved.items():
                 self._set_meta(connection, str(key), str(value))
@@ -1301,6 +1418,7 @@ class SQLiteNodeStore:
             self._set_meta(connection, "vector_backend", self.vector_backend)
             self._set_meta(connection, "embedding_dimension", str(self.embedding_dimension))
             connection.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild')")
+            connection.execute("INSERT INTO nodes_fts_bigram(nodes_fts_bigram) VALUES ('rebuild')")
 
     def rebuild_from_nodes(
         self,
