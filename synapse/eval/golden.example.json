@@ -1,0 +1,31 @@
+{
+  "queries": [
+    {
+      "id": "en-001",
+      "query": "API gateway design retry budgets",
+      "language": "en",
+      "relevant": [
+        {"node_id": "example_gateway_node", "tier": "must"},
+        {"node_id": "example_retry_node", "tier": "may"}
+      ]
+    },
+    {
+      "id": "zh-001",
+      "query": "会话摘要 重复写入",
+      "language": "zh",
+      "relevant": [{"node_id": "example_session_node", "tier": "must"}]
+    },
+    {
+      "id": "code-001",
+      "query": "nodes_fts sanitizer",
+      "language": "code",
+      "relevant": [{"node_id": "example_fts_node", "tier": "must"}]
+    },
+    {
+      "id": "none-001",
+      "query": "best ramen recipe",
+      "language": "none",
+      "expect_no_result": true
+    }
+  ]
+}

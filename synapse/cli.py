@@ -798,6 +798,37 @@ def _format_percent(value: object) -> str:
     return f"{percent:.0f}%"
 
 
+@app.command("eval")
+def eval_run(
+    ctx: typer.Context,
+    golden: Annotated[
+        Path,
+        typer.Option("--golden", help="Path to a golden-set JSON file.", dir_okay=False, resolve_path=True),
+    ],
+    report: Annotated[
+        Path | None,
+        typer.Option("--report", help="Write the JSON report to this path.", dir_okay=False, resolve_path=True),
+    ] = None,
+    top_k: Annotated[int, typer.Option("--top-k", min=1, help="top_k used for retrieval during eval.")] = 5,
+    runs: Annotated[int, typer.Option("--runs", min=1, help="Runs per query; metrics use the median run.")] = 1,
+) -> None:
+    """Run golden-set queries through the real retrieval pipeline and print metrics."""
+
+    from synapse.eval import load_golden, run_eval, write_report
+
+    state = _state_from_context(ctx)
+    queries = load_golden(golden)
+    typer.echo(f"Loaded {len(queries)} golden queries from {golden}")
+    result = run_eval(state.config, queries, top_k=top_k, runs=runs, runtime_paths=state.runtime_paths)
+    payload = result.to_dict()
+    if report is not None:
+        write_report(result, report)
+        typer.echo(f"Report written to {report}")
+    typer.echo(json.dumps(payload["overall"], indent=2, ensure_ascii=False))
+    for name, metrics in sorted(payload["slices"].items()):
+        typer.echo(f"--- {name}: " + json.dumps(metrics, ensure_ascii=False))
+
+
 def main() -> None:
     """Console script entry point."""
 
