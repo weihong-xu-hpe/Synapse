@@ -177,7 +177,14 @@ class Distiller:
         if self._sampling_client is None:
             from synapse.server.decider import LocalLLMDecider
 
-            self._sampling_client = LocalLLMDecider(self.config.decider)
+            # Distiller-specific LLM timeout: distillation prompts (long zh
+            # transcripts + reasoning models) routinely exceed the write-path
+            # decider timeout, so the sweep reuses [decider] settings but with
+            # its own [distiller] llm_timeout_seconds (default 300 s).
+            settings = self.config.decider.model_copy(
+                update={"timeout_seconds": self.config.distiller.llm_timeout_seconds}
+            )
+            self._sampling_client = LocalLLMDecider(settings)
         return self._sampling_client
 
     # ------------------------------------------------------------------

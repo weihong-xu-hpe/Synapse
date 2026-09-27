@@ -189,6 +189,11 @@ class DistillerSettings(BaseModel):
     # budget: a 9k-char zh transcript measured 13k reasoning tokens before any
     # content. 16000 leaves room for the JSON payload after thinking.
     llm_max_tokens: int = Field(default=16_000, ge=200)
+    # Distiller-specific LLM HTTP timeout. Live sweeps timed out at the shared
+    # decider timeout (120 s) on 8.6k/16k-char transcripts; backfill succeeded
+    # at 300 s. Applied only to the distiller's own LLM client — the write-path
+    # decider keeps [decider] timeout_seconds.
+    llm_timeout_seconds: int = Field(default=300, ge=1)
     max_transcripts_per_run: int = Field(default=5, ge=1, le=50)
     backoff_sweeps: int = Field(default=3, ge=0)
 

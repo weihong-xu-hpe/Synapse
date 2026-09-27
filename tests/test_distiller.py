@@ -1421,3 +1421,29 @@ def test_supersede_of_legacy_sourced_node_not_downgraded(tmp_path: Path) -> None
     superseded = read_node_file(runtime_paths.active / f"{existing_id}.md")
     assert superseded.metadata.status is NodeStatus.SUPERSEDED
     service._store().close() if hasattr(service, "_store") else None
+
+
+# ---------------------------------------------------------------------------
+# Distiller-specific LLM timeout
+# ---------------------------------------------------------------------------
+
+
+def test_distiller_llm_timeout_uses_distiller_setting_not_decider(tmp_path: Path) -> None:
+    """The distiller's LLM client inherits [decider] settings except timeout."""
+
+    config = _config(tmp_path)
+    # Give the write-path decider a short timeout and the distiller a long one.
+    config.decider = config.decider.model_copy(update={"timeout_seconds": 120})
+    config.distiller = config.distiller.model_copy(update={"llm_timeout_seconds": 300})
+    distiller = Distiller(config, runtime_paths=_runtime(tmp_path), sampling_client=None)
+    try:
+        client = distiller._get_sampling_client()
+        assert client.settings.timeout_seconds == 300
+        assert client.settings.model == config.decider.model
+    finally:
+        distiller.close()
+
+
+def test_distiller_llm_timeout_default_is_300(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    assert config.distiller.llm_timeout_seconds == 300

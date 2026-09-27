@@ -219,9 +219,9 @@ Controls the local LLM used for sampling decisions (write-path triage, link weav
 - `fallback_base_url` — fallback LLM endpoint base URL; used when the primary endpoint fails
 - `fallback_model` — fallback model name
 - `fallback_api_key_env` — env var name holding the bearer token for the fallback endpoint
-- `timeout_seconds` — HTTP request timeout per endpoint (raise this for reasoning models that emit `reasoning_content` before the final answer)
-- `max_tokens` — generation token cap sent to the LLM; must be large enough for reasoning models (e.g. glm-5.2-fp8) whose `reasoning_content` consumes tokens before `content` is populated
-- `temperature` — sampling temperature
+- `timeout_seconds` — HTTP request timeout per endpoint (raise this for reasoning models that emit `reasoning_content` before the final answer). Applies to the write-path decider only; the distiller has its own `[distiller] llm_timeout_seconds`.
+- `max_tokens` — generation token cap sent to the LLM; must be large enough for reasoning models (e.g. glm-5.2-fp8) whose `reasoning_content` consumes tokens before `content` is populated. Measured on glm-5.3-flash write-path decisions: max 542 completion tokens over 10 calls (median 465) — a cap of ~2500 gives ≥4× headroom; a runaway value like 200000 lets a wandering generation run for minutes.
+- `temperature` — sampling temperature. Use `0` for deterministic decisions; the decider's JSON contract degrades nondeterministically at higher values.
 
 > **Reasoning-model note:** some models (e.g. `glm-5.2-fp8`) return intermediate reasoning in a `reasoning_content` field and only populate `content` after reasoning completes. If `max_tokens` is too small, `content` stays empty and the Decider raises a parse error. Size `max_tokens` to leave headroom for both reasoning and the final structured answer.
 
@@ -268,6 +268,7 @@ Controls the session distiller — the server-side pipeline that converts sessio
 - `downgrade_supersede` (bool, default `true`) — when true, a decider `supersede` targeting an existing non-distilled persistent node is downgraded to `complement` and recorded; the live sweep runs with downgrade OFF, backfill/CLI `--apply` with it ON
 - `enforce_okf` (bool, default `false`) — rejection timeline flag: when true, fatal `okf_*` validation codes reject persistent writes instead of warning (not active in the current transition period)
 - `llm_max_tokens` (int, default `16000`) — per-call completion budget; reasoning models (e.g. glm-5.3-flash) spend thinking tokens from the same budget, so this must exceed reasoning + JSON output
+- `llm_timeout_seconds` (int, ≥1, default `300`) — HTTP timeout for the distiller's own LLM client. Distillation prompts (long zh transcripts against reasoning models) routinely exceed the write-path `[decider] timeout_seconds`; live sweeps timed out at 120 s on 8.6k/16k-char transcripts while backfill succeeded at 300 s. The write-path decider timeout is unchanged.
 - `max_transcripts_per_run` (int, 1–50, default `5`) — sweep batch size
 - `backoff_sweeps` (int, default `3`) — sweeps a failing transcript is skipped before retry
 
