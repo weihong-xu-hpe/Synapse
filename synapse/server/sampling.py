@@ -137,7 +137,7 @@ def build_memory_write_sampling_prompt(request: MemoryWriteSamplingRequest) -> s
             "4. Never target nodes that were not provided in the candidate list.",
             "5. If unsure, choose create.",
             "6. Output MUST be a single JSON object with no markdown fence and no extra prose.",
-            "7. For persistent memories, prefer OKF structure with ## sections (Context, Decision, Consequences). Transient memories may be free-form.",
+            "7. For persistent memories, use typed OKF structure: set okf_type (decision, fact, procedure, or pitfall) and follow its template with ## sections starting with a one-line ## Takeaway and ending with ## Sources (see docs/okf.md). Transient memories may be free-form.",
             "",
             "Draft:",
             f"Title: {request.title}",

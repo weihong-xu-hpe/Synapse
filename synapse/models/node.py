@@ -111,6 +111,15 @@ class NodeMetadata(BaseModel):
     # Session-keyed upsert provenance (bridge integration). Persisted in
     # frontmatter so Markdown stays canonical and rebuilds preserve it.
     session_key: str | None = None
+    # OKF typed-knowledge metadata (docs/okf.md). Persisted in frontmatter.
+    okf_type: str | None = None
+    okf_version: int | None = None
+    sources: list[str] = Field(default_factory=list)
+    project: str | None = None
+    # Distiller state on transcript nodes (design doc §2).
+    distilled_hash: str | None = None
+    distilled_at: str | None = None
+    distilled_node_ids: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
 
@@ -237,17 +246,48 @@ def validate_word_count(text: str) -> WordCountValidation:
     )
 
 
-def slugify_title(title: str) -> str:
-    """Convert a title into an ASCII-safe underscore slug."""
+# Stopwords dropped from knowledge slugs (docs/okf.md title rule).
+SLUG_STOPWORDS = frozenset(
+    "a an the of to for and or in on at by is are be with via from into as that this "
+    "it its when then than if but not no do does did can could should would will was were "
+    "has have had also which who whom whose what how why where while during about after "
+    "before between under over again further once here there all any both each few more "
+    "most other some such only own same so too very s t just don now".split()
+)
+SLUG_MAX_TOKENS = 8
+SLUG_MAX_CHARS = 48
+SLUG_MIN_CHARS = 8
+SLUG_MIN_TOKENS = 2
+
+
+def slugify_english_title(title: str) -> str:
+    """Slug for knowledge nodes from an English title (docs/okf.md §7 ID plan).
+
+    Lowercase ASCII tokens joined by ``_``; stopwords dropped; capped at 8
+    tokens / 48 chars at a word boundary. Returns "" when the title is
+    degenerate (< 2 meaningful tokens or < 8 chars) — e.g. CJK-only titles,
+    whose NFKD-ASCII projection leaves nothing.
+    """
 
     normalized = unicodedata.normalize("NFKD", title)
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
-    ascii_text = re.sub(r"[^a-z0-9]+", "_", ascii_text)
-    slug = ascii_text.strip("_")
-    if slug:
-        return slug
-    title_hash = hashlib.sha1(title.encode("utf-8")).hexdigest()[:10]
-    return f"node_{title_hash}"
+    tokens = [t for t in re.split(r"[^a-z0-9]+", ascii_text) if t]
+    meaningful = [t for t in tokens if t not in SLUG_STOPWORDS and not t.isdigit()]
+    if not meaningful:
+        # Fall back to raw tokens if everything was classified a stopword.
+        meaningful = tokens
+    selected: list[str] = []
+    length = 0
+    for token in meaningful:
+        extra = len(token) + (1 if selected else 0)
+        if len(selected) >= SLUG_MAX_TOKENS or length + extra > SLUG_MAX_CHARS:
+            break
+        selected.append(token)
+        length += extra
+    slug = "_".join(selected)
+    if len(selected) < SLUG_MIN_TOKENS or len(slug) < SLUG_MIN_CHARS:
+        return ""
+    return slug
 
 
 def _resolve_node_date(current_date: date | datetime | str | None) -> date:
@@ -262,7 +302,16 @@ def _resolve_node_date(current_date: date | datetime | str | None) -> date:
 
 
 def generate_node_id(title: str, current_date: date | datetime | str | None = None) -> str:
-    """Generate a canonical node identifier using the Synapse `mem_YYYYMMDD_slug` convention."""
+    """Generate a canonical node identifier using the Synapse `mem_YYYYMMDD_slug` convention.
+
+    Slug prefers the English knowledge-slug (stopwords dropped, capped). A
+    degenerate slug (CJK-only or too-short titles) falls back to
+    ``node_<sha1(title)[:10]>`` so IDs never become meaningless fragments.
+    """
 
     node_date = _resolve_node_date(current_date)
-    return f"mem_{node_date.strftime('%Y%m%d')}_{slugify_title(title)}"
+    slug = slugify_english_title(title)
+    if not slug:
+        title_hash = hashlib.sha1(title.encode("utf-8")).hexdigest()[:10]
+        slug = f"node_{title_hash}"
+    return f"mem_{node_date.strftime('%Y%m%d')}_{slug}"

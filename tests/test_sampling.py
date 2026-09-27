@@ -34,8 +34,10 @@ def _node(node_id: str, content: str) -> Node:
 def test_memory_write_sampling_prompt_requests_okf_for_persistent_memories() -> None:
     prompt = build_memory_write_sampling_prompt(_memory_write_request())
 
-    assert "OKF structure with ## sections" in prompt
-    assert "Context, Decision, Consequences" in prompt
+    assert "typed OKF structure" in prompt
+    assert "decision, fact, procedure, or pitfall" in prompt
+    assert "## Takeaway" in prompt
+    assert "## Sources" in prompt
     assert "Transient memories may be free-form" in prompt
 
 

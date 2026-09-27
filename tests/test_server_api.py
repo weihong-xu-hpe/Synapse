@@ -456,15 +456,13 @@ def test_write_memory_warns_for_unstructured_persistent_content(tmp_path: Path) 
         node_type="persistent",
     )
 
-    assert result["warnings"] == [
-        {
-            "code": "low_structure",
-            "message": "Persistent memory has no ## sections; consider OKF format.",
-        }
-    ]
+    warning_codes = [warning["code"] for warning in result["warnings"]]
+    assert "okf_missing_type" in warning_codes
+    assert "okf_untyped" in warning_codes
+    assert "okf_missing_sources" in warning_codes
+    assert "okf_missing_section:Takeaway" in warning_codes
     stats = service.stats()
     assert stats["write_stats"]["requests_total"] == 1
-    assert stats["write_stats"]["warnings"] == {"low_structure": 1}
     assert stats["write_stats"]["decision_totals"]["create"] == 1
     assert stats["lifecycle_stats"]["thresholds"]["missing_link_cosine"] == 0.75
 
@@ -484,7 +482,14 @@ def test_write_memory_does_not_warn_for_structured_persistent_content(tmp_path: 
         node_type="persistent",
     )
 
-    assert result["warnings"] == []
+    # Typed OKF validation: this body has sections but no okf_type/sources
+    # frontmatter, so it still gets type-provenance warnings (transition
+    # period is warnings-only).
+    warning_codes = [warning["code"] for warning in result["warnings"]]
+    assert "okf_missing_type" in warning_codes
+    assert "okf_missing_sources" in warning_codes
+    assert "okf_missing_section:Takeaway" in warning_codes
+    assert "okf_missing_section:Sources" in warning_codes
 
 
 def test_write_memory_does_not_warn_for_unstructured_transient_content(tmp_path: Path) -> None:

@@ -162,6 +162,11 @@ class SynapseServerService:
         action: IntegrateAction | str = IntegrateAction.CREATE,
         target_node_ids: list[str] | None = None,
         reasoning: str = "",
+        okf_type: str | None = None,
+        okf_version: int | None = None,
+        sources: list[str] | None = None,
+        project: str | None = None,
+        node_id: str | None = None,
     ) -> dict[str, Any]:
         """Execute an explicit memory write action decided by the higher-level orchestration layer.
 
@@ -181,7 +186,7 @@ class SynapseServerService:
         normalized_links = self._normalize_links(links or [])
         resolved_target_ids = self._normalize_links(target_node_ids or [])
         normalized_reasoning = normalize_reasoning(normalized_action, reasoning)
-        node_id = self._allocate_node_id(clean_title)
+        node_id = node_id or self._allocate_node_id(clean_title)
 
         # Embed target IDs into content so graph edges are stored correctly by the
         # sync layer (supersession banners are stripped on read-back, so targets
@@ -202,6 +207,10 @@ class SynapseServerService:
             status=NodeStatus.ACTIVE,
             supersedes=resolved_target_ids if normalized_action is IntegrateAction.SUPERSEDE else [],
             sensitivity=normalized_sensitivity,
+            okf_type=okf_type,
+            okf_version=okf_version,
+            sources=list(sources) if sources else [],
+            project=project,
         )
         new_node = Node(
             metadata=metadata,
@@ -278,6 +287,12 @@ class SynapseServerService:
         sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
         query_hint: str | None = None,
         similarity_threshold: float = 0.3,
+        okf_type: str | None = None,
+        okf_version: int | None = None,
+        sources: list[str] | None = None,
+        project: str | None = None,
+        node_id: str | None = None,
+        downgrade_supersede: bool = False,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -309,6 +324,12 @@ class SynapseServerService:
                 sensitivity=sensitivity,
                 query_hint=query_hint,
                 similarity_threshold=similarity_threshold,
+                okf_type=okf_type,
+                okf_version=okf_version,
+                sources=sources,
+                project=project,
+                node_id=node_id,
+                downgrade_supersede=downgrade_supersede,
             )
 
     def _find_identical_active_node(self, title: str, content: str) -> Node | None:
@@ -334,17 +355,25 @@ class SynapseServerService:
         sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
         query_hint: str | None = None,
         similarity_threshold: float = 0.3,
+        okf_type: str | None = None,
+        okf_version: int | None = None,
+        sources: list[str] | None = None,
+        project: str | None = None,
+        node_id: str | None = None,
+        downgrade_supersede: bool = False,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
         section_count = sum(1 for line in content.splitlines() if line.lstrip().startswith("##"))
         warnings: list[dict[str, str]] = []
-        if normalized_type is NodeType.PERSISTENT and section_count == 0:
-            warnings.append(
-                {
-                    "code": "low_structure",
-                    "message": "Persistent memory has no ## sections; consider OKF format.",
-                }
+        if normalized_type is NodeType.PERSISTENT:
+            warnings.extend(
+                self._okf_write_warnings(
+                    clean_title,
+                    content,
+                    okf_type=okf_type,
+                    sources=sources,
+                )
             )
 
         payload = self._decide_memory_write_payload(
@@ -358,6 +387,36 @@ class SynapseServerService:
         )
 
         decision_payload = payload["decision"].copy()
+        downgrade_note: dict[str, Any] | None = None
+        # Downgrade scope (design A3): only supersede of CURATED knowledge —
+        # persistent nodes without distiller provenance — is downgraded.
+        # Distilled-vs-distilled supersede stays allowed so knowledge can be
+        # updated by later distillations.
+        curated_targets: list[str] = []
+        if (
+            downgrade_supersede
+            and decision_payload.get("action") == "supersede"
+            and decision_payload.get("target_node_ids")
+        ):
+            curated_targets = self._curated_supersede_targets(list(decision_payload["target_node_ids"]))
+        if (
+            downgrade_supersede
+            and decision_payload.get("action") == "supersede"
+            and curated_targets
+        ):
+            decision_payload["action"] = "complement"
+            downgrade_note = {
+                "original_action": "supersede",
+                "target_node_ids": list(decision_payload["target_node_ids"]),
+                "curated_target_node_ids": curated_targets,
+                "reason": "supersede downgraded to complement (curated knowledge is never superseded without owner approval)",
+            }
+            warnings.append(
+                {
+                    "code": "okf_supersede_downgraded",
+                    "message": f"Supersede of curated nodes {curated_targets} downgraded to complement.",
+                }
+            )
 
         try:
             integrate_result = self.integrate_knowledge(
@@ -369,6 +428,11 @@ class SynapseServerService:
                 action=decision_payload["action"],
                 target_node_ids=decision_payload["target_node_ids"],
                 reasoning=decision_payload["reasoning"],
+                okf_type=okf_type,
+                okf_version=okf_version,
+                sources=sources,
+                project=project,
+                node_id=node_id,
             )
         except SynapseServiceError as exc:
             self._record_write_memory_metrics(
@@ -392,9 +456,9 @@ class SynapseServerService:
             ) from exc
 
         node_payload = integrate_result.get("node") if isinstance(integrate_result, dict) else None
-        node_id = str(node_payload.get("id")) if isinstance(node_payload, dict) else None
+        written_node_id = str(node_payload.get("id")) if isinstance(node_payload, dict) else None
         self._record_write_memory_metrics(
-            node_id=node_id,
+            node_id=written_node_id,
             node_type=normalized_type.value,
             decision_payload=decision_payload,
             evidence=payload["evidence"],
@@ -413,6 +477,8 @@ class SynapseServerService:
             },
             "warnings": warnings,
         }
+        if downgrade_note is not None:
+            result["downgrade"] = downgrade_note
         self._log_tool_call(
             "write_memory",
             {
@@ -729,11 +795,17 @@ class SynapseServerService:
     def _allocate_node_id(self, title: str) -> str:
         base_id = generate_node_id(title)
         candidate = base_id
-        counter = 2
         with self._store() as store:
-            while store.get_node(candidate) is not None or (self.runtime_paths.active / f"{candidate}.md").exists():
-                candidate = f"{base_id}_{counter}"
-                counter += 1
+            if store.get_node(candidate) is None and not (self.runtime_paths.active / f"{candidate}.md").exists():
+                return candidate
+            # Collision: deterministic short hash of title + creation date
+            # (docs/okf.md ID plan) instead of _2/_3 counters; extend from 4
+            # to 6 hex only if the 4-hex variant is still taken.
+            now_iso = datetime.now(UTC).isoformat()
+            digest = hashlib.sha1(f"{title}{now_iso}".encode("utf-8")).hexdigest()
+            candidate = f"{base_id}_{digest[:4]}"
+            if store.get_node(candidate) is not None or (self.runtime_paths.active / f"{candidate}.md").exists():
+                candidate = f"{base_id}_{digest[:6]}"
         return candidate
 
     def _embed_query(self, query: str) -> list[float] | None:
@@ -837,6 +909,35 @@ class SynapseServerService:
         normalized_hint = " ".join(str(query_hint or "").split()).strip()
         queries = self._normalize_links([base_query, normalized_hint])
         return base_query, queries or [base_query]
+
+    def _okf_write_warnings(
+        self,
+        title: str,
+        content: str,
+        *,
+        okf_type: str | None = None,
+        sources: list[str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Typed OKF validation for persistent writes (warnings-only transition).
+
+        Explicit okf fields (e.g. from the distiller or a curated client) take
+        precedence; otherwise an existing node with the same title/content
+        provides them; otherwise the write is untyped. Submitted sources are
+        checked against the conforming shapes (node id / session:<key> / URL);
+        non-conforming entries surface as ``okf_unresolvable_source``. The
+        title is checked against the English-title rules (warnings only for
+        agent writes — no auto-translation, no rejection).
+        """
+
+        from synapse.okf import validate_okf_node
+
+        if okf_type is None or sources is None:
+            existing = self._find_identical_active_node(title, content)
+            if existing is not None:
+                okf_type = okf_type or existing.metadata.okf_type
+                sources = sources if sources is not None else existing.metadata.sources
+        findings = validate_okf_node(node_type="persistent", content=content, okf_type=okf_type, sources=sources, title=title)
+        return [{"code": w.code, "message": w.message} for w in findings]
 
     def _decide_memory_write_payload(
         self,
