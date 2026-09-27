@@ -174,13 +174,24 @@ def run_eval(
         config_path=str(config.config_path),
     )
 
+    from synapse.okf.transcripts import is_distilled_current, is_session_transcript
+
+    def _default_include(node) -> bool:
+        # Mirror the service default: distilled-current transcripts (represented
+        # OR zero-item) are excluded; only not-yet-distilled remain searchable.
+        if is_session_transcript(node) and is_distilled_current(node):
+            return False
+        return True
+
     with RetrievalPipeline(config, runtime_paths=paths) as pipeline:
         for gq in queries:
             result = QueryResult(query_id=gq.id, slice=gq.language)
             must = gq.must_ids
             for run_index in range(runs):
                 start = time.perf_counter()
-                response = pipeline.search(gq.query, top_k=top_k, update_access=False)
+                response = pipeline.search(
+                    gq.query, top_k=top_k, update_access=False, result_filter=_default_include
+                )
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
                 result.latencies_ms.append(elapsed_ms)
                 ranked_ids = [item.node.id for item in response.results]

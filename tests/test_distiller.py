@@ -609,6 +609,53 @@ def test_search_excludes_fully_distilled_transcripts_by_default(tmp_path: Path) 
         pass
 
 
+def test_search_excludes_zero_item_distilled_transcripts_by_default(tmp_path: Path) -> None:
+    """Zero-item distilled transcripts are excluded from default search too.
+
+    The LLM judged nothing durable — the transcript has already contributed its
+    (empty) knowledge and only competes with real knowledge in default search.
+    include=transcripts|all still returns it.
+    """
+
+    runtime_paths = _runtime(tmp_path)
+    from tests.test_server_api import FakeSamplingClient
+
+    service = SynapseServerService(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=FakeSamplingClient())
+    try:
+        transcript = _write_transcript(
+            runtime_paths,
+            "mem_session_zeroitem",
+            "## User\nslack webhook channel mapping\n\n## Assistant\nprobe message approach",
+            session_key="sess-zero",
+        )
+        # Stamp distilled-current with ZERO knowledge ids (zero-item distill).
+        stamped = transcript.model_copy(
+            update={
+                "metadata": transcript.metadata.model_copy(
+                    update={"distilled_hash": content_sha256(transcript.content), "distilled_node_ids": []}
+                )
+            }
+        )
+        write_node_file(stamped, base_path=runtime_paths.base)
+        _sync_all(runtime_paths)
+
+        from synapse.okf.transcripts import is_distilled_current, is_represented
+
+        reloaded = service._store().get_node("mem_session_zeroitem")
+        assert is_distilled_current(reloaded) and not is_represented(reloaded)
+
+        default_hits = [r["node"]["id"] for r in service.search_memory("slack webhook channel mapping", 10)["results"]]
+        assert "mem_session_zeroitem" not in default_hits
+
+        transcript_hits = [
+            r["node"]["id"]
+            for r in service.search_memory("slack webhook channel mapping", 10, include="transcripts")["results"]
+        ]
+        assert "mem_session_zeroitem" in transcript_hits
+    finally:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Config plumbing
 # ---------------------------------------------------------------------------
@@ -661,8 +708,8 @@ def test_zero_item_transcript_not_reselected_and_archived_after_retention(tmp_pa
         stamped = read_node_file(paths.active / "mem_session_zero1.md")
         assert stamped.metadata.distilled_hash == content_sha256(stamped.content)
         assert stamped.metadata.distilled_node_ids == []
-        assert not is_represented(stamped)  # zero items: searchable still
-        assert is_distilled_current(stamped)
+        assert not is_represented(stamped)  # zero items: no knowledge produced
+        assert is_distilled_current(stamped)  # still excluded from default search
 
         report2 = distiller.run(downgrade_supersede=False)
         assert report2.transcripts_scanned == 0  # no infinite re-distill loop

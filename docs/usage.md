@@ -171,7 +171,7 @@ Final score = raw reranker logit + `ln` of decay/status multipliers (additive in
 - **Transient material** decays additively by `ln(0.98^days-since-access)`.
 - **Superseded** nodes get `ln(0.1)`, **disputed** `ln(0.5)` — strictly below active nodes at equal relevance.
 
-`score > 0` still means "relevant enough to inject" for clients that filter on it (the omp bridge). Excluded nodes (represented transcripts, `exclude_session_key`) are filtered **before** fusion, so they cannot consume fused candidate slots.
+`score > 0` still means "relevant enough to inject" for clients that filter on it (the omp bridge). Excluded nodes (**distilled-current transcripts** — represented or zero-item, i.e. already contributed whatever the LLM judged durable — and `exclude_session_key`) are filtered **before** fusion, so they cannot consume fused candidate slots; only not-yet-distilled transcripts remain searchable by default (`include=transcripts|all` returns everything).
 
 ### POST /api/write
 

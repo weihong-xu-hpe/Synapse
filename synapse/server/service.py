@@ -163,19 +163,22 @@ class SynapseServerService:
         return payload
 
     def _include_result(self, node: Node, include: str) -> bool:
-        """Default search excludes represented transcripts (shared predicates).
+        """Default search excludes distilled-current transcripts.
 
-        ``is_represented`` = distilled at the current revision AND knowledge
-        nodes produced. Legacy session summaries are covered by
-        ``is_session_transcript``. ``include=all|transcripts`` disables the
-        exclusion.
+        A transcript distilled at its current revision has already contributed
+        whatever the LLM judged durable — represented transcripts via produced
+        knowledge nodes, zero-item transcripts by explicit judgment ("nothing
+        durable here"). Both compete with knowledge in default search, so both
+        are excluded; only not-yet-distilled transcripts remain searchable.
+        ``include=transcripts|all`` still returns everything. Legacy session
+        summaries are covered by ``is_session_transcript``.
         """
 
         if include in {"all", "transcripts"}:
             return True
-        from synapse.okf.transcripts import is_represented, is_session_transcript
+        from synapse.okf.transcripts import is_distilled_current, is_session_transcript
 
-        if is_session_transcript(node) and is_represented(node):
+        if is_session_transcript(node) and is_distilled_current(node):
             return False
         return True
 
