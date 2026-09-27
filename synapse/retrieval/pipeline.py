@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -11,7 +12,7 @@ from typing import Callable, Iterable, Sequence
 from synapse.config import SynapseConfig
 from synapse.embedding import create_embedding_engine, create_reranker_engine
 from synapse.interfaces import SearchQuery
-from synapse.models import Node, NodeStatus
+from synapse.models import Node, NodeStatus, NodeType
 from synapse.storage import SQLiteNodeStore
 from synapse.utils.documents import render_node_document
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
@@ -25,6 +26,14 @@ STATUS_MULTIPLIERS: dict[NodeStatus, float] = {
     NodeStatus.SUPERSEDED: 0.1,
     NodeStatus.DISPUTED: 0.5,
 }
+# Persistent knowledge receives a fixed mild logit-space penalty instead of an
+# access-driven decay clock (see RetrievalPipeline.apply_decay).
+DECAY_PERSISTENT_PENALTY = -0.2
+# Multi-part recall queries are split on this separator for per-chunk dense
+# embedding (bridge recall joins messages with "\n---\n").
+_QUERY_CHUNK_SEPARATOR = "\n---\n"
+# Chunks shorter than this add embedding cost without semantic value.
+_MIN_CHUNK_CHARS = 24
 
 
 @dataclass(slots=True, frozen=True)
@@ -110,8 +119,20 @@ class RetrievalPipeline:
         request = query if isinstance(query, SearchQuery) else SearchQuery(text=str(query), top_k=top_k or self.config.retrieval.top_k)
         final_top_k = top_k or request.top_k or self.config.retrieval.top_k
         query_embedding = self._embed_query(request.text)
-        anchors = self.hybrid_search(request.text, query_embedding, limit=min(3, self.config.reranker.max_candidates))
+        # Rerank the full fused top-max_candidates: the anchor cut at 3 was the
+        # pipeline's dominant recall bottleneck (the reranker — the only
+        # cross-encoder — never saw ranks 4..9 of the fused list). The exclude
+        # filter also applies BEFORE fusion so excluded transcripts cannot
+        # consume fused candidate slots.
+        anchors = self.hybrid_search(
+            request.text,
+            query_embedding,
+            limit=self.config.reranker.max_candidates,
+            exclude=result_filter,
+        )
         anchor_ids = [anchor.node.id for anchor in anchors]
+        # Graph-hop neighbours APPEND after fused hits (slots permitting);
+        # they never displace fused hits.
         neighbor_ids = self.graph_hop(anchor_ids, max_neighbors=max(0, self.config.reranker.max_candidates - len(anchor_ids)))
 
         anchor_id_set = set(anchor_ids)
@@ -154,15 +175,88 @@ class RetrievalPipeline:
         limit: int = 3,
         per_source_limit: int = 20,
     ) -> list[_AnchorCandidate]:
-        """Fuse FTS and vector retrieval with reciprocal rank fusion."""
+        """Fuse FTS and vector retrieval with reciprocal rank fusion.
+
+        Dense leg: long multi-part recall queries (bridge recall concatenates
+        the last 3 user messages) dilute a single embedding across topics, so
+        the query is ALSO embedded per ``\\n---\\n`` chunk and every chunk
+        votes in the fusion. The whole-query embedding participates too.
+        """
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_embedding: list[float] | None = None,
+        *,
+        limit: int = 3,
+        per_source_limit: int = 20,
+        exclude: Callable[[Node], bool] | None = None,
+    ) -> list[_AnchorCandidate]:
+        """Fuse FTS and vector retrieval with reciprocal rank fusion.
+
+        Dense leg: long multi-part recall queries (bridge recall concatenates
+        the last 3 user messages) dilute a single embedding across topics, so
+        the query is ALSO embedded per ``\\n---\\n`` chunk and every chunk
+        votes in the fusion. The whole-query embedding participates too.
+
+        ``exclude`` drops nodes BEFORE fusion so filtered transcripts cannot
+        consume fused candidate slots (with the default search excluding
+        represented transcripts, they otherwise crowd out knowledge).
+        """
 
         store = self._get_store()
         fts_results = store.fts_search(query, limit=per_source_limit)
-        vector_results = store.vector_search(query_embedding, limit=per_source_limit) if query_embedding else []
-        rrf_scores = self.compute_rrf((fts_results, vector_results), k=self.config.retrieval.rrf_k)
-        ranked_ids = sorted(rrf_scores.items(), key=lambda item: (-item[1], item[0]))[:limit]
-        nodes = {node.id: node for node in store.get_nodes([node_id for node_id, _ in ranked_ids])}
+        if query_embedding is None:
+            vector_sets: list[list[tuple[str, float]]] = []
+        else:
+            vector_sets = [store.vector_search(query_embedding, limit=per_source_limit)]
+            for chunk in query.split(_QUERY_CHUNK_SEPARATOR):
+                chunk = chunk.strip()
+                if len(chunk) < _MIN_CHUNK_CHARS or chunk.casefold() == query.strip().casefold():
+                    continue
+                chunk_embedding = self._embed_query(chunk)
+                if chunk_embedding:
+                    vector_sets.append(store.vector_search(chunk_embedding, limit=per_source_limit))
+        if exclude is not None:
+            # ``exclude`` follows the service result_filter convention: it
+            # returns True for nodes to KEEP.
+            def _keep(node_id: str) -> bool:
+                node = store.get_node(node_id)
+                return node is not None and exclude(node)
+
+            fts_results = [(node_id, score) for node_id, score in fts_results if _keep(node_id)]
+            vector_sets = [
+                [(node_id, score) for node_id, score in vs if _keep(node_id)]
+                for vs in vector_sets
+            ]
+        ranked_ids = self.fuse_rankings((fts_results, *vector_sets), k=self.config.retrieval.rrf_k, limit=limit)
+        ranked_id_list = [node_id for node_id, _ in ranked_ids]
+        nodes = {node.id: node for node in store.get_nodes(ranked_id_list)}
         return [_AnchorCandidate(node=nodes[node_id], score=score) for node_id, score in ranked_ids if node_id in nodes]
+
+    @staticmethod
+    def fuse_rankings(
+        result_sets: Iterable[Sequence[tuple[str, float]]],
+        *,
+        k: int,
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        """Fuse ranked lists by keeping each item's BEST per-list RRF score.
+
+        Max-fusion instead of sum: multi-chunk recall queries embed each user
+        message separately, and generic transcripts appear in every chunk list
+        (consensus noise) while a specific rank-1 match appears in only one.
+        Sum-fusion lets consensus beat specificity; max keeps every leg's
+        strongest evidence. For a single list this is identical to plain RRF.
+        """
+
+        best: dict[str, float] = {}
+        for results in result_sets:
+            for rank, (node_id, _) in enumerate(results, start=1):
+                score = 1.0 / (k + rank)
+                if node_id not in best or score > best[node_id]:
+                    best[node_id] = score
+        return sorted(best.items(), key=lambda item: (-item[1], item[0]))[:limit]
 
     def graph_hop(self, anchor_ids: Sequence[str], *, max_neighbors: int = 6) -> list[str]:
         """Return unique 1-degree linked neighbors for anchor nodes."""
@@ -203,20 +297,41 @@ class RetrievalPipeline:
         return scores
 
     def apply_decay(self, node: Node, base_score: float) -> tuple[float, float]:
-        """Apply tier-sensitive time decay to a score."""
+        """Apply tier-sensitive time decay to a score.
+
+        Sign-safe: decay is applied as an additive penalty in logit space
+        (``ln(decay_factor^days)``), so stale/superseded irrelevant results can
+        never be moved UP toward zero, and persistent knowledge is not punished
+        for simply not being accessed recently (decay targets transient
+        material; persistent knowledge keeps a fixed mild penalty after a
+        grace period).
+        """
 
         now = self._now_fn()
         last_accessed = node.metadata.last_accessed.astimezone(UTC)
         elapsed_days = max(0.0, (now - last_accessed).total_seconds() / 86_400.0)
         factor = self.config.decay.factor
-        multiplier = factor ** elapsed_days
-        return base_score * multiplier, multiplier
+        if node.metadata.type is NodeType.PERSISTENT:
+            # Knowledge: no access-driven decay clock (access frequency is a
+            # popularity signal, not a freshness signal). A fixed mild penalty
+            # keeps fresh, just-written context ahead of long-tail knowledge.
+            penalty = DECAY_PERSISTENT_PENALTY
+        else:
+            penalty = math.log(factor) * elapsed_days
+        return base_score + penalty, math.exp(penalty)
 
     def apply_status_penalty(self, node: Node, score: float) -> tuple[float, float]:
-        """Apply conflict-aware penalties for disputed or superseded nodes."""
+        """Apply conflict-aware penalties for disputed or superseded nodes.
+
+        Additive in logit space (see apply_decay): a negative penalty on
+        superseded/disputed nodes shifts their logits strictly down, which is
+        monotone in relevance — unlike multiplication, it cannot turn a very
+        negative (irrelevant) logit into a competitive one.
+        """
 
         multiplier = STATUS_MULTIPLIERS.get(node.metadata.status, 1.0)
-        return score * multiplier, multiplier
+        penalty = math.log(multiplier) if multiplier > 0 else -1000.0
+        return score + penalty, multiplier
 
     def _score_candidate(self, node: Node, rerank_score: float, *, anchor_score: float, is_anchor: bool) -> RetrievalItem:
         decayed_score, decay_multiplier = self.apply_decay(node, rerank_score)

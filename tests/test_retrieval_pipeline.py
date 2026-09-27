@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import pytest
 from synapse.config import load_config
 from synapse.models import Node, NodeMetadata, NodeStatus, NodeType, SensitivityLevel
 from synapse.retrieval import RetrievalPipeline
+from synapse.retrieval.pipeline import DECAY_PERSISTENT_PENALTY
 from synapse.storage import SQLiteNodeStore
 from synapse.utils.runtime import bootstrap_runtime_directories
 
@@ -167,6 +170,10 @@ def test_rerank_decay_and_status_penalties_are_applied(tmp_path: Path) -> None:
         file_name="old.md",
         last_accessed=NOW - timedelta(days=10),
     )
+    # Transient type so the time-decay branch (not the persistent constant) applies.
+    old_concept = old_concept.model_copy(
+        update={"metadata": old_concept.metadata.model_copy(update={"type": NodeType.TRANSIENT})}
+    )
     disputed = make_node(
         node_id="disputed",
         title="Disputed Gateway Note",
@@ -181,9 +188,29 @@ def test_rerank_decay_and_status_penalties_are_applied(tmp_path: Path) -> None:
         file_name="superseded.md",
         status=NodeStatus.SUPERSEDED,
     )
+    persistent_old = make_node(
+        node_id="pers-old",
+        title="Untouched Knowledge",
+        content="Knowledge not accessed for a month.",
+        file_name="pers-old.md",
+        last_accessed=NOW - timedelta(days=30),
+    )
+    persistent_old = persistent_old.model_copy(
+        update={"metadata": persistent_old.metadata.model_copy(update={"type": NodeType.PERSISTENT})}
+    )
+    persistent_new = make_node(
+        node_id="pers-new",
+        title="Fresh Knowledge",
+        content="Knowledge accessed right now.",
+        file_name="pers-new.md",
+        last_accessed=NOW,
+    )
+    persistent_new = persistent_new.model_copy(
+        update={"metadata": persistent_new.metadata.model_copy(update={"type": NodeType.PERSISTENT})}
+    )
 
     with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
-        for node in (fresh, old_concept, disputed, superseded):
+        for node in (fresh, old_concept, disputed, superseded, persistent_old, persistent_new):
             store.upsert_node(node, embedding=[1.0, 0.0, 0.0])
         pipeline = RetrievalPipeline(
             config,
@@ -195,17 +222,92 @@ def test_rerank_decay_and_status_penalties_are_applied(tmp_path: Path) -> None:
         )
 
         reranked = pipeline.rerank_candidates("gateway", [old_concept, disputed, fresh])
-        decayed_score, decay_multiplier = pipeline.apply_decay(old_concept, 1.0)
-        disputed_score, disputed_multiplier = pipeline.apply_status_penalty(disputed, 1.0)
-        superseded_score, superseded_multiplier = pipeline.apply_status_penalty(superseded, 1.0)
+        stale_logit, decay_multiplier = pipeline.apply_decay(old_concept, 1.0)
+        disputed_score, disputed_multiplier = pipeline.apply_status_penalty(disputed, 0.0)
+        superseded_score, superseded_multiplier = pipeline.apply_status_penalty(superseded, 0.0)
+        positive_superseded, _ = pipeline.apply_status_penalty(superseded, 1.0)
+        negative_active, _ = pipeline.apply_decay(fresh, -6.0)
+        persistent_stale, _ = pipeline.apply_decay(persistent_old, 1.0)
+        persistent_fresh, _ = pipeline.apply_decay(persistent_new, 1.0)
 
+    # RRF order preserved through rerank; additive penalties keep strict order.
     assert [node.id for node, _ in reranked] == [fresh.id, old_concept.id, disputed.id]
+    # Transient decay is additive in logit space: 1 + ln(0.98^10) < 1, and the
+    # multiplier is the exponential of the penalty.
+    assert stale_logit == pytest.approx(1.0 + math.log(0.98) * 10)
     assert decay_multiplier == pytest.approx(0.98**10)
-    assert decayed_score == pytest.approx(0.98**10)
+    # Sign-safety: an irrelevant (very negative) logit can never be moved UP
+    # by decay — stale is at or below fresh for equal logits.
+    assert negative_active == pytest.approx(-6.0 + DECAY_PERSISTENT_PENALTY)  # fresh persistent
+    # Status penalties shift strictly DOWN from any starting logit.
     assert disputed_multiplier == pytest.approx(0.5)
-    assert disputed_score == pytest.approx(0.5)
+    assert disputed_score == pytest.approx(math.log(0.5))
     assert superseded_multiplier == pytest.approx(0.1)
-    assert superseded_score == pytest.approx(0.1)
+    assert superseded_score == pytest.approx(math.log(0.1))
+    assert positive_superseded == pytest.approx(1.0 + math.log(0.1))
+    # Persistent knowledge: fixed mild penalty regardless of access age —
+    # untouched-for-30d knowledge scores the same as freshly-touched.
+    assert persistent_stale == pytest.approx(1.0 + DECAY_PERSISTENT_PENALTY)
+    assert persistent_fresh == pytest.approx(1.0 + DECAY_PERSISTENT_PENALTY)
+    # Superseded/disputed rank strictly below equal-logit active nodes.
+    assert superseded_score < disputed_score < 0.0
+
+
+def test_rerank_covers_full_fused_candidates_and_graph_hop_appends(tmp_path: Path) -> None:
+    """Fused ranks beyond #3 reach the reranker; graph-hop only appends.
+
+    Setup: 12 nodes; the first 9 fused hits are distinct knowledge, the 10th
+    fused hit is missing on purpose, and a graph-hop neighbour of anchor #1 is
+    linked in. With reranker.max_candidates=9 the reranked set must be the 9
+    fused hits plus appended neighbours ONLY when slots remain — here slots
+    are full, so the graph-hop neighbour must NOT displace any fused hit.
+    """
+
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    # 12 nodes with distinct vector dims so fusion ranking is deterministic:
+    # n0..n8 embed close to the query; n9..n11 embed far below fusion cutoff.
+    nodes = [
+        make_node(node_id=f"n{i:02d}", title=f"Node {i} gateway filler body", content=f"Gateway body {i}", file_name=f"n{i:02d}.md")
+        for i in range(12)
+    ]
+    linked = make_node(node_id="linked", title="Linked neighbour", content="Neighbour body", file_name="linked.md")
+
+    class RankedEmbedding:
+        model_name = "ranked"
+        dimension = 3
+
+        def embed(self, text: str) -> list[float]:
+            del text
+            return [1.0, 0.0, 0.0]
+
+        def embed_batch(self, texts: list[str]) -> list[list[float]]:
+            return [self.embed(t) for t in texts]
+
+        def is_available(self) -> bool:
+            return True
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        for index, node in enumerate(nodes):
+            # Deterministic decreasing similarity: n0 most similar.
+            store.upsert_node(node, embedding=[1.0 - index * 0.05, 0.0, 0.0])
+        store.upsert_node(linked, embedding=[0.0, 0.0, 0.0])  # orthogonal: never fused
+        store.upsert_edges(nodes[0].id, [linked.id])
+        pipeline = RetrievalPipeline(
+            config,
+            store=store,
+            runtime_paths=runtime_paths,
+            embedding_engine=RankedEmbedding(),
+            reranker_engine=FakeRerankerEngine(),
+            now_fn=lambda: NOW,
+        )
+        response = pipeline.search("gateway", top_k=5, update_access=False)
+
+    reranked_ids = [item.node.id for item in response.candidates]
+    # The reranked candidate set is exactly the top-9 fused hits (n00..n08):
+    # the graph-hop neighbour exists but never displaced a fused hit.
+    assert reranked_ids == [f"n{i:02d}" for i in range(9)]
 
 
 def test_retrieval_pipeline_returns_top_k_marks_disputed_and_updates_access_only_for_results(tmp_path: Path) -> None:
