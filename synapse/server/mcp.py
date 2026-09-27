@@ -91,13 +91,30 @@ class SynapseMCPServer:
             for tool in (
                 MCPToolDefinition(
                     name="search_memory",
-                    description="Search the knowledge graph for relevant context.",
+                    description=(
+                        "Search the knowledge graph for relevant context. Returns ranked results with an "
+                        "``inject`` flag (true = trustworthy enough to inject into agent context; decided by a "
+                        "calibrated rerank-logit floor + relative margin). Inject only results with inject=true; "
+                        "``score`` is a display/logit score and may be negative for correctly-ranked results. "
+                        "``include``: ``default`` excludes distilled session transcripts (only not-yet-distilled "
+                        "ones remain searchable), ``transcripts``/``all`` include everything."
+                    ),
                     input_model=SearchMemoryToolRequest,
                     handler=self.service.search_memory,
                 ),
                 MCPToolDefinition(
                     name="write_memory",
-                    description="Use Synapse's decision layer to decide and execute a memory write.",
+                    description=(
+                        "Write durable knowledge to memory. For knowledge (how a system works, decisions with "
+                        "rationale, procedures, pitfalls): set type=persistent, follow the OKF template "
+                        "(docs/okf.md) — okf_type decision|fact|procedure|pitfall, fixed English ## sections "
+                        "(e.g. Symptom/Cause/Fix for pitfalls), a single-line ## Takeaway (<=200 chars), ## Sources "
+                        "listing where the knowledge came from, and an ENGLISH title (<= 90 chars, specific claim, "
+                        "no type prefix). Omitting ``type`` defaults to persistent when the body already carries "
+                        "OKF structure (okf_type or matching ## sections) and transient otherwise; persistent "
+                        "writes without okf_type are auto-normalized (original text preserved under "
+                        "'## Original note'). Session chatter and status updates are transient."
+                    ),
                     input_model=WriteMemoryRequest,
                     handler=self.service.write_memory,
                 ),

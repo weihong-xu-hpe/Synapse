@@ -41,7 +41,9 @@ class WriteMemoryRequest(BaseModel):
 
     title: str = Field(min_length=1)
     content: str = ""
-    type: NodeType = NodeType.TRANSIENT
+    # Optional: when omitted, the write path defaults to persistent for OKF-
+    # structured bodies and transient otherwise (see synapse/server/write_normalize.py).
+    type: NodeType | None = None
     links: list[str] = Field(default_factory=list)
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
     query_hint: str | None = None

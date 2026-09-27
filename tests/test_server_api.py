@@ -36,7 +36,10 @@ class FakeSamplingClient:
     name = "fake-sampler"
 
     def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
-        _ = (system_prompt, max_tokens, model_hints)
+        # Write-path OKF normalization calls sample_json; tests that don't
+        # exercise it raise here so unexpected prompts surface loudly. The
+        # normalizer converts any exception into a graceful fallback
+        # (stored as submitted + warning), so raises never break writes.
         raise AssertionError(f"Unexpected sampling prompt: {prompt}")
 
     def decide_memory_write(self, request):
@@ -699,7 +702,40 @@ def test_streamable_sampling_round_trip_completes_over_post_sse_stream(tmp_path:
                     lines = response.iter_lines()
                     sampling_request = _next_sse_json(lines)
                     assert sampling_request["method"] == "sampling/createMessage"
-                    assert sampling_request["params"]["messages"][0]["content"]["text"].startswith(
+                    # Write-path tightening: the omitted-type plain body first
+                    # goes through OKF normalization sampling; the FIRST
+                    # sampling request is the normalizer, the SECOND is the
+                    # write decision.
+                    assert sampling_request["params"]["messages"][0]["content"]["text"].lstrip().startswith(
+                        "Normalize the note below into ONE OKF knowledge item"
+                    )
+                    normalization_response = control_client.post(
+                        "/mcp",
+                        headers={SESSION_HEADER: session_id},
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": sampling_request["id"],
+                            "result": {
+                                "role": "assistant",
+                                "content": {
+                                    "type": "text",
+                                    "text": (
+                                        '{"okf_type":"fact","title":"Gateway streaming session coherence",'
+                                        '"takeaway":"Streaming uses one coherent session.",'
+                                        '"sections":{"Details":"Streamable HTTP sampling should use one coherent session."},'
+                                        '"sources":["agent:note"]}'
+                                    ),
+                                },
+                                "model": "test-model",
+                                "stopReason": "endTurn",
+                            },
+                        },
+                    )
+                    assert normalization_response.status_code == 202
+
+                    decision_request = _next_sse_json(lines)
+                    assert decision_request["method"] == "sampling/createMessage"
+                    assert decision_request["params"]["messages"][0]["content"]["text"].startswith(
                         "You are deciding how Synapse should write a new memory draft."
                     )
 
@@ -708,7 +744,7 @@ def test_streamable_sampling_round_trip_completes_over_post_sse_stream(tmp_path:
                         headers={SESSION_HEADER: session_id},
                         json={
                             "jsonrpc": "2.0",
-                            "id": sampling_request["id"],
+                            "id": decision_request["id"],
                             "result": {
                                 "role": "assistant",
                                 "content": {
@@ -764,13 +800,44 @@ def test_streamable_sampling_round_trip_completes_over_session_event_stream(tmp_
                     lines = event_stream_response.iter_lines()
                     sampling_request = _next_sse_json(lines)
                     assert sampling_request["method"] == "sampling/createMessage"
+                    # Normalization sampling comes first (write-path tightening),
+                    # then the write decision.
+                    assert sampling_request["params"]["messages"][0]["content"]["text"].lstrip().startswith(
+                        "Normalize the note below into ONE OKF knowledge item"
+                    )
+                    normalization_response = control_client.post(
+                        "/mcp",
+                        headers={SESSION_HEADER: session_id},
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": sampling_request["id"],
+                            "result": {
+                                "role": "assistant",
+                                "content": {
+                                    "type": "text",
+                                    "text": (
+                                        '{"okf_type":"fact","title":"Gateway session streaming sampling",'
+                                        '"takeaway":"Session streams support server-driven sampling.",'
+                                        '"sections":{"Details":"Session event streams should support server-driven sampling."},'
+                                        '"sources":["agent:note"]}'
+                                    ),
+                                },
+                                "model": "test-model",
+                                "stopReason": "endTurn",
+                            },
+                        },
+                    )
+                    assert normalization_response.status_code == 202
+
+                    decision_request = _next_sse_json(lines)
+                    assert decision_request["method"] == "sampling/createMessage"
 
                     sampling_response = control_client.post(
                         "/mcp",
                         headers={SESSION_HEADER: session_id},
                         json={
                             "jsonrpc": "2.0",
-                            "id": sampling_request["id"],
+                            "id": decision_request["id"],
                             "result": {
                                 "role": "assistant",
                                 "content": {
