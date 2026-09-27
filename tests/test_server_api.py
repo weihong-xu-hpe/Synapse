@@ -1127,15 +1127,17 @@ def test_keyed_upsert_create_unchanged_update(tmp_path: Path) -> None:
     assert node_file.exists()
     assert "session_key: session-abc" in node_file.read_text(encoding="utf-8")
 
-    # Metrics recorded with session-upsert provider.
+    # Metrics recorded with session-upsert route attribution (v7 schema: the
+    # marker moved from sampling_provider to the write_memory_events.route
+    # column; sampling_provider is empty for non-decider routes).
     import sqlite3
     db = sqlite3.connect(runtime_paths.base / "synapse.db")
     rows = db.execute(
-        "SELECT sampling_provider, COUNT(*) FROM write_memory_events WHERE node_id = ? GROUP BY sampling_provider",
+        "SELECT route, COUNT(*) FROM write_memory_events WHERE node_id = ? GROUP BY route",
         (node_id,),
     ).fetchall()
     db.close()
-    assert rows == [("session-upsert", 3)]
+    assert rows == [("session_upsert", 3)]
 
 
 def test_keyed_upsert_concurrent_same_key_creates_one_node(tmp_path: Path) -> None:

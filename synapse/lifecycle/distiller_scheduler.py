@@ -105,6 +105,20 @@ class DistillerScheduler:
                 distiller.run()
             finally:
                 distiller.close()
+            # Observability snapshot piggybacks on the sweep cadence (no
+            # separate timer): today's row if missing, plus yesterday when the
+            # machine slept through a day boundary. Never breaks the sweep.
+            self._write_metrics_snapshots()
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
+
+    def _write_metrics_snapshots(self) -> None:
+        try:
+            from synapse.observability import write_missing_snapshots
+
+            written = write_missing_snapshots(self.config, self.runtime_paths)
+            if written:
+                self._logger.info("Metrics snapshots written", extra={"dates": written})
+        except Exception as exc:  # noqa: BLE001 — snapshots must never break the sweep
+            self._logger.warning("Metrics snapshot write failed", extra={"error": str(exc)})
