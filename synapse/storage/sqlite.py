@@ -123,7 +123,6 @@ class DreamerRunMetrics:
 @dataclass(slots=True, frozen=True)
 class WriteMemoryEventMetrics:
     """Persisted summary of one write_memory request."""
-
     created_at: str
     node_id: str | None
     node_type: str
@@ -133,6 +132,46 @@ class WriteMemoryEventMetrics:
     warning_codes: tuple[str, ...]
     sampling_provider: str
     execution_succeeded: bool
+
+
+@dataclass(slots=True, frozen=True)
+class DistillerRunMetrics:
+    """Persisted summary of one distiller sweep."""
+
+    started_at: str
+    completed_at: str
+    duration_ms: int
+    transcripts_scanned: int
+    transcripts_distilled: int
+    transcripts_skipped: int
+    items_extracted: int
+    items_invalid: int
+    decider_creates: int
+    decider_complements: int
+    decider_supersedes: int
+    decider_downgrades: int
+    llm_failures: int
+    archived_transcripts: int
+
+
+OKF_META_FIELDS = ("okf_type", "okf_version", "sources", "project", "distilled_hash", "distilled_at", "distilled_node_ids")
+
+
+def _okf_meta_json(metadata: Any) -> str:
+    payload = {name: getattr(metadata, name) for name in OKF_META_FIELDS}
+    if not any(payload.values()):
+        return "{}"
+    return json.dumps({k: v for k, v in payload.items() if v is not None}, ensure_ascii=False)
+
+
+def _okf_meta_from_json(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class SQLiteNodeStore:
@@ -235,6 +274,7 @@ class SQLiteNodeStore:
             "nodes_fts",
             "edges",
             "dreamer_runs",
+            "distiller_runs",
             "write_memory_events",
             "nodes_vec",
             "nodes_ai",
@@ -284,7 +324,8 @@ class SQLiteNodeStore:
                 created_at TEXT NOT NULL,
                 last_accessed TEXT NOT NULL,
                 access_count INTEGER DEFAULT 0,
-                tags TEXT DEFAULT '[]'
+                tags TEXT DEFAULT '[]',
+                okf_meta TEXT DEFAULT '{}'
             )
             """
         )
@@ -355,6 +396,28 @@ class SQLiteNodeStore:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_write_memory_events_created_at ON write_memory_events(created_at)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS distiller_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                transcripts_scanned INTEGER NOT NULL,
+                transcripts_distilled INTEGER NOT NULL,
+                transcripts_skipped INTEGER NOT NULL,
+                items_extracted INTEGER NOT NULL,
+                items_invalid INTEGER NOT NULL,
+                decider_creates INTEGER NOT NULL,
+                decider_complements INTEGER NOT NULL,
+                decider_supersedes INTEGER NOT NULL,
+                decider_downgrades INTEGER NOT NULL,
+                llm_failures INTEGER NOT NULL,
+                archived_transcripts INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_distiller_runs_started_at ON distiller_runs(started_at)")
 
     def _ensure_node_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -365,6 +428,8 @@ class SQLiteNodeStore:
             connection.execute("ALTER TABLE nodes ADD COLUMN source_mtime TEXT")
         if "sensitivity" not in columns:
             connection.execute("ALTER TABLE nodes ADD COLUMN sensitivity TEXT DEFAULT 'internal'")
+        if "okf_meta" not in columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN okf_meta TEXT DEFAULT '{}'")
 
     def _ensure_vector_table(self, connection: sqlite3.Connection) -> None:
         # sqlite-vec is intentionally not required for Phase 3. The current session
@@ -474,8 +539,8 @@ class SQLiteNodeStore:
                 """
                 INSERT INTO nodes (
                     id, title, file_path, source_mtime, content, type, status,
-                    sensitivity, supersedes, superseded_by, created_at, last_accessed, access_count, tags
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sensitivity, supersedes, superseded_by, created_at, last_accessed, access_count, tags, okf_meta
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     file_path = excluded.file_path,
@@ -489,7 +554,8 @@ class SQLiteNodeStore:
                     created_at = excluded.created_at,
                     last_accessed = excluded.last_accessed,
                     access_count = excluded.access_count,
-                    tags = excluded.tags
+                    tags = excluded.tags,
+                    okf_meta = excluded.okf_meta
                 """,
                 payload,
             )
@@ -1046,6 +1112,37 @@ class SQLiteNodeStore:
                 ),
             )
 
+    def record_distiller_run(self, metrics: DistillerRunMetrics) -> None:
+        """Persist a low-cardinality distiller sweep summary for long-term stats."""
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO distiller_runs (
+                    started_at, completed_at, duration_ms,
+                    transcripts_scanned, transcripts_distilled, transcripts_skipped,
+                    items_extracted, items_invalid,
+                    decider_creates, decider_complements, decider_supersedes, decider_downgrades,
+                    llm_failures, archived_transcripts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    metrics.started_at,
+                    metrics.completed_at,
+                    metrics.duration_ms,
+                    metrics.transcripts_scanned,
+                    metrics.transcripts_distilled,
+                    metrics.transcripts_skipped,
+                    metrics.items_extracted,
+                    metrics.items_invalid,
+                    metrics.decider_creates,
+                    metrics.decider_complements,
+                    metrics.decider_supersedes,
+                    metrics.decider_downgrades,
+                    metrics.llm_failures,
+                    metrics.archived_transcripts,
+                ),
+            )
+
     def record_write_memory_event(self, metrics: WriteMemoryEventMetrics) -> None:
         """Persist a low-cardinality write_memory summary for long-term stats."""
         with self.transaction() as connection:
@@ -1255,9 +1352,14 @@ class SQLiteNodeStore:
             _ensure_isoformat(metadata.last_accessed),
             metadata.access_count,
             json.dumps(metadata.tags),
+            _okf_meta_json(metadata),
         )
 
     def _row_to_node(self, row: sqlite3.Row) -> Node:
+        try:
+            okf_meta = _okf_meta_from_json(row["okf_meta"])
+        except (IndexError, KeyError):
+            okf_meta = {}
         metadata = NodeMetadata.model_validate(
             {
                 "id": row["id"],
@@ -1271,6 +1373,7 @@ class SQLiteNodeStore:
                 "supersedes": json.loads(row["supersedes"] or "[]"),
                 "superseded_by": row["superseded_by"],
                 "tags": json.loads(row["tags"] or "[]"),
+                **okf_meta,
             }
         )
         return Node(metadata=metadata, content=str(row["content"]), file_path=Path(str(row["file_path"])))

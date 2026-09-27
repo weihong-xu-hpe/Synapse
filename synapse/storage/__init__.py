@@ -18,6 +18,7 @@ from synapse.storage.markdown import (
 )
 from synapse.storage.sqlite import (
 	DatabaseIntegrityReport,
+	DistillerRunMetrics,
 	DreamerRunMetrics,
 	IndexedFileState,
 	RebuildProgress,
@@ -41,6 +42,7 @@ __all__ = [
 	"scan_markdown_nodes",
 	"serialize_frontmatter",
 	"DatabaseIntegrityReport",
+	"DistillerRunMetrics",
 	"DreamerRunMetrics",
 	"IndexedFileState",
 	"RebuildProgress",
