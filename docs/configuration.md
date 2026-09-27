@@ -255,6 +255,24 @@ Dreamer runs are scheduled **in-process** by `DreamerScheduler` (a daemon `threa
 
 To change the cadence, edit `interval_hours` and restart the service. To disable automatic runs entirely, set `enabled = false` (manual `dreamer run` still works).
 
+### `[distiller]`
+
+Controls the session distiller — the server-side pipeline that converts session transcript nodes into typed OKF knowledge nodes (see `docs/okf.md` for the format spec).
+
+- `enabled` (bool, default `true`) — whether the in-process sweep scheduler auto-starts when the server runs
+- `interval_minutes` (int, ≥1, default `10`) — sweep interval; short enough that macOS sleep drift is harmless
+- `idle_minutes` (int, ≥1, default `30`) — a transcript must be untouched this long before it is distilled (avoids distilling mid-pause). The idle and retention clocks both use the transcript **file mtime**: stamping (distillation write-back) and failure backoff rewrite the file and thus reset the clock.
+- `retention_days` (int, ≥1, default `45`) — transcripts distilled at their **current** content revision are archived this many days after their last content update (file mtime); **undistilled or stale-distilled transcripts are never archived**. A transcript that yielded zero knowledge items counts as distilled-current (the LLM judged nothing durable) and is archived after retention like any other.
+- `max_transcript_chars` (int, default `16000`) — prompt cap per transcript (head + tail split)
+- `max_items_per_transcript` (int, 1–20, default `5`) — bound on extracted knowledge items per transcript
+- `downgrade_supersede` (bool, default `true`) — when true, a decider `supersede` targeting an existing non-distilled persistent node is downgraded to `complement` and recorded; the live sweep runs with downgrade OFF, backfill/CLI `--apply` with it ON
+- `enforce_okf` (bool, default `false`) — rejection timeline flag: when true, fatal `okf_*` validation codes reject persistent writes instead of warning (not active in the current transition period)
+- `llm_max_tokens` (int, default `16000`) — per-call completion budget; reasoning models (e.g. glm-5.3-flash) spend thinking tokens from the same budget, so this must exceed reasoning + JSON output
+- `max_transcripts_per_run` (int, 1–50, default `5`) — sweep batch size
+- `backoff_sweeps` (int, default `3`) — sweeps a failing transcript is skipped before retry
+
+Maintenance commands: `python -m synapse distill status | run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`.
+
 ## Environment variables
 
 The project includes an `.env` file for remote inference credentials:

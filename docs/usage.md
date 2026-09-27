@@ -177,6 +177,38 @@ Lifecycle maintenance — stale orphan eviction, superseded archival, disputed r
 
 Superseded archival resolves the `superseded_by` chain to its terminal node: a node is archived when the terminal is ACTIVE with a file on disk, when the terminal is missing from the index (already archived or deleted), or when `superseded_by` is missing entirely. Nodes whose terminal is DISPUTED (live disagreement) or whose chain is cyclic are kept.
 
+## OKF knowledge format & the session distiller
+
+Knowledge nodes follow **OKF** (see `docs/okf.md` for the authoritative spec): typed templates
+(`decision` / `fact` / `procedure` / `pitfall`) with fixed English `##` section headings, a one-line
+`## Takeaway`, and a `## Sources` provenance section. Body content may be Chinese, English, or mixed.
+Every OKF node carries `okf_type`, `okf_version`, and `sources` frontmatter.
+
+The **session distiller** converts session transcript nodes into OKF knowledge automatically:
+
+- a sweep runs every `distiller.interval_minutes` (default 10) when `[distiller] enabled = true`,
+  selecting idle transcripts (`idle_minutes`, default 30) whose content changed since last distillation;
+- **both the idle clock and the retention clock use the transcript file's mtime** — stamping
+  (`distilled_hash` write-back) and failure backoff rewrite the file, so they reset the clock;
+  this is intentional: a stamp means "this transcript was just processed", and retention counts
+  from the last real content update;
+- extracted items are written through the normal `write_memory` decider path as `persistent` nodes
+  with provenance (`sources` + backlink on the transcript's `distilled_node_ids`);
+- fully-distilled transcripts are excluded from default search (`include=all` restores them) and
+  archived after `distiller.retention_days` (default 45) — **never before they are distilled**;
+- distilled items can complement existing knowledge but never supersede curated nodes by default
+  in backfill mode (`downgrade_supersede`).
+
+Maintenance commands:
+
+```bash
+python -m synapse distill status                  # queue depth + recent run metrics
+python -m synapse distill run --dry-run           # plan only, no writes
+python -m synapse distill run --apply --limit 5   # sweep up to 5 transcripts
+python -m synapse distill run --id <node-id>      # distill one transcript
+python -m synapse distill run --legacy-groups groups.json --report out.json   # backfill mode
+```
+
 ## Maintenance commands
 
 Archive duplicate/stale session summaries (`Session summary — %` titles): exact duplicates keep the newest copy, prefix-subsumed older versions are archived, and stale superseded nodes are cleaned up. Dry-run by default:

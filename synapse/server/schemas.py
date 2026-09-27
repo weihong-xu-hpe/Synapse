@@ -46,6 +46,10 @@ class WriteMemoryRequest(BaseModel):
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
     query_hint: str | None = None
     similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    okf_type: str | None = None
+    okf_version: int | None = None
+    sources: list[str] | None = None
+    project: str | None = None
 
 
 class RunDreamerRequest(BaseModel):
@@ -74,6 +78,7 @@ class SearchMemoryToolRequest(BaseModel):
 
     query: str = Field(min_length=1)
     top_k: int = Field(default=3, ge=1, le=25)
+    include: str = Field(default="default", pattern="^(default|transcripts|all)$")
 
 
 class GetNodeToolRequest(BaseModel):

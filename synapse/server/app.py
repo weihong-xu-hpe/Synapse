@@ -398,6 +398,10 @@ def _create_rest_write_handler(service: SynapseServerService):
             body.get("sensitivity", "internal"),
             body.get("query_hint"),
             float(body.get("similarity_threshold", 0.3)),
+            body.get("okf_type"),
+            body.get("okf_version"),
+            body.get("sources"),
+            body.get("project"),
         )
         return JSONResponse(status_code=200, content=result)
 
