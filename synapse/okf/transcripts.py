@@ -17,11 +17,14 @@ Predicates (design decision A1):
 from __future__ import annotations
 
 import hashlib
+import re
 
 from synapse.models import Node, NodeType
 
 SESSION_ID_PREFIX = "mem_session_"
 LEGACY_TITLE_PREFIX = "Session summary"
+# Legacy session-summary node ids: mem_<YYYYMMDD>_session_summary_*
+LEGACY_ID_PATTERN = re.compile(r"^mem_\d{8}_session_summary_.+$")
 
 
 def content_sha256(content: str) -> str:

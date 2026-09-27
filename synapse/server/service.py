@@ -1115,11 +1115,21 @@ class SynapseServerService:
 
     @staticmethod
     def _has_distiller_provenance(node: Node) -> bool:
-        from synapse.okf.transcripts import SESSION_ID_PREFIX, LEGACY_TITLE_PREFIX
+        """True when the node's sources point at session transcripts.
+
+        Matches the shared transcript id patterns — keyed ``mem_session_*``,
+        legacy ``mem_<date>_session_summary_*`` — regardless of whether the
+        transcript still exists on disk (it may already be archived), plus
+        ``session:<key>`` references emitted by the distiller prompt.
+        """
+
+        from synapse.okf.transcripts import SESSION_ID_PREFIX, LEGACY_ID_PATTERN
 
         for source in node.metadata.sources:
             source_id = source.strip()
-            if source_id.startswith(SESSION_ID_PREFIX) or source_id.startswith(LEGACY_TITLE_PREFIX):
+            if source_id.startswith(SESSION_ID_PREFIX):
+                return True
+            if LEGACY_ID_PATTERN.match(source_id):
                 return True
             # "session:<key>" style references emitted by the distiller prompt.
             if source_id.casefold().startswith("session:"):

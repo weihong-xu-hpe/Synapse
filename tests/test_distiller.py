@@ -1309,3 +1309,115 @@ def test_distiller_title_repair_success_and_failure(tmp_path: Path) -> None:
         assert re.fullmatch(r"mem_\d{8}_pitfall_[0-9a-f]{8}", knowledge_id), knowledge_id
     finally:
         distiller2.close()
+
+
+# ---------------------------------------------------------------------------
+# Provenance fix: legacy-transcript sources mark distiller-produced nodes
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_transcript_source_is_distiller_provenance(tmp_path: Path) -> None:
+    """A node whose sources point at a LEGACY transcript (archived or not) is
+    distiller-produced: supersede allowed, not downgraded."""
+
+    runtime_paths = _runtime(tmp_path)
+    from tests.test_server_api import FakeSamplingClient
+
+    service = SynapseServerService(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=FakeSamplingClient())
+    try:
+        # Sources point at a legacy transcript that does NOT exist on disk
+        # (archived) — provenance must not depend on the transcript existing.
+        distilled = service.write_memory(
+            title="Distilled from legacy transcript",
+            content="## Takeaway\nt\n\n## Details\nd\n\n## Sources\n- x",
+            node_type="persistent",
+            okf_type="fact",
+            okf_version=1,
+            sources=["mem_20260817_session_summary_authz_29"],
+        )
+        distilled_id = distilled["execution"]["result"]["node"]["id"]
+
+        curated = service.write_memory(
+            title="Curated non-distiller node",
+            content="## Takeaway\nt\n\n## Details\nd\n\n## Sources\n- x",
+            node_type="persistent",
+            okf_type="fact",
+            okf_version=1,
+            sources=["https://example.com/spec"],
+        )
+        curated_id = curated["execution"]["result"]["node"]["id"]
+
+        # Legacy-transcript source → distiller-produced → supersede allowed.
+        assert service._curated_supersede_targets([distilled_id]) == []
+        # URL source → curated → protected.
+        assert service._curated_supersede_targets([curated_id]) == [curated_id]
+    finally:
+        service._store().close() if hasattr(service, "_store") else None
+
+
+def test_supersede_of_legacy_sourced_node_not_downgraded(tmp_path: Path) -> None:
+    """End-to-end: distiller supersedes a node with legacy-transcript provenance
+    (transcript archived) — the write succeeds as supersede, no downgrade."""
+
+    runtime_paths = _runtime(tmp_path)
+
+    class SupersedeLegacyClient:
+        name = "fake-supersede-legacy"
+
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+            item = dict(_PITFALL_ITEM)
+            item["title"] = "Legacy-sourced knowledge"
+            return {"items": [item]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            if request.candidates:
+                return MemoryWriteSamplingDecision(
+                    action="supersede",
+                    target_node_ids=(request.candidates[0].node_id,),
+                    reasoning="newer distillation of the same legacy transcript",
+                    confidence=0.9,
+                )
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    service = SynapseServerService(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=SupersedeLegacyClient())
+    # Pre-existing distilled node with legacy-transcript provenance.
+    existing = service.integrate_knowledge(
+        title="Legacy-sourced knowledge",
+        content="## Takeaway\nold version\n\n## Details\nold\n\n## Sources\n- mem_20260817_session_summary_authz_29",
+        node_type="persistent",
+        okf_type="fact",
+        okf_version=1,
+        sources=["mem_20260817_session_summary_authz_29"],
+        action="create",
+    )
+    existing_id = existing["node"]["id"]
+
+    # Distiller write with downgrade ON — must supersede, not downgrade.
+    from synapse.okf import OkfItem
+
+    item = OkfItem(
+        okf_type="pitfall",
+        title="Legacy-sourced knowledge",
+        takeaway="newer version",
+        sections={"Symptom": "s", "Cause": "c", "Fix": "f"},
+        sources=["mem_20260817_session_summary_authz_29"],
+    )
+    result = service.write_memory(
+        title=item.title,
+        content=item.render(),
+        node_type="persistent",
+        okf_type=item.okf_type,
+        okf_version=1,
+        sources=[existing_id],
+        downgrade_supersede=True,
+    )
+    assert result["decision"]["action"] == "supersede", "distilled-vs-distilled supersede must be allowed"
+    assert "downgrade" not in result
+
+    from synapse.storage import read_node_file
+
+    superseded = read_node_file(runtime_paths.active / f"{existing_id}.md")
+    assert superseded.metadata.status is NodeStatus.SUPERSEDED
+    service._store().close() if hasattr(service, "_store") else None
