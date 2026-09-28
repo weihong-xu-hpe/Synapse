@@ -32,6 +32,9 @@ base_url = "http://127.0.0.1:47861"
 embedding_base_url = "http://127.0.0.1:47860"
 embedding_endpoint = "/v1/embeddings"
 rerank_endpoint = "/v1/rerank"
+# Exact token counting for request budgeting (llama.cpp POST /tokenize).
+# Empty string disables it and falls back to conservative character estimates.
+tokenize_endpoint = "/tokenize"
 api_key_env = ""
 headers = {}
 request_timeout_seconds = 30

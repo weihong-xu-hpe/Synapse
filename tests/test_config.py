@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from synapse.config import load_config
+import pytest
+from pydantic import ValidationError
+
+from synapse.config import RerankerSettings, SynapseConfig, load_config
 from synapse.utils.runtime import bootstrap_runtime_directories
 
 
@@ -155,6 +158,52 @@ request_timeout_seconds = 15
     assert config.providers.remote_api.headers["X-Tenant"] == "dev"
     assert config.providers.remote_api.headers["Authorization"] == "Bearer {api_key}"
     assert config.providers.remote_api.request_timeout_seconds == 15
+
+
+def test_load_config_parses_tokenize_endpoint(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[providers.remote_api]
+base_url = "https://models.example.com"
+tokenize_endpoint = ""
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    assert config.providers.remote_api.tokenize_endpoint == ""
+
+    config = SynapseConfig()
+    assert config.providers.remote_api.tokenize_endpoint == "/tokenize"
+
+
+def test_reranker_max_doc_tokens_leaves_query_room() -> None:
+    # Default fits comfortably.
+    settings = RerankerSettings()
+    assert settings.max_doc_tokens == 2048
+
+    # Context 8192 minus pair margin: anything beyond context-24 is rejected.
+    with pytest.raises(ValidationError) as exc_info:
+        RerankerSettings(model="bge-reranker-v2-m3", max_doc_tokens=8192)
+    assert "no room for a query" in str(exc_info.value)
+
+    # The largest valid value is accepted.
+    RerankerSettings(model="bge-reranker-v2-m3", max_doc_tokens=8192 - 24)
+
+
+def test_load_config_rejects_oversize_max_doc_tokens(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[reranker]
+max_doc_tokens = 9000
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError):
+        load_config(config_path)
 
 
 def test_load_config_parses_decider_block(tmp_path: Path) -> None:

@@ -29,6 +29,22 @@ DEFAULT_EMBEDDING_DIMENSIONS: dict[str, int] = {
     "gemma-300m": 1024,
 }
 
+# Model context sizes for the supported reranker models; single source of
+# truth for reranker context windows (the engine specs derive from it).
+RERANKER_MODEL_CONTEXT_TOKENS: dict[str, int] = {
+    "bge-reranker-v2-m3": 8192,
+    "qllama/bge-reranker-v2-m3": 8192,
+    "jina-reranker-v2": 8192,
+}
+
+# Special tokens a rerank (query, document) pair adds when the server packs
+# both texts into one sequence. Single definition: the engine layer budgets
+# each rerank request with the same margin.
+RERANKER_PAIR_SPECIAL_TOKEN_MARGIN: int = 8
+# Smallest query that must still fit in the context alongside a
+# max_doc_tokens-truncated document (pair margin + usable query room).
+RERANKER_MIN_QUERY_TOKENS: int = 16
+
 
 class ServerSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -48,11 +64,16 @@ class MemorySettings(BaseModel):
 
 class RemoteAPIProviderSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
     base_url: str = "https://api.example.com"
     embedding_base_url: str = ""  # if set, overrides base_url for embedding requests
     embedding_endpoint: str = "/v1/embeddings"
     rerank_endpoint: str = "/v1/rerank"
+    # llama.cpp-style token-count endpoint used for exact request budgeting
+    # (POST {"content": ...} -> {"tokens": [...]}). Tokenization is shared by
+    # both engines; the embedding engine calls it on embedding_base_url and the
+    # reranker on base_url. Set to "" to disable exact counting and fall back
+    # to conservative character-based token estimates.
+    tokenize_endpoint: str = "/tokenize"
     api_key_env: str = ""
     headers: dict[str, str] = Field(default_factory=dict)
     request_timeout_seconds: int = Field(default=30, ge=1)
@@ -85,10 +106,28 @@ class RerankerSettings(BaseModel):
     provider: InferenceProvider = "remote_api"
     model: RerankerModel = "bge-reranker-v2-m3"
     max_candidates: int = Field(default=9, ge=1)
-    # Per-document truncation for rerank requests: long documents dominate
-    # rerank latency (~0.13 ms/token) with measured no top-3 quality loss.
-    max_doc_tokens: int = Field(default=512, ge=1)
+    # Per-document truncation for rerank requests, in REAL tokens (measured via
+    # the provider's tokenize endpoint when available, conservative estimate
+    # otherwise). Rerank latency scales with the total candidate tokens sent.
+    # Must leave room for the query in the model context: at most
+    # (model context - pair margin - minimum usable query tokens).
+    max_doc_tokens: int = Field(default=2048, ge=1)
     timeout_seconds: int = Field(default=30, ge=1)
+
+    @model_validator(mode="after")
+    def validate_query_room(self) -> "RerankerSettings":
+        spec_max = RERANKER_MODEL_CONTEXT_TOKENS.get(self.model)
+        max_allowed = (
+            spec_max - RERANKER_PAIR_SPECIAL_TOKEN_MARGIN - RERANKER_MIN_QUERY_TOKENS
+            if spec_max is not None
+            else None
+        )
+        if max_allowed is not None and self.max_doc_tokens > max_allowed:
+            raise ValueError(
+                f"reranker.max_doc_tokens={self.max_doc_tokens} leaves no room for a query "
+                f"in the {self.model} context ({spec_max} tokens); use at most {max_allowed}"
+            )
+        return self
 
 
 class RetrievalSettings(BaseModel):

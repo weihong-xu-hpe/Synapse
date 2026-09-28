@@ -43,7 +43,7 @@ timeout_seconds = 30
 provider = "remote_api"
 model = "bge-reranker-v2-m3"
 max_candidates = 9
-max_doc_tokens = 512
+max_doc_tokens = 2048
 timeout_seconds = 30
 
 # Both embedding and reranking use [providers.remote_api].
@@ -53,6 +53,7 @@ base_url = "http://127.0.0.1:47861"
 embedding_base_url = "http://127.0.0.1:47860"
 embedding_endpoint = "/v1/embeddings"
 rerank_endpoint = "/v1/rerank"
+tokenize_endpoint = "/tokenize"
 api_key_env = ""
 headers = {}
 request_timeout_seconds = 30
@@ -171,7 +172,7 @@ Controls reranking.
 - `model`
 - `max_candidates`
 - `timeout_seconds`
-- `max_doc_tokens` — per-document truncation for rerank requests (default 512). Rerank latency scales with total candidate tokens; the first few hundred tokens carry the ranking signal.
+- `max_doc_tokens` — per-document truncation for rerank requests, in **real tokens** (default 2048). Token counts come from the provider's `tokenize_endpoint` when available; a conservative character-based estimate is used otherwise. Rerank latency scales with total candidate tokens; the first few hundred tokens carry the ranking signal. Must leave room for the query in the model context (at most context size − pair margin − minimum query tokens; validated at load).
 
 ### `[providers.remote_api]`
 
@@ -181,6 +182,7 @@ Settings for any OpenAI-compatible HTTP inference server (llama.cpp, hosted APIs
 - `embedding_base_url` — optional override for embedding server; uses `base_url` if not set
 - `embedding_endpoint`
 - `rerank_endpoint`
+- `tokenize_endpoint` — token-count endpoint used for exact request budgeting (llama.cpp `POST /tokenize`; default `/tokenize`). The embedding engine tokenizes against `embedding_base_url`, the reranker against `base_url`. Set to `""` to disable exact counting; budgets then use a conservative estimate (1 token per CJK character + 2 characters per other token) that never under-counts real token usage
 - `api_key_env` — env var name holding the bearer token; leave blank for local servers
 - `headers` — additional static headers
 - `request_timeout_seconds`

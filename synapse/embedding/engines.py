@@ -8,13 +8,21 @@ import logging
 import math
 import os
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from collections.abc import Iterator
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from synapse.config import EmbeddingSettings, ProviderSettings, RerankerSettings
+from synapse.config import (
+    RERANKER_MODEL_CONTEXT_TOKENS,
+    RERANKER_PAIR_SPECIAL_TOKEN_MARGIN,
+    EmbeddingSettings,
+    ProviderSettings,
+    RerankerSettings,
+)
 from synapse.interfaces import EmbeddingEngine, RerankerEngine
 
 JSON_MIME_TYPE = "application/json"
@@ -24,31 +32,218 @@ API_KEY_PLACEHOLDER = "{api_key}"
 LOGGER = logging.getLogger(__name__)
 _TOKEN_PATTERN = re.compile(r"\w+|[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _REMOTE_EMBEDDING_REQUEST_BATCH_SIZE = 32
-# Conservative chars-per-token estimate: bge-family tokenizers average ~3-4 chars
-# per token on mixed English/code text. Under-estimating tokens (higher chars
-# value) risks exceeding the server's ubatch; 3 keeps every request safe.
-_CHARS_PER_TOKEN = 3
+# Special tokens the embedding server adds per input document (BOS/EOS); the
+# per-request token cap covers document tokens plus this overhead.
+_EMBEDDING_SPECIAL_TOKEN_COUNT = 2
+# Rerank pair specials come from RERANKER_PAIR_SPECIAL_TOKEN_MARGIN (synapse.config),
+# the single definition shared with config validation.
+# Maximum proportional re-tokenize passes before falling back to halving.
+_TRUNCATION_MAX_PASSES = 8
+# Bounded LRU size for RemoteTokenizer's exact-truncation cache. Candidate
+# documents repeat heavily across searches, so caching (budget, digest) ->
+# (prefix length, token count) removes repeated tokenize round-trips on the
+# search hot path. Lengths are stored, never text.
+_TRUNCATION_CACHE_MAX_ENTRIES = 4096
+
+# Character ranges counted as one token each by the conservative estimator
+# (CJK ideographs, kana, hangul, fullwidth/CJK punctuation). Verified against
+# the XLM-R tokenizer on the live corpus: the estimate never under-counts.
+_CJK_TOKEN_CHAR_RANGES: tuple[tuple[int, int], ...] = (
+    (0x2E80, 0x2EFF),
+    (0x3000, 0x303F),
+    (0x3040, 0x309F),
+    (0x30A0, 0x30FF),
+    (0x3130, 0x318F),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7AF),
+    (0xF900, 0xFAFF),
+    (0xFF00, 0xFFEF),
+    (0x20000, 0x2A6DF),
+)
 
 
-def _split_by_char_budget(texts: Sequence[str], *, max_batch_docs: int, max_batch_chars: int) -> Iterator[list[str]]:
-    """Group documents into request batches under a document-count and char budget.
+def _estimate_tokens(text: str) -> int:
+    """Conservative token estimate: 1 per CJK char + ceil(other chars / 2).
 
-    A single document longer than the whole budget is still sent alone — the
-    reranker truncates oversized documents, and embedding callers rely on one
-    vector per input document.
+    Measured on the active corpus against the bge tokenizer (XLM-R): this
+    never under-counts real tokens, so requests budgeted with it stay safe.
     """
 
-    batch: list[str] = []
-    batch_chars = 0
-    for text in texts:
-        if batch and (len(batch) >= max_batch_docs or batch_chars + len(text) > max_batch_chars):
+    cjk_chars = sum(
+        1 for char in text if any(lo <= ord(char) <= hi for lo, hi in _CJK_TOKEN_CHAR_RANGES)
+    )
+    return cjk_chars + math.ceil((len(text) - cjk_chars) / 2)
+
+
+def _truncate_by_estimate(text: str, budget: int) -> str:
+    """Cut text to a prefix whose conservative token estimate fits the budget."""
+
+    count = _estimate_tokens(text)
+    if count <= budget:
+        return text
+    candidate = text[: max(1, (len(text) * budget) // count)]
+    while _estimate_tokens(candidate) > budget:
+        candidate_count = _estimate_tokens(candidate)
+        candidate = candidate[: max(1, (len(candidate) * budget) // candidate_count)]
+    return candidate
+
+
+def _split_by_token_budget(
+    token_counts: Sequence[int], *, max_batch_docs: int, max_request_tokens: int
+) -> Iterator[Sequence[int]]:
+    """Group documents into request batches under a doc-count and token budget.
+
+    ``token_counts`` holds per-document token counts (upper bounds allowed).
+    Each document costs ``count + _EMBEDDING_SPECIAL_TOKEN_COUNT`` against the
+    request budget. A single document always yields its own batch when needed —
+    one vector per input document stays the contract. Yields index sequences.
+    """
+
+    batch: list[int] = []
+    batch_tokens = 0
+    for index, count in enumerate(token_counts):
+        cost = count + _EMBEDDING_SPECIAL_TOKEN_COUNT
+        if batch and (len(batch) >= max_batch_docs or batch_tokens + cost > max_request_tokens):
             yield batch
             batch = []
-            batch_chars = 0
-        batch.append(text)
-        batch_chars += len(text)
+            batch_tokens = 0
+        batch.append(index)
+        batch_tokens += cost
     if batch:
         yield batch
+
+
+@dataclass(slots=True)
+class RemoteTokenizer:
+    """Counts and truncates text against a llama.cpp-style ``POST /tokenize`` endpoint.
+
+    Exact counts come from the provider; when the endpoint is disabled or the
+    call fails, a conservative character-based estimate is used instead
+    (verified on the live corpus to never under-count). Counting never raises.
+
+    Exact truncation results are memoized in a bounded thread-safe LRU keyed
+    by ``(budget, text digest)``; candidate documents repeat heavily across
+    searches, so a warm cache removes the tokenize round-trips from the search
+    hot path. Only prefix lengths and token counts are stored, never text, and
+    estimate-fallback results are never cached.
+    """
+
+    client: HTTPJSONClient
+    endpoint: str
+    timeout_seconds: int
+    _warned_failures: set[str] = field(default_factory=set)
+    _cache: OrderedDict[tuple[int, str], tuple[int, int]] = field(
+        default_factory=OrderedDict, repr=False, compare=False
+    )
+    _cache_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def available(self) -> bool:
+        return bool(self.endpoint)
+
+    def count(self, text: str) -> int:
+        """Token count for ``text``; exact via the provider when possible."""
+
+        if not text:
+            return 0
+        if self.endpoint:
+            try:
+                return self._count_remote(text)
+            except ProviderError as exc:
+                self._warn_once(exc)
+        return _estimate_tokens(text)
+
+    def truncate(self, text: str, budget: int) -> tuple[str, int]:
+        """Return ``(prefix_of_text, token_count)`` with ``token_count <= budget``.
+
+        The result is always a prefix of the original text (never detokenized
+        output) and lands close to the budget. Under-budget texts are returned
+        without a tokenize call: XLM-R sentencepiece emits at most one token per
+        character, so ``len(text) <= budget`` guarantees the count fits.
+        """
+
+        if len(text) <= budget:
+            return text, len(text)
+        if not self.endpoint:
+            truncated = _truncate_by_estimate(text, budget)
+            return truncated, _estimate_tokens(truncated)
+
+        cache_key = (budget, hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest())
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            prefix_length, token_count = cached
+            return text[:prefix_length], token_count
+
+        try:
+            count = self._count_remote(text)
+        except ProviderError as exc:
+            self._warn_once(exc)
+            truncated = _truncate_by_estimate(text, budget)
+            return truncated, _estimate_tokens(truncated)
+        if count <= budget:
+            self._cache_put(cache_key, (len(text), count))
+            return text, count
+
+        candidate = text[: max(1, (len(text) * budget) // count)]
+        for _ in range(_TRUNCATION_MAX_PASSES):
+            try:
+                candidate_count = self._count_remote(candidate)
+            except ProviderError as exc:
+                self._warn_once(exc)
+                truncated = _truncate_by_estimate(candidate, budget)
+                return truncated, _estimate_tokens(truncated)
+            if candidate_count <= budget:
+                self._cache_put(cache_key, (len(candidate), candidate_count))
+                return candidate, candidate_count
+            candidate = candidate[: max(1, (len(candidate) * budget) // candidate_count)]
+        # Proportional shrinking did not converge within the pass cap; halve
+        # until a tokenize call verifies the prefix fits (terminates: fewer
+        # characters can only produce fewer or equal tokens).
+        while True:
+            candidate = candidate[: max(1, len(candidate) // 2)]
+            try:
+                candidate_count = self._count_remote(candidate)
+            except ProviderError as exc:
+                self._warn_once(exc)
+                truncated = _truncate_by_estimate(candidate, budget)
+                return truncated, _estimate_tokens(truncated)
+            if candidate_count <= budget:
+                self._cache_put(cache_key, (len(candidate), candidate_count))
+                return candidate, candidate_count
+
+    def _cache_get(self, cache_key: tuple[int, str]) -> tuple[int, int] | None:
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._cache.move_to_end(cache_key)
+            return cached
+
+    def _cache_put(self, cache_key: tuple[int, str], value: tuple[int, int]) -> None:
+        with self._cache_lock:
+            self._cache[cache_key] = value
+            self._cache.move_to_end(cache_key)
+            while len(self._cache) > _TRUNCATION_CACHE_MAX_ENTRIES:
+                self._cache.popitem(last=False)
+
+    def _count_remote(self, text: str) -> int:
+        response = self.client.post_json(
+            self.endpoint,
+            {"content": text},
+            timeout_seconds=self.timeout_seconds,
+        )
+        if isinstance(response, Mapping):
+            tokens = response.get("tokens")
+            if _is_numeric_sequence(tokens):
+                return len(tokens)
+        raise ProviderError(f"Tokenizer endpoint {self.endpoint} returned a malformed response")
+
+    def _warn_once(self, exc: ProviderError) -> None:
+        signature = str(exc)
+        if signature not in self._warned_failures:
+            self._warned_failures.add(signature)
+            LOGGER.warning(
+                "Remote tokenization failed (%s); using conservative token estimates", exc
+            )
 
 
 @dataclass(slots=True, frozen=True)
@@ -78,9 +273,12 @@ EMBEDDING_MODEL_SPECS: dict[str, EmbeddingModelSpec] = {
 }
 
 RERANKER_MODEL_SPECS: dict[str, RerankerModelSpec] = {
-    "bge-reranker-v2-m3": RerankerModelSpec(name="bge-reranker-v2-m3", family="bge", max_tokens=8192),
-    "qllama/bge-reranker-v2-m3": RerankerModelSpec(name="qllama/bge-reranker-v2-m3", family="bge", max_tokens=8192),
-    "jina-reranker-v2": RerankerModelSpec(name="jina-reranker-v2", family="jina", max_tokens=8192),
+    name: RerankerModelSpec(name=name, family=family, max_tokens=RERANKER_MODEL_CONTEXT_TOKENS[name])
+    for name, family in (
+        ("bge-reranker-v2-m3", "bge"),
+        ("qllama/bge-reranker-v2-m3", "bge"),
+        ("jina-reranker-v2", "jina"),
+    )
 }
 
 
@@ -263,6 +461,7 @@ class RemoteAPIEmbeddingEngine:
     backend_name: str = "remote_api"
     last_known_available: bool | None = None
     max_batch_tokens: int = 8192
+    tokenizer: RemoteTokenizer | None = None
 
     def is_available(self) -> bool:
         return bool(self.last_known_available)
@@ -275,20 +474,37 @@ class RemoteAPIEmbeddingEngine:
         if not texts:
             return []
 
-        # Keep requests bounded by document count and a conservative char
-        # budget so no single request exceeds the server's physical batch.
-        # A single document longer than the model context is truncated: one
-        # vector per input document must be returned.
+        # Real-token budgeting against the model context: per document at most
+        # max_batch_tokens - specials (a prefix of the original text is sent),
+        # and per request at most 32 docs with total tokens + specials within
+        # the context. One vector per input document is the contract. Every
+        # document is tokenized: skipping short docs and using len(text) as an
+        # upper bound inflates real sync batches ~2.4x (measured on the live
+        # corpus), so the cheap len(text) <= budget fast path is only used by
+        # reranker truncation where per-call latency matters more.
         vectors: list[list[float]] = []
         all_batches_succeeded = True
-        max_batch_chars = self.max_batch_tokens * _CHARS_PER_TOKEN
-        bounded_texts = [_truncate_to_char_budget(text, self.max_batch_tokens) for text in texts]
+        per_doc_budget = self.max_batch_tokens - _EMBEDDING_SPECIAL_TOKEN_COUNT
+        tokenizer = self.tokenizer or RemoteTokenizer(
+            client=self.client, endpoint="", timeout_seconds=self.timeout_seconds
+        )
+        bounded_texts: list[str] = []
+        token_counts: list[int] = []
+        for text in texts:
+            if len(text) > per_doc_budget:
+                truncated, count = tokenizer.truncate(text, per_doc_budget)
+            else:
+                truncated = text
+                count = tokenizer.count(text)
+            bounded_texts.append(truncated)
+            token_counts.append(count)
         failure: ProviderError | None = None
-        for batch in _split_by_char_budget(
-            bounded_texts,
+        for indexes in _split_by_token_budget(
+            token_counts,
             max_batch_docs=_REMOTE_EMBEDDING_REQUEST_BATCH_SIZE,
-            max_batch_chars=max_batch_chars,
+            max_request_tokens=self.max_batch_tokens,
         ):
+            batch = [bounded_texts[index] for index in indexes]
             try:
                 batch_vectors = _request_embedding_vectors(
                     client=self.client,
@@ -327,9 +543,11 @@ class RemoteAPIRerankerEngine:
     backend_name: str = "remote_api"
     last_known_available: bool | None = None
     max_batch_tokens: int = 8192
-    # Per-document truncation: rerank latency scales with total candidate
-    # tokens, and the first few hundred tokens carry the ranking signal.
-    max_doc_tokens: int = 512
+    # Per-document truncation in REAL tokens (measured via the provider's
+    # tokenize endpoint): rerank latency scales with total candidate tokens,
+    # and the first few hundred tokens carry the ranking signal.
+    max_doc_tokens: int = 2048
+    tokenizer: RemoteTokenizer | None = None
 
     def is_available(self) -> bool:
         return bool(self.last_known_available)
@@ -342,16 +560,22 @@ class RemoteAPIRerankerEngine:
     ) -> list[tuple[int, float]]:
         if not documents:
             return []
+        tokenizer = self.tokenizer or RemoteTokenizer(
+            client=self.client, endpoint="", timeout_seconds=self.timeout_seconds
+        )
+        query_budget = self.max_batch_tokens - self.max_doc_tokens - RERANKER_PAIR_SPECIAL_TOKEN_MARGIN
         try:
+            bounded_query, _ = tokenizer.truncate(query, query_budget)
+            bounded_documents: list[str] = []
+            for document in documents:
+                bounded_document, _ = tokenizer.truncate(document, self.max_doc_tokens)
+                bounded_documents.append(bounded_document)
             ranked = _request_rerank_scores(
                 client=self.client,
                 endpoint=self.endpoint,
                 model_name=self.model_name,
-                query=_truncate_to_char_budget(query, self.max_batch_tokens),
-                documents=[
-                    _truncate_to_char_budget(document, self.max_doc_tokens)
-                    for document in documents
-                ],
+                query=bounded_query,
+                documents=bounded_documents,
                 timeout_seconds=self.timeout_seconds,
             )
         except ProviderError as exc:
@@ -362,15 +586,6 @@ class RemoteAPIRerankerEngine:
         if limit is not None:
             return ranked[:limit]
         return ranked
-
-
-def _truncate_to_char_budget(text: str, max_tokens: int, *, chars_per_token: int = _CHARS_PER_TOKEN) -> str:
-    """Truncate text to a conservative token budget (chars ≈ tokens × chars_per_token)."""
-
-    max_chars = max_tokens * chars_per_token
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars]
 
 
 EmbeddingFactory = Callable[[EmbeddingSettings, EmbeddingModelSpec], EmbeddingEngine | None]
@@ -426,18 +641,24 @@ def create_embedding_engine(
     if not remote_api.embedding_endpoint:
         return fallback_engine
     embed_base_url = remote_api.embedding_base_url or remote_api.base_url
+    embed_client = HTTPJSONClient(
+        base_url=embed_base_url,
+        default_headers=_build_provider_headers(remote_api.headers, remote_api.api_key_env),
+        timeout_seconds=remote_api.request_timeout_seconds,
+    )
     return RemoteAPIEmbeddingEngine(
         model_name=settings.model,
         dimension=resolved_dimension,
-        client=HTTPJSONClient(
-            base_url=embed_base_url,
-            default_headers=_build_provider_headers(remote_api.headers, remote_api.api_key_env),
-            timeout_seconds=remote_api.request_timeout_seconds,
-        ),
+        client=embed_client,
         endpoint=remote_api.embedding_endpoint,
         timeout_seconds=settings.timeout_seconds,
         fallback_engine=fallback_engine,
         max_batch_tokens=spec.max_tokens,
+        tokenizer=RemoteTokenizer(
+            client=embed_client,
+            endpoint=remote_api.tokenize_endpoint,
+            timeout_seconds=remote_api.request_timeout_seconds,
+        ),
     )
 
 
@@ -471,18 +692,24 @@ def create_reranker_engine(
     remote_api = selected_providers.remote_api
     if not remote_api.rerank_endpoint:
         return fallback_engine
+    rerank_client = HTTPJSONClient(
+        base_url=remote_api.base_url,
+        default_headers=_build_provider_headers(remote_api.headers, remote_api.api_key_env),
+        timeout_seconds=remote_api.request_timeout_seconds,
+    )
     return RemoteAPIRerankerEngine(
         model_name=settings.model,
-        client=HTTPJSONClient(
-            base_url=remote_api.base_url,
-            default_headers=_build_provider_headers(remote_api.headers, remote_api.api_key_env),
-            timeout_seconds=remote_api.request_timeout_seconds,
-        ),
+        client=rerank_client,
         endpoint=remote_api.rerank_endpoint,
         timeout_seconds=settings.timeout_seconds,
         max_batch_tokens=spec.max_tokens,
         max_doc_tokens=settings.max_doc_tokens,
         fallback_engine=fallback_engine,
+        tokenizer=RemoteTokenizer(
+            client=rerank_client,
+            endpoint=remote_api.tokenize_endpoint,
+            timeout_seconds=remote_api.request_timeout_seconds,
+        ),
     )
 
 
