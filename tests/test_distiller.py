@@ -1688,3 +1688,109 @@ def test_incremental_distillation_only_processes_new_turns(tmp_path: Path) -> No
         assert report3.transcripts_scanned == 0
     finally:
         distiller.close()
+
+
+# ---------------------------------------------------------------------------
+# P2+: evidence verification (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_evidence_accepts_verbatim_and_rejects_paraphrase() -> None:
+    from synapse.okf import EvidenceEntry, verify_evidence
+
+    turns = {
+        "T1": "We decided to use kafka offsets for resume.",
+        "T2": "call: grep -rn offsets\nresult [ok]: src/main.py:1 uses offsets",
+    }
+    verified, unverified = verify_evidence(
+        [
+            EvidenceEntry(turn="T1", quote="use kafka offsets"),
+            EvidenceEntry(turn="T1", quote="  use  KAFKA\noffsets "),  # case/whitespace collapse
+            EvidenceEntry(turn="T2", quote="result [ok]: src/main.py:1 uses offsets"),
+            EvidenceEntry(turn="T1", quote="paraphrased claim not present"),
+            EvidenceEntry(turn="T9", quote="kafka"),
+        ],
+        turns=turns,
+    )
+    assert [e.turn for e in verified] == ["T1", "T1", "T2"]
+    assert [(e.turn, e.quote[:20]) for e in unverified] == [("T1", "paraphrased claim no"), ("T9", "kafka")]
+
+
+def test_distiller_stamps_verified_frontmatter_and_evidence_section(tmp_path: Path) -> None:
+    """Items with verifiable quotes get verified: true + ## Evidence; items
+    whose evidence cannot be checked are written with verified: false."""
+
+    good_item = {
+        "okf_type": "fact",
+        "title": "Kafka offsets gate resume",
+        "takeaway": "kafka offset 恢复由 offsets gate 控制",
+        "sections": {"Details": "Offsets gate drives resume behavior."},
+        "sources": [],
+        "evidence": [{"turn": "T1", "quote": "offsets gate controls resume"}],
+    }
+    bad_item = {
+        "okf_type": "fact",
+        "title": "Unverifiable claim",
+        "takeaway": "unverifiable takeaway",
+        "sections": {"Details": "No quotable source."},
+        "sources": [],
+        "evidence": [{"turn": "T1", "quote": "this quote does not exist anywhere"}],
+    }
+
+    class EvidenceClient:
+        name = "fake-evidence"
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            if "merge" in prompt.lower():
+                return {"items": [good_item, bad_item]}
+            return {"items": [good_item, bad_item]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.max_items_per_transcript = 5
+    runtime_paths = bootstrap_runtime_directories(config)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=EvidenceClient())
+    try:
+        import os
+
+        content = "<!-- synapse-transcript v2 -->\n## T1 User\nthe offsets gate controls resume behavior\n"
+        _write_transcript(runtime_paths, "mem_session_ev1", content, session_key="sess-ev")
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / "mem_session_ev1.md", (old_ts, old_ts))
+
+        report = distiller.run(downgrade_supersede=False)
+        assert report.transcripts_distilled == 1
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / "mem_session_ev1.md")
+        titles = [read_node_file(runtime_paths.active / f"{kid}.md") for kid in stamped.metadata.distilled_node_ids]
+        by_title = {node.title: node for node in titles}
+
+        good = by_title["Kafka offsets gate resume"]
+        assert good.metadata.verified is True
+        assert "## Evidence" in good.content
+        assert '- T1: "offsets gate controls resume"' in good.content
+
+        bad = by_title["Unverifiable claim"]
+        assert bad.metadata.verified is False
+        assert "## Evidence" in bad.content
+    finally:
+        distiller.close()
+
+
+def test_distiller_validates_clean_with_skill_sources(tmp_path: Path) -> None:
+    """Nodes citing skill://<name> sources validate without warnings (parallel
+    data-cleanup compatibility)."""
+    from synapse.okf import validate_okf_node
+
+    warnings = validate_okf_node(
+        node_type="persistent",
+        content="## Takeaway\nt\n\n## Details\nd\n\n## Sources\n- skill://authz-shim-triage-fast",
+        okf_type="fact",
+        sources=["skill://authz-shim-triage-fast"],
+    )
+    assert not any(w.code == "okf_unresolvable_source" for w in warnings)

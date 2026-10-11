@@ -189,9 +189,14 @@ OKF_META_FIELDS = (
 
 def _okf_meta_json(metadata: Any) -> str:
     payload = {name: getattr(metadata, name) for name in OKF_META_FIELDS}
-    if not any(payload.values()):
+    # ``verified: false`` is meaningful (P2+ inject gate) and must survive;
+    # only None and empty collections are treated as absent.
+    if not any(value is not None and value != [] and value != "" for value in payload.values()):
         return "{}"
-    return json.dumps({k: v for k, v in payload.items() if v is not None}, ensure_ascii=False)
+    return json.dumps(
+        {k: v for k, v in payload.items() if v is not None and v != [] and v != ""},
+        ensure_ascii=False,
+    )
 
 
 def _okf_meta_from_json(raw: str | None) -> dict[str, Any]:

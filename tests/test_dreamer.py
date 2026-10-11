@@ -4,7 +4,7 @@ from pathlib import Path
 
 from synapse.config import SynapseConfig
 from synapse.lifecycle import Dreamer
-from synapse.models import Node, NodeMetadata, NodeStatus
+from synapse.models import Node, NodeMetadata, NodeStatus, NodeType
 from synapse.storage import SQLiteNodeStore
 from synapse.utils.runtime import RuntimePaths, bootstrap_runtime_directories
 
@@ -236,3 +236,109 @@ def test_archive_superseded_cyclic_chain_logged_and_kept(tmp_path: Path) -> None
     assert archived_ids == []
     assert any(w.code == "cyclic_supersession" for w in warnings)
     dreamer.close()
+
+
+class _SynthesisSamplingClient:
+    """Returns one hub payload per synthesis call; records prompts."""
+
+    name = "fake-synthesis"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        self.calls.append(prompt)
+        return {
+            "title": "Kafka consumer offset handling across services",
+            "takeaway": "All services resume from committed kafka offsets.",
+            "details": "Members establish that offsets gate resume behavior.",
+            "sources": [],
+        }
+
+    def decide_memory_write(self, request):  # pragma: no cover - not used by Dreamer
+        raise AssertionError(f"Unexpected write decision request: {request}")
+
+
+def _typed_cluster_node(node_id: str, *, project: str = "kafka", okf_type: str = "fact") -> Node:
+    metadata = NodeMetadata(
+        id=node_id,
+        title=f"Kafka fact {node_id}",
+        type=NodeType.PERSISTENT,
+        okf_type=okf_type,
+        okf_version=1,
+        project=project,
+    )
+    return Node(
+        metadata=metadata,
+        content=f"## Takeaway\nfact {node_id}\n\n## Details\ncontent {node_id}\n\n## Sources\n- x",
+        file_path=Path("active") / f"{node_id}.md",
+    )
+
+
+def test_synthesis_creates_fact_hub_for_typed_cluster(tmp_path: Path) -> None:
+    """P3: a project-scoped cluster of >= min size typed nodes above the cosine
+    threshold produces ONE fact hub; hubs are not re-clustered as members."""
+    config, runtime_paths = make_runtime(tmp_path)
+    config.dreamer.thresholds.synthesis_cosine = 0.80
+    config.dreamer.thresholds.min_synthesis_cluster = 4
+    client = _SynthesisSamplingClient()
+    dreamer = Dreamer(config, runtime_paths=runtime_paths, sampling_client=client)
+
+    base = [0.0, 0.0, 1.0]
+    try:
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            for i in range(4):
+                node = _typed_cluster_node(f"mem_kafka_{i}")
+                jitter = 0.01 * i
+                store.upsert_node(node, embedding=[base[0] + jitter, base[1], base[2] - jitter])
+            # Untyped + transcript-adjacent nodes must not join the cluster.
+            store.upsert_node(
+                Node(
+                    metadata=NodeMetadata(id="mem_untyped", title="Untyped note"),
+                    content="plain note",
+                    file_path=Path("active/mem_untyped.md"),
+                ),
+                embedding=[0.0, 0.0, 1.0],
+            )
+
+            results = dreamer._run_synthesis(store, warnings=[])
+
+        assert len(results) == 1
+        result = results[0]
+        assert result.hub_node_id.startswith("mem_")
+        assert set(result.member_ids) == {f"mem_kafka_{i}" for i in range(4)}
+        assert client.calls and "Cluster members:" in client.calls[0]
+
+        from synapse.storage import read_node_file
+
+        hub = read_node_file(runtime_paths.active / f"{result.hub_node_id}.md")
+        assert hub.metadata.okf_type == "fact"
+        assert hub.metadata.type is NodeType.PERSISTENT
+        assert "## Sources" in hub.content
+        assert all(f"- mem_kafka_{i}" in hub.content for i in range(4))
+
+        # Second run: cluster now covered by the hub -> skipped.
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            store.upsert_node(hub, embedding=[0.0, 0.0, 1.0])
+            calls_before = len(client.calls)
+            results2 = dreamer._run_synthesis(store, warnings=[])
+        assert results2 == []
+        assert len(client.calls) == calls_before
+    finally:
+        dreamer.close()
+
+
+def test_synthesis_skips_small_clusters(tmp_path: Path) -> None:
+    config, runtime_paths = make_runtime(tmp_path)
+    config.dreamer.thresholds.min_synthesis_cluster = 4
+    client = _SynthesisSamplingClient()
+    dreamer = Dreamer(config, runtime_paths=runtime_paths, sampling_client=client)
+    try:
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            for i in range(3):
+                store.upsert_node(_typed_cluster_node(f"mem_small_{i}"), embedding=[0.0, 0.0, 1.0])
+            results = dreamer._run_synthesis(store, warnings=[])
+        assert results == []
+        assert client.calls == []
+    finally:
+        dreamer.close()

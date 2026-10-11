@@ -520,3 +520,51 @@ def test_inject_flag_margin_drops_distant_results(tmp_path: Path) -> None:
     # distant logit -0.5: above floor(-10) but 2.5 below best(2.0) with margin 1.0 → dropped.
     assert by_id["best"].is_injectable is True
     assert by_id["distant"].is_injectable is False
+
+
+def test_inject_flag_suppresses_verified_false_nodes(tmp_path: Path) -> None:
+    """P2+ (owner decision C): nodes with verified: false never auto-inject but
+    are still returned with scores; nodes without the field are unaffected."""
+    config = load_config(_inject_config(tmp_path, floor=-2.0, margin=2.5))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    verified = make_node(node_id="ver", title="API Gateway Design", content="Gateway architecture.", file_name="ver.md")
+    unverified = make_node(node_id="unver", title="Gateway Retry Details", content="Gateway retry details.", file_name="unver.md")
+    legacy = make_node(node_id="legacy", title="Gateway Auth Notes", content="Gateway auth notes.", file_name="legacy.md")
+    # Mark only 'unver' as verified=false; 'legacy' has no field at all.
+    unverified = Node(metadata=unverified.metadata.model_copy(update={"verified": False}), content=unverified.content, file_path=unverified.file_path)
+
+    class SpreadReranker:
+        model_name = "spread"
+        def rerank(self, query, documents, limit=None):
+            scores = []
+            for index, document in enumerate(documents):
+                if "API Gateway Design" in document:
+                    score = 0.9
+                elif "Gateway Retry Details" in document:
+                    score = 0.8
+                else:
+                    score = 0.7
+                scores.append((index, score))
+            scores.sort(key=lambda item: (-item[1], item[0]))
+            return scores[:limit] if limit is not None else scores
+        def is_available(self):
+            return True
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        store.upsert_node(verified, embedding=[1.0, 0.0, 0.0])
+        store.upsert_node(unverified, embedding=[0.9, 0.1, 0.0])
+        store.upsert_node(legacy, embedding=[0.8, 0.2, 0.0])
+        pipeline = RetrievalPipeline(
+            config, store=store, runtime_paths=runtime_paths,
+            embedding_engine=FakeEmbeddingEngine(), reranker_engine=SpreadReranker(),
+            now_fn=lambda: NOW,
+        )
+        response = pipeline.search("gateway")
+
+    by_id = {item.node.id: item for item in response.results}
+    # All three are returned with scores.
+    assert {"ver", "unver", "legacy"} <= set(by_id)
+    assert by_id["ver"].is_injectable is True
+    assert by_id["unver"].is_injectable is False  # verified: false never injects
+    assert by_id["legacy"].is_injectable is True  # no field → unaffected
