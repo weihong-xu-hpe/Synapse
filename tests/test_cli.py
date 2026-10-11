@@ -271,6 +271,7 @@ def test_dreamer_run_command_uses_configured_batch_size(tmp_path: Path, monkeypa
                 conflicts_resolved=(),
                 archived=(),
                 condensed=(),
+                synthesized=(),
                 warnings=(),
             )
 

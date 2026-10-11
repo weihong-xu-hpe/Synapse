@@ -347,7 +347,9 @@ class RetrievalPipeline:
         catches degraded reranker outputs (long conversational queries depress
         absolute logits, but so do genuinely irrelevant ones); the relative
         margin keeps order-calibrated results injectable even when the whole
-        query sits far below zero.
+        query sits far below zero. Nodes with ``verified: false`` frontmatter
+        are never auto-injected (P2+, docs/okf.md §9) but still returned with
+        scores.
         """
 
         settings = self.config.retrieval
@@ -361,6 +363,10 @@ class RetrievalPipeline:
             injectable = (
                 item.rerank_score >= floor
                 and item.rerank_score >= best_logit - margin
+                # P2+ (owner decision C "annotate, never auto-inject"): nodes
+                # explicitly marked verified=false never auto-inject. Nodes
+                # WITHOUT the field (all pre-existing nodes) are unaffected.
+                and item.node.metadata.verified is not False
             )
             decided.append(
                 RetrievalItem(

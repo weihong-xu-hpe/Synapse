@@ -288,6 +288,43 @@ def build_conflict_resolution_prompt(pairs: tuple[tuple[Node, Node], ...]) -> st
     )
 
 
+def build_synthesis_prompt(cluster: tuple[Node, ...]) -> str:
+    """Render a synthesis prompt for the Dreamer's clustering stage (P3)."""
+
+    member_blocks = [
+        "\n".join(
+            [
+                f"- ID: {node.id}",
+                f"  Title: {node.title}",
+                f"  okf_type: {node.metadata.okf_type or 'untyped'}",
+                "  Content:",
+                *[f"    {line}" for line in (node.content.splitlines() or ["<empty>"])],
+            ]
+        )
+        for node in cluster
+    ]
+    return "\n".join(
+        [
+            "You are performing Synapse Dreamer synthesis — the hub-building stage.",
+            "The typed knowledge nodes below cluster around one project/topic (high embedding similarity).",
+            "Write ONE hub node that summarizes what these nodes collectively establish.",
+            "Rules:",
+            "1. title: ENGLISH, <= 90 chars, a specific claim or noun phrase; no 'Summary:'/'Hub:' prefix, no date.",
+            "2. okf_type must be \"fact\"; body must follow the fact template exactly:",
+            "   '## Takeaway' (single line, <= 200 chars), '## Details' (what the members collectively establish),",
+            "   '## Sources' (one '- <member node id>' line per member, verbatim ids from the list).",
+            "3. Summarize; do not copy member text wholesale. Mirror the members' language in the body.",
+            _JSON_ONLY_INSTRUCTION,
+            "",
+            "Cluster members:",
+            "\n\n".join(member_blocks),
+            "",
+            _JSON_SHAPE_HEADER,
+            '{"title":"...","takeaway":"...","details":"...","sources":["mem_..."]}',
+        ]
+    )
+
+
 def _render_source_nodes(nodes: tuple[Node, ...]) -> str:
     blocks: list[str] = []
     for node in nodes:

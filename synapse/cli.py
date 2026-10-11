@@ -208,6 +208,7 @@ def run_dreamer(
     typer.echo(f"Conflicts resolved: {len(report.conflicts_resolved)}")
     typer.echo(f"Archived: {len(report.archived)}")
     typer.echo(f"Condensed: {len(report.condensed)}")
+    typer.echo(f"Synthesized hubs: {len(report.synthesized)}")
     typer.echo(f"Warnings: {len(report.warnings)}")
 
 

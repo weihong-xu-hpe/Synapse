@@ -25,6 +25,7 @@ from synapse.server.sampling import (
     SamplingClient,
     build_conflict_resolution_prompt,
     build_link_weaving_prompt,
+    build_synthesis_prompt,
     build_triage_prompt,
 )
 from synapse.storage import SQLiteNodeStore, archive_node_path, write_node_file
@@ -79,6 +80,15 @@ class CondensationResult:
 
 
 @dataclass(slots=True, frozen=True)
+class SynthesisResult:
+    """One hub node created by the P3 synthesis (clustering) stage."""
+
+    member_ids: tuple[str, ...]
+    hub_node_id: str
+    hub_title: str
+
+
+@dataclass(slots=True, frozen=True)
 class DreamerReport:
     """Structured report returned by the Dreamer pipeline."""
 
@@ -90,6 +100,7 @@ class DreamerReport:
     conflicts_resolved: tuple[ConflictDecision, ...] = field(default_factory=tuple)
     archived: tuple[str, ...] = field(default_factory=tuple)
     condensed: tuple[CondensationResult, ...] = field(default_factory=tuple)
+    synthesized: tuple[SynthesisResult, ...] = field(default_factory=tuple)
     deleted_archive_paths: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[DreamerWarning, ...] = field(default_factory=tuple)
     sync: SyncBatchResult = field(default_factory=SyncBatchResult)
@@ -115,6 +126,11 @@ _LINK_WEAVING_SYSTEM = (
 
 _CONFLICT_SYSTEM = (
     "You are a memory-conflict-resolution agent inside Synapse."
+    " Respond with a single JSON object, no markdown fence, no extra prose."
+)
+
+_SYNTHESIS_SYSTEM = (
+    "You are a memory-synthesis agent inside Synapse."
     " Respond with a single JSON object, no markdown fence, no extra prose."
 )
 
@@ -213,6 +229,9 @@ class Dreamer:
         # Stage 4: Conflict Resolution (interference clearance)
         conflict_decisions = self._run_conflict_resolution(disputed, batch_size=batch_size, warnings=warnings)
 
+        # Stage 4b: Synthesis (hub building over clustered typed knowledge)
+        synthesis_results = self._run_synthesis(store, warnings)
+
         # Stage 5: Execute all decisions
         archived_ids, condensed_results = self._execute_triage(triage_decisions, store, warnings)
         self._execute_links(link_decisions, store, warnings)
@@ -249,6 +268,7 @@ class Dreamer:
             conflicts_resolved=tuple(conflict_decisions),
             archived=tuple([*archived_ids, *archived_superseded_ids]),
             condensed=tuple(condensed_results),
+            synthesized=tuple(synthesis_results),
             deleted_archive_paths=deleted_archive_paths,
             warnings=tuple(warnings),
             sync=sync_result,
@@ -383,6 +403,140 @@ class Dreamer:
                     )
                 )
         return decisions
+
+    # -- Stage 4b: Synthesis (P3) --------------------------------------------
+
+    def _run_synthesis(self, store: SQLiteNodeStore, warnings: list[DreamerWarning]) -> list[SynthesisResult]:
+        """Cluster typed active nodes per project and write one fact hub per cluster.
+
+        Clusters already covered by an existing hub are skipped (hub detection:
+        an active typed node whose Sources list contains every cluster member —
+        i.e. a node whose sources are the member ids). Hubs themselves never
+        re-cluster as members because their Sources point at member ids and
+        their own ids never appear as a member's source... members exclude any
+        node whose id appears in another candidate node's sources.
+        """
+
+        thresholds = self.config.dreamer.thresholds
+        clusters = store.find_synthesis_clusters(
+            cosine_threshold=thresholds.synthesis_cosine,
+            min_size=thresholds.min_synthesis_cluster,
+            max_size=thresholds.max_synthesis_cluster,
+        )
+        if not clusters:
+            return []
+
+        results: list[SynthesisResult] = []
+        hub_ids_created: set[str] = set()
+        for cluster in clusters[: thresholds.max_synthesis_hubs_per_run]:
+            member_ids = {node.id for node in cluster}
+            # Skip clusters already covered by a hub: an ACTIVE typed node
+            # whose sources ⊇ member ids (and which is not itself a member).
+            if self._cluster_has_hub(store, cluster, member_ids):
+                continue
+            # Hub nodes created in this run must not become members of later
+            # clusters: drop any node referenced as a source by a prior hub.
+            cluster = [node for node in cluster if node.id not in hub_ids_created]
+            if len(cluster) < thresholds.min_synthesis_cluster:
+                continue
+            try:
+                result = self._sampling_client.sample_json(
+                    prompt=build_synthesis_prompt(tuple(cluster)),
+                    system_prompt=_SYNTHESIS_SYSTEM,
+                    max_tokens=1500,
+                )
+                payload = result
+                title = str(payload.get("title") or "").strip()
+                takeaway = str(payload.get("takeaway") or "").strip()
+                details = str(payload.get("details") or "").strip()
+                sources = [str(s).strip() for s in (payload.get("sources") or []) if str(s).strip()]
+            except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+                self._logger.warning("Synthesis sampling failed for cluster, skipping", exc_info=exc)
+                warnings.append(
+                    DreamerWarning(
+                        code="synthesis_sampling_failed",
+                        message=f"Synthesis sampling failed: {exc}. Skipping cluster.",
+                    )
+                )
+                continue
+            if not title or not takeaway or not details:
+                warnings.append(
+                    DreamerWarning(
+                        code="synthesis_invalid_payload",
+                        message="Synthesis payload missing title/takeaway/details; skipping cluster.",
+                    )
+                )
+                continue
+            hub = self._write_hub_node(title, takeaway, details, member_ids)
+            if hub is None:
+                warnings.append(
+                    DreamerWarning(
+                        code="synthesis_title_unusable",
+                        message=f"Synthesis produced an unusable English title ({title!r}); skipping cluster.",
+                    )
+                )
+                continue
+            hub_ids_created.add(hub.id)
+            results.append(SynthesisResult(member_ids=tuple(sorted(member_ids)), hub_node_id=hub.id, hub_title=hub.title))
+            self._logger.info(
+                "Synthesized hub node",
+                extra={"hub_node_id": hub.id, "members": sorted(member_ids)},
+            )
+        return results
+
+    @staticmethod
+    def _cluster_has_hub(store: SQLiteNodeStore, cluster: list[Node], member_ids: set[str]) -> bool:
+        for candidate in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}):
+            if candidate.id in member_ids:
+                continue
+            if not candidate.metadata.okf_type:
+                continue
+            sources = set(candidate.metadata.sources)
+            if sources and member_ids and member_ids.issubset(sources):
+                return True
+        return False
+
+    def _write_hub_node(self, title: str, takeaway: str, details: str, member_ids: set[str]) -> Node | None:
+        from synapse.models import slugify_english_title
+
+        if not slugify_english_title(title) or len(title) > 90:
+            return None
+        now = self._utc_now()
+        hub_id = generate_node_id(title, now)
+        content = "\n".join(
+            [
+                "## Takeaway",
+                "",
+                takeaway,
+                "",
+                "## Details",
+                "",
+                details,
+                "",
+                "## Sources",
+                "",
+                *(f"- {member_id}" for member_id in sorted(member_ids)),
+                "",
+            ]
+        )
+        metadata = NodeMetadata.model_validate(
+            {
+                "id": hub_id,
+                "title": title,
+                "type": NodeType.PERSISTENT.value,
+                "status": NodeStatus.ACTIVE.value,
+                "okf_type": "fact",
+                "okf_version": 1,
+                "sources": sorted(member_ids),
+                "tags": ["dreamer-hub"],
+                "created_at": now.isoformat().replace(UTC_SUFFIX, "Z"),
+                "last_accessed": now.isoformat().replace(UTC_SUFFIX, "Z"),
+                "access_count": 0,
+            }
+        )
+        hub = Node(metadata=metadata, content=content, file_path=self.runtime_paths.active / f"{hub_id}.md")
+        write_node_file(hub, base_path=self.runtime_paths.base)
+        return hub
 
     # -- Stage 5: Execution -------------------------------------------------
 
