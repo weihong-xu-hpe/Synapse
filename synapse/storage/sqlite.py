@@ -765,6 +765,30 @@ class SQLiteNodeStore:
             self._invalidate_vector_cache()
             connection.execute("DELETE FROM nodes_vec WHERE id = ?", (node_id,))
 
+    def delete_embeddings(self, node_ids: list[str]) -> int:
+        """Delete vectors for the given ids; returns the number of rows removed."""
+
+        if not node_ids:
+            return 0
+        with self.transaction() as connection:
+            self._invalidate_vector_cache()
+            placeholders = ", ".join("?" for _ in node_ids)
+            cursor = connection.execute(f"DELETE FROM nodes_vec WHERE id IN ({placeholders})", node_ids)
+            return int(cursor.rowcount)
+
+    def delete_edges_touching(self, node_ids: list[str]) -> int:
+        """Delete edges with any of the given ids as source or target; returns rows removed."""
+
+        if not node_ids:
+            return 0
+        with self.transaction() as connection:
+            placeholders = ", ".join("?" for _ in node_ids)
+            cursor = connection.execute(
+                f"DELETE FROM edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+                [*node_ids, *node_ids],
+            )
+            return int(cursor.rowcount)
+
     def update_access(self, node_ids: list[str]) -> None:
         if not node_ids:
             return

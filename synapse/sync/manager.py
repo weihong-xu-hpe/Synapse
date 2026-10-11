@@ -13,9 +13,23 @@ from typing import Callable, Literal
 from synapse.config import SynapseConfig
 from synapse.embedding import create_embedding_engine
 from synapse.models import Node
+from synapse.okf.transcripts import is_session_transcript
 from synapse.storage import SQLiteNodeStore, build_node_alias_map, extract_wiki_links, read_node_file, resolve_links_to_node_ids
 from synapse.utils.documents import render_node_document
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
+
+
+def should_exclude_from_embedding(node: Node) -> bool:
+    """True when a node must never get a stored vector (P2b).
+
+    Session transcripts are storage-only raw material for the distiller: they
+    are huge, short-lived, and compete with knowledge in the vector leg. The
+    gate lives in the sync layer so EVERY path that persists a node (bridge
+    upsert, file watcher, startup sync, distiller stamps, dreamer writes)
+    shares one rule.
+    """
+
+    return is_session_transcript(node)
 
 
 try:  # pragma: no cover - optional dependency
@@ -322,7 +336,7 @@ class SyncManager:
     def _sync_upsert(self, path: Path) -> Node:
         node = self._load_node_for_sync(path)
         file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
-        embedding = self._embed_for_persistence(node, path)
+        embedding = None if should_exclude_from_embedding(node) else self._embed_for_persistence(node, path)
 
         store = self._get_store()
         store.upsert_node(node, embedding=embedding, source_mtime=file_mtime)

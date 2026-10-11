@@ -249,24 +249,20 @@ class SynapseServerService:
             self.logger.warning("Failed to record search event", exc_info=exc)
 
     def _include_result(self, node: Node, include: str) -> bool:
-        """Default search excludes distilled-current transcripts.
+        """Default search excludes ALL session transcripts (P2b).
 
-        A transcript distilled at its current revision has already contributed
-        whatever the LLM judged durable — represented transcripts via produced
-        knowledge nodes, zero-item transcripts by explicit judgment ("nothing
-        durable here"). Both compete with knowledge in default search, so both
-        are excluded; only not-yet-distilled transcripts remain searchable.
-        ``include=transcripts|all`` still returns everything. Legacy session
-        summaries are covered by ``is_session_transcript``.
+        Transcripts are storage-only raw material for the distiller: they
+        compete with knowledge for search slots, dominate long queries
+        lexically, and never inject. ``include=transcripts|all`` still returns
+        them explicitly. Legacy session summaries are covered by
+        ``is_session_transcript``.
         """
 
         if include in {"all", "transcripts"}:
             return True
-        from synapse.okf.transcripts import is_distilled_current, is_session_transcript
+        from synapse.okf.transcripts import is_session_transcript
 
-        if is_session_transcript(node) and is_distilled_current(node):
-            return False
-        return True
+        return not is_session_transcript(node)
 
     def integrate_knowledge(
         self,
@@ -727,6 +723,13 @@ class SynapseServerService:
         clean_title = title.strip()
         if not clean_title:
             raise SynapseServiceError("INVALID_TITLE", _INVALID_TITLE_MESSAGE)
+
+        # P2b: transcripts soon carry tool outputs with secrets — redact at
+        # the boundary so nothing sensitive is ever persisted (storage-only
+        # material never passes through the outbound cloud sanitizer).
+        from synapse.security import RedactionEngine
+
+        content = RedactionEngine.from_config(self.config).redact(content)[0]
 
         node_id = self._session_node_id(clean_key)
         lock = self._lock_for(self._session_key_locks, self._session_key_locks_guard, node_id)

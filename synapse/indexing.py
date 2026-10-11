@@ -16,6 +16,7 @@ from synapse.embedding import create_embedding_engine
 from synapse.storage import scan_markdown_files, scan_markdown_nodes
 from synapse.storage.sqlite import DatabaseIntegrityReport, SQLiteNodeStore
 from synapse.sync import SyncBatchResult, SyncManager
+from synapse.sync.manager import should_exclude_from_embedding
 from synapse.utils.runtime import RuntimePaths, bootstrap_runtime_directories, get_runtime_paths
 from synapse.utils.documents import render_node_document
 
@@ -126,7 +127,10 @@ def rebuild_index(
     db_path = database_path_for_config(config)
     nodes = scan_markdown_nodes(paths.active, relative_to=paths.base)
     engine = create_embedding_engine(config.embedding, providers=config.providers)
-    texts = [render_node_document(node) for node in nodes]
+    # P2b: session transcripts never get vectors — skip them BEFORE the batch
+    # call so remote embedding budgets are not spent on transcript payloads.
+    embedded_nodes = [node for node in nodes if not should_exclude_from_embedding(node)]
+    texts = [render_node_document(node) for node in embedded_nodes]
     try:
         raw_embeddings = engine.embed_batch(texts) if texts else []
     except Exception as exc:  # ProviderError from a fully-down remote provider
@@ -137,20 +141,22 @@ def rebuild_index(
     # space; store those nodes WITHOUT a vector instead (re-embedded by the
     # next successful startup sync).
     if getattr(engine, "backend_name", "") == "remote_api" and engine.is_available() is False:
-        embeddings: list[list[float] | None] = [None] * len(texts)
+        embedded: list[list[float] | None] = [None] * len(texts)
     elif len(raw_embeddings) != len(texts):
         # embed_batch raised mid-way and returned nothing usable.
-        embeddings = [None] * len(texts)
+        embedded = [None] * len(texts)
     else:
-        embeddings = list(raw_embeddings)
+        embedded = list(raw_embeddings)
+    # Map vectors back onto the full node list (transcript nodes carry None).
+    embedded_iter = iter(embedded)
+    embeddings: list[list[float] | None] = [
+        None if should_exclude_from_embedding(node) else next(embedded_iter)
+        for node in nodes
+    ]
     source_mtimes: list[datetime | None] = [
         datetime.fromtimestamp((paths.base / node.file_path).stat().st_mtime, tz=UTC)
         for node in nodes
     ]
-    if texts and len(embeddings) != len(texts):
-        raise RuntimeError(
-            f"Embedding engine returned {len(embeddings)} vectors for {len(texts)} nodes during rebuild"
-        )
 
     def emit(message: str) -> None:
         if progress_callback is not None:

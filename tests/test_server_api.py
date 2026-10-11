@@ -1140,6 +1140,37 @@ def test_keyed_upsert_create_unchanged_update(tmp_path: Path) -> None:
     assert rows == [("session_upsert", 3)]
 
 
+def test_keyed_upsert_redacts_secret_patterns_in_content(tmp_path: Path) -> None:
+    """P2b: session-upsert content passes the RedactionEngine before storage,
+    so tool outputs carrying secrets never reach the canonical Markdown."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    secret = "sk-" + "a" * 40
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/write",
+            json={
+                "session_key": "secret-session",
+                "title": "Session summary — secrets",
+                "content": f"## Assistant\ntoken was {secret} and mail x@y.example.com.",
+                "type": "transient",
+            },
+        )
+        assert response.status_code == 200
+
+    node_file = runtime_paths.active / "mem_session_9f2b3c2f0a45b2d3.md"
+    # id derives from sha1("secret-session")[:16]; read whatever the response said.
+    stored = response.json()["node"]["content"]
+    assert secret not in stored
+    assert "[REDACTED_API_KEY]" in stored
+    assert "[REDACTED_EMAIL]" in stored
+    on_disk = list(runtime_paths.active.glob("mem_session_*.md"))
+    assert any("[REDACTED_API_KEY]" in p.read_text(encoding="utf-8") for p in on_disk)
+
+
 def test_keyed_upsert_concurrent_same_key_creates_one_node(tmp_path: Path) -> None:
     """Concurrent same-key writes serialize: exactly one node, last write wins."""
     config = load_config(write_config(tmp_path))
@@ -1208,7 +1239,12 @@ def test_unkeyed_write_identical_content_guard(tmp_path: Path) -> None:
 
 
 def test_rest_search_exclude_session_key(tmp_path: Path) -> None:
-    """exclude_session_key removes the derived node from results."""
+    """exclude_session_key removes the derived node from results.
+
+    P2b: session transcripts are excluded from default search regardless, so
+    the transcript-only assertions use ``include=transcripts`` where the
+    exclude_session_key filter still applies.
+    """
     config = load_config(write_config(tmp_path))
     runtime_paths = bootstrap_runtime_directories(config)
     service = SynapseServerService(config, runtime_paths=runtime_paths)
@@ -1229,7 +1265,7 @@ def test_rest_search_exclude_session_key(tmp_path: Path) -> None:
 
         with_results = client.post(
             "/api/search",
-            json={"query": "exclude-marker content session node", "top_k": 5},
+            json={"query": "exclude-marker content session node", "top_k": 5, "include": "transcripts"},
         )
         ids_with = [item["node_id"] for item in with_results.json()["results"]]
         assert session_node_id in ids_with
@@ -1239,6 +1275,7 @@ def test_rest_search_exclude_session_key(tmp_path: Path) -> None:
             json={
                 "query": "exclude-marker content session node",
                 "top_k": 5,
+                "include": "transcripts",
                 "exclude_session_key": "exclude-me",
             },
         )

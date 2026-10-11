@@ -287,3 +287,65 @@ def test_dreamer_run_command_uses_configured_batch_size(tmp_path: Path, monkeypa
     assert captured["closed"] is True
     assert "Dreamer run completed." in result.output
     assert "Warnings: 0" in result.output
+
+
+def test_prune_transcript_vectors_dry_run_then_apply(tmp_path: Path) -> None:
+    """P2b maintenance step: dry-run reports counts; --apply deletes transcript
+    vectors and edges touching transcripts; idempotent on second run."""
+    config_path = write_config(tmp_path)
+    seed_markdown_nodes(tmp_path)
+
+    transcript = Node(
+        metadata=NodeMetadata(
+            id="mem_session_cli1",
+            title="Session summary — cli",
+            created_at=FIXED_TIME,
+            last_accessed=FIXED_TIME,
+            type=NodeType.TRANSIENT,
+            session_key="cli-key",
+        ),
+        content="## User\ncli probe\n\n## Assistant\nbody",
+        file_path=Path("active/mem_session_cli1.md"),
+    )
+    write_node_file(transcript, base_path=tmp_path / ".synapse")
+
+    runner.invoke(app, ["--config", str(config_path), "rebuild-index"])
+    # rebuild-index with the P2b gate leaves no transcript vector; seed one
+    # directly to simulate pre-gate data.
+    import sqlite3
+
+    db_path = tmp_path / ".synapse" / "synapse.db"
+    db = sqlite3.connect(db_path)
+    db.execute(
+        "INSERT INTO nodes_vec (id, embedding, dimension) VALUES (?, ?, ?)",
+        ("mem_session_cli1", "[0.1, 0.2]", 1024),
+    )
+    db.execute(
+        "INSERT INTO edges (source_id, target_id) VALUES (?, ?)",
+        ("mem_20260307_gateway_design", "mem_session_cli1"),
+    )
+    db.commit()
+    db.close()
+
+    dry = runner.invoke(app, ["--config", str(config_path), "prune-transcript-vectors"])
+    assert dry.exit_code == 0, dry.output
+    assert "Vectors deleted: 0" in dry.output
+    assert "Dry run" in dry.output
+
+    applied = runner.invoke(app, ["--config", str(config_path), "prune-transcript-vectors", "--apply"])
+    assert applied.exit_code == 0, applied.output
+    assert "Vectors deleted: 1" in applied.output
+    assert "Edges touching transcripts deleted: 1" in applied.output
+
+    db = sqlite3.connect(db_path)
+    vector_rows = db.execute("SELECT id FROM nodes_vec WHERE id = 'mem_session_cli1'").fetchall()
+    edge_rows = db.execute(
+        "SELECT * FROM edges WHERE source_id = 'mem_20260307_gateway_design' AND target_id = 'mem_session_cli1'"
+    ).fetchall()
+    db.close()
+    assert vector_rows == []
+    assert edge_rows == []
+
+    again = runner.invoke(app, ["--config", str(config_path), "prune-transcript-vectors", "--apply"])
+    assert again.exit_code == 0, again.output
+    assert "Vectors deleted: 0" in again.output

@@ -451,6 +451,50 @@ def rebuild_index(
     typer.echo("Rebuild-index completed successfully.")
 
 
+@app.command("prune-transcript-vectors")
+def prune_transcript_vectors(
+    ctx: typer.Context,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Execute the deletions. Default is a dry-run report."),
+    ] = False,
+) -> None:
+    """P2b maintenance: delete session-transcript vectors and their graph edges.
+
+    Session transcripts (``is_session_transcript``) are storage-only raw
+    material — they are never embedded going forward, so this step removes the
+    vectors and edges that predate the gate. Idempotent; run once after
+    deploying this version (report any time without --apply).
+    """
+
+    from synapse.okf.transcripts import is_session_transcript
+
+    state = _state_from_context(ctx)
+    paths = state.runtime_paths
+    with SQLiteNodeStore(
+        paths.base / "synapse.db",
+        embedding_dimension=state.config.embedding.dimension or 0,
+    ) as store:
+        transcripts = [
+            node
+            for node in store.list_nodes({"type": "transient"})
+            if is_session_transcript(node)
+        ]
+        transcript_ids = [node.id for node in transcripts]
+        vectors_deleted = 0
+        edges_deleted = 0
+        if apply and transcript_ids:
+            vectors_deleted = store.delete_embeddings(transcript_ids)
+            edges_deleted = store.delete_edges_touching(transcript_ids)
+    typer.echo(f"Session transcripts in index: {len(transcript_ids)}")
+    typer.echo(f"Vectors deleted: {vectors_deleted}")
+    typer.echo(f"Edges touching transcripts deleted: {edges_deleted}")
+    if not apply:
+        typer.echo("Dry run — re-run with --apply to delete.")
+    else:
+        typer.echo("Prune complete.")
+
+
 @app.command()
 def install(
     ctx: typer.Context,

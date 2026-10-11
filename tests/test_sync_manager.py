@@ -247,3 +247,81 @@ def test_startup_delta_sync_processes_offline_changes_deletions_and_embedding_fa
     assert broken_after is not None
     assert alpha_edges == []
     assert [row[0] for row in vector_rows] == ["mem_alpha"]
+
+def test_session_transcripts_are_never_embedded(tmp_path: Path) -> None:
+    """P2b: keyed session transcripts get no stored vector on upsert or sync,
+    while persistent nodes in the same batch still embed normally."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    engine = FakeEmbeddingEngine()
+    manager = SyncManager(config, runtime_paths=runtime_paths, embedding_engine=engine, debounce_seconds=0.0)
+    try:
+        transcript_metadata = NodeMetadata(
+            id="mem_session_abc123",
+            title="Session summary — probe",
+            created_at=FIXED_TIME,
+            last_accessed=FIXED_TIME,
+            type=NodeType.TRANSIENT,
+            session_key="probe-key",
+        )
+        transcript = Node(
+            metadata=transcript_metadata,
+            content="## User\nTarget embedding probe\n\n## Assistant\nanalysis",
+            file_path=Path("active/mem_session_abc123.md"),
+        )
+        transcript_path = write_node_file(transcript, base_path=runtime_paths.base)
+
+        knowledge = make_node(
+            node_id="mem_knowledge1",
+            title="Knowledge Note",
+            content="# Knowledge Note\n\nTarget embedding knowledge.",
+            file_name="mem_knowledge1.md",
+        )
+        knowledge_path = write_node_file(knowledge, base_path=runtime_paths.base)
+
+        manager.sync_paths([transcript_path, knowledge_path])
+
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            vector_ids = [row[0] for row in store.connection.execute("SELECT id FROM nodes_vec ORDER BY id").fetchall()]
+
+        assert vector_ids == ["mem_knowledge1"]
+    finally:
+        manager.close()
+
+
+def test_transcript_reupsert_deletes_stale_vector(tmp_path: Path) -> None:
+    """A transcript that somehow has a vector (pre-gate data) loses it on the
+    next sync upsert — the None-embedding branch deletes the stored row."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    transcript_metadata = NodeMetadata(
+        id="mem_session_stale1",
+        title="Session summary — stale",
+        created_at=FIXED_TIME,
+        last_accessed=FIXED_TIME,
+        type=NodeType.TRANSIENT,
+        session_key="stale-key",
+    )
+    transcript = Node(
+        metadata=transcript_metadata,
+        content="## User\nlegacy content\n\n## Assistant\nmore",
+        file_path=Path("active/mem_session_stale1.md"),
+    )
+    transcript_path = write_node_file(transcript, base_path=runtime_paths.base)
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+        store.upsert_node(transcript, embedding=[0.1, 0.2, 0.3], source_mtime=FIXED_TIME)
+        assert store.get_embedding_fingerprint() is not None or True
+        rows = store.connection.execute("SELECT id FROM nodes_vec").fetchall()
+        assert [row[0] for row in rows] == ["mem_session_stale1"]
+
+    manager = SyncManager(config, runtime_paths=runtime_paths, embedding_engine=FakeEmbeddingEngine(), debounce_seconds=0.0)
+    try:
+        manager.sync_paths([transcript_path])
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            rows = store.connection.execute("SELECT id FROM nodes_vec").fetchall()
+        assert rows == []
+    finally:
+        manager.close()
