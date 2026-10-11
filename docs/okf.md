@@ -258,3 +258,46 @@ never fire warnings — only headings are checked (fixed English strings `## Tak
 Adding a type: append a row here with its required sections and validator rule; bump
 `okf_version` only for breaking template changes. The distiller prompt and validator read this
 registry from code (`synapse/okf/__init__.py` — `OKF_TYPES`, `TYPE_REQUIRED_SECTIONS`).
+
+## 9. Evidence & verification (P2+)
+
+Owner decision C — **annotate, never auto-inject**. Distilled items carry an
+`evidence` array citing where the knowledge came from:
+
+```json
+{"evidence": [{"turn": "T12", "quote": "<verbatim excerpt, <= 200 chars>"}]}
+```
+
+- **Accepted evidence sources by type**: `fact` / `procedure` / `pitfall` cite a
+  tool result line or a user turn; `decision` cites a user turn or a tool result.
+- **Server verification is deterministic (no LLM, no code execution)**: the quote,
+  whitespace-collapsed and case-insensitive, must appear in the named turn's text
+  (body or attached tool-result lines).
+- Verified items get frontmatter `verified: true` and a `## Evidence` section
+  (`- T12: "quote"`). Unverifiable items are still written with `verified: false`
+  and their (unverifiable) evidence listed.
+- **Search**: results whose node has `verified: false` get `inject=false` (they are
+  still returned with scores via MCP/search). Nodes without the field — all
+  pre-existing nodes — are unaffected.
+
+Optional frontmatter (§2 addition): `verified` (`true` | `false`, system-managed,
+written by the distiller). Optional body section: `## Evidence` (list of
+`- T<n>: "<quote>"` entries; the validator accepts both, no warnings).
+
+Turn numbering follows the session transcript contract
+(`docs/transcript-format.md`): v2 transcripts number turns `T1..Tn` at submission;
+legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
+
+## 10. Chunked + incremental distillation
+
+- Transcripts are split into segments at turn boundaries
+  (`[distiller].segment_chars`, default 16 000 — same size as the old single-call
+  budget); a single oversized turn is split by characters. One extraction LLM call
+  runs per segment; nothing is head/tail-truncated away.
+- A reduce step merges/dedupes per-segment candidates to
+  `max_items_per_transcript`. The reduce LLM call runs only when candidates exceed
+  the cap or near-duplicate titles are detected; otherwise merging is skipped
+  deterministically. Known-titles / own-distilled-titles dedupe still applies.
+- Progress watermark: `distilled_turn` on the transcript frontmatter records the
+  last turn covered; a re-distill after new turns arrive processes only later
+  turns (one previous turn as context). `distilled_hash` semantics are unchanged.
