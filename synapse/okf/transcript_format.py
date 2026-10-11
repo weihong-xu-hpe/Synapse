@@ -30,12 +30,50 @@ class TranscriptTurn:
     number: int
     role: str  # "User" | "Assistant"
     body: str
-    # Raw lines of any `### Tool T<n>.<m> <name>` blocks attached to this turn.
+    # Raw blocks of any `### Tool T<n>.<m> <name>` sections attached to this turn.
     tool_sections: list[str] = field(default_factory=list)
 
     @property
     def id(self) -> str:
         return f"T{self.number}"
+
+    _TOOL_RESULT_LINE = re.compile(r"^\s*result \[[^\]]*\]:\s*(.*)$")
+    _TOOL_CALL_LINE = re.compile(r"^\s*call:\s*(.*)$")
+    _TOOL_RESULT_STATUS = re.compile(r"^\s*result \[([^\]]*)\]:")
+
+    def eligible_evidence_text(self, *, okf_type: str | None = None) -> str:
+        """Text a verified evidence quote may come from (docs/okf.md §9).
+
+        Eligible: (a) the body of a User turn, (b) the ``result [...] :``
+        lines of attached tool blocks, (c) for okf_type ``procedure``
+        additionally the ``call:`` lines of tool blocks whose result status
+        is ``ok``. Assistant prose never counts for any type.
+        """
+
+        if self.role == ROLE_USER:
+            return self.body
+        chunks: list[str] = []
+        for block in self.tool_sections:
+            for line in block.splitlines():
+                result_match = self._TOOL_RESULT_LINE.match(line)
+                if result_match is not None:
+                    chunks.append(result_match.group(1))
+                    continue
+                if okf_type == "procedure":
+                    status_match = self._TOOL_RESULT_STATUS.search(line)
+                    if status_match is not None:
+                        continue  # result line handled above regardless of status
+                    call_match = self._TOOL_CALL_LINE.match(line)
+                    if call_match is not None and self._tool_result_status_for(block) == "ok":
+                        chunks.append(call_match.group(1))
+        return "\n".join(chunks)
+
+    def _tool_result_status_for(self, block: str) -> str | None:
+        for line in block.splitlines():
+            status_match = self._TOOL_RESULT_STATUS.match(line)
+            if status_match is not None:
+                return status_match.group(1).strip().casefold()
+        return None
 
 
 @dataclass(slots=True)

@@ -1794,3 +1794,166 @@ def test_distiller_validates_clean_with_skill_sources(tmp_path: Path) -> None:
         sources=["skill://authz-shim-triage-fast"],
     )
     assert not any(w.code == "okf_unresolvable_source" for w in warnings)
+
+
+def test_evidence_eligible_sources_strict_by_type() -> None:
+    """§9 rule, enforced server-side: assistant prose never verifies; tool
+    result lines and user-turn bodies verify; procedure call lines verify only
+    with an ok result."""
+    from synapse.okf import EvidenceEntry, verify_evidence
+    from synapse.okf.transcript_format import parse_transcript
+
+    content = (
+        "<!-- synapse-transcript v2 -->\n"
+        "## T1 User\nwe chose kafka offsets for resume\n\n"
+        "## T2 Assistant\nassistant claims offsets gate works\n"
+        "### Tool T2.1 grep\n"
+        "call: grep -rn offsets src/\n"
+        "result [ok]: src/main.py:1 uses offsets gate\n\n"
+        "### Tool T2.2 rm\n"
+        "call: rm -rf /tmp/stale\n"
+        "result [error]: permission denied\n"
+    )
+    parsed = parse_transcript(content)
+
+    def turns_for(okf_type: str) -> dict[str, str]:
+        return {turn.id: turn.eligible_evidence_text(okf_type=okf_type) for turn in parsed.turns}
+
+    # Assistant prose quote: NEVER verified, whatever the type.
+    for okf_type in ("fact", "procedure", "decision", "pitfall"):
+        verified, _ = verify_evidence(
+            [EvidenceEntry(turn="T2", quote="assistant claims offsets gate works")],
+            turns=turns_for(okf_type),
+        )
+        assert verified == [], f"assistant prose must not verify for {okf_type}"
+
+    # Tool-result quote verifies for fact; user-turn quote verifies for decision.
+    verified, _ = verify_evidence(
+        [
+            EvidenceEntry(turn="T2", quote="src/main.py:1 uses offsets gate"),
+            EvidenceEntry(turn="T1", quote="we chose kafka offsets for resume"),
+        ],
+        turns=turns_for("fact"),
+    )
+    assert len(verified) == 2
+
+    # Procedure: call-line quote verifies only against an ok-result tool block.
+    verified_proc, _ = verify_evidence(
+        [
+            EvidenceEntry(turn="T2", quote="grep -rn offsets src/"),      # ok result block
+            EvidenceEntry(turn="T2", quote="rm -rf /tmp/stale"),          # error result block
+        ],
+        turns=turns_for("procedure"),
+    )
+    assert [e.quote for e in verified_proc] == ["grep -rn offsets src/"]
+
+    # Fact: the same call-line quote does NOT verify (call lines not eligible).
+    verified_fact, _ = verify_evidence(
+        [EvidenceEntry(turn="T2", quote="grep -rn offsets src/")],
+        turns=turns_for("fact"),
+    )
+    assert verified_fact == []
+
+    # v1 transcript (no tool blocks): only User turns are eligible.
+    v1 = parse_transcript("## User\nv1 user statement\n\n## Assistant\nv1 assistant prose\n")
+    verified_v1, _ = verify_evidence(
+        [
+            EvidenceEntry(turn="T1", quote="v1 user statement"),
+            EvidenceEntry(turn="T2", quote="v1 assistant prose"),
+        ],
+        turns={turn.id: turn.eligible_evidence_text() for turn in v1.turns},
+    )
+    assert [e.turn for e in verified_v1] == ["T1"]
+
+
+# ---------------------------------------------------------------------------
+# P2c: archived-transcript revival (backfill resubmission)
+# ---------------------------------------------------------------------------
+
+
+def test_archived_transcript_revives_on_reupsert_and_redisills(tmp_path: Path) -> None:
+    """A distilled+archived session_key, re-upserted with new v2 content,
+    revives as a fresh ACTIVE transcript: the archive keeps its copy, the DB
+    row points at the active file with default distillation state (except
+    carried-over distilled_node_ids for own-title dedupe), and the sweep
+    selects the new transcript."""
+    from tests.test_server_api import FakeSamplingClient
+
+    runtime_paths = _runtime(tmp_path)
+    session_key = "sess-revive"
+
+    # 1. Create + distill + archive via the distiller's REAL archive primitive.
+    service = SynapseServerService(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=FakeSamplingClient())
+    content_v1 = "## User\nkafka offset resume behavior\n"
+    up = service.upsert_session_memory(session_key=session_key, title="Session summary — revive", content=content_v1)
+    node_id = up["node"]["id"]
+    assert node_id.startswith("mem_session_")
+
+    class OneItemClient(FakeDistillSamplingClient):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            return {"items": [dict(_PITFALL_ITEM, title="Revived session pitfall")]}
+
+    distiller = Distiller(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=OneItemClient([dict(_PITFALL_ITEM, title="Revived session pitfall")]))
+    try:
+        import os
+
+        old_ts = (datetime.now(UTC) - timedelta(hours=2)).timestamp()
+        os.utime(runtime_paths.active / f"{node_id}.md", (old_ts, old_ts))
+        first_run = distiller.run(downgrade_supersede=False)
+        assert first_run.transcripts_distilled == 1
+
+        from synapse.storage import read_node_file
+
+        distilled = read_node_file(runtime_paths.active / f"{node_id}.md")
+        carried_ids = list(distilled.metadata.distilled_node_ids)
+        assert carried_ids
+
+        # Archive with the distiller's own primitive.
+        archived_node = service._load_node(node_id)
+        assert distiller._archive_transcript(archived_node) is True
+        assert (runtime_paths.archive / f"{node_id}.md").exists()
+        assert not (runtime_paths.active / f"{node_id}.md").exists()
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=0) as store:
+            assert store.get_node(node_id) is None, "archive must remove the index row"
+    finally:
+        distiller.close()
+
+    # 2. Re-upsert the same session_key with new v2 content (backfill client).
+    content_v2 = "<!-- synapse-transcript v2 -->\n## T1 User\nfresh resubmission of an old session\n"
+    up2 = service.upsert_session_memory(session_key=session_key, title="Session summary — revive", content=content_v2)
+    assert up2["action"] == "created"
+    assert up2["node"]["id"] == node_id, "same session key -> same node id"
+    # The DB row exists again, active, pointing at the active file.
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=0) as store:
+        row = store.get_node(node_id)
+    assert row is not None
+    assert row.metadata.status is NodeStatus.ACTIVE
+    assert row.file_path.as_posix() == f"active/{node_id}.md"
+    assert (runtime_paths.active / f"{node_id}.md").exists()
+    assert (runtime_paths.archive / f"{node_id}.md").exists(), "archived copy must be preserved"
+
+    revived_content = (runtime_paths.active / f"{node_id}.md").read_text(encoding="utf-8")
+    assert "distilled_hash:" not in revived_content or "distilled_hash: null" in revived_content
+    assert "distilled_turn:" not in revived_content or "distilled_turn: null" in revived_content
+    assert f"- {carried_ids[0]}" in revived_content, "distilled_node_ids carried over for dedupe"
+
+    # 3. The sweep selects the revived transcript and distills it fully.
+    distiller2 = Distiller(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=OneItemClient([dict(_PITFALL_ITEM, title="Second revival pitfall")]))
+    try:
+        import os
+
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / f"{node_id}.md", (old_ts, old_ts))
+        selected = distiller2.select_transcripts()
+        assert node_id in [n.id for n in selected], "revived transcript must be selected by the sweep"
+        run2 = distiller2.run(downgrade_supersede=False)
+        assert run2.transcripts_distilled == 1
+
+        from synapse.storage import read_node_file
+
+        restamped = read_node_file(runtime_paths.active / f"{node_id}.md")
+        assert restamped.metadata.distilled_hash == content_sha256(restamped.content)
+        assert restamped.metadata.distilled_turn == 1
+        assert carried_ids[0] in restamped.metadata.distilled_node_ids, "carried ids survive re-stamping"
+    finally:
+        distiller2.close()

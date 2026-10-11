@@ -424,10 +424,14 @@ class Distiller:
         candidates = self._reduce_candidates(transcript, candidates, own_titles, report, dry_run=dry_run)
 
         # Deterministic evidence verification (P2+, no LLM): quotes must
-        # appear (whitespace-collapsed, case-insensitive) in the named turn.
-        turn_texts = self._turn_texts_for_verification(parsed)
+        # appear in the named turn's ELIGIBLE text only (docs/okf.md §9) —
+        # user-turn bodies and tool result lines (call lines only for
+        # procedure with an ok result). Assistant prose never verifies.
         for item in candidates:
-            verified, unverified = verify_evidence(item.evidence, turns=turn_texts)
+            verified, unverified = verify_evidence(
+                item.evidence,
+                turns={turn.id: turn.eligible_evidence_text(okf_type=item.okf_type) for turn in parsed.turns},
+            )
             item.evidence = [*verified, *unverified]
             item.verified = bool(item.evidence) and not unverified
 
@@ -489,15 +493,6 @@ class Distiller:
                 },
             )
         return detail
-
-    @staticmethod
-    def _turn_texts_for_verification(parsed: ParsedTranscript) -> dict[str, str]:
-        """Turn id -> searchable text (body + attached tool-result lines)."""
-
-        return {
-            turn.id: "\n".join([turn.body, *turn.tool_sections])
-            for turn in parsed.turns
-        }
 
     @staticmethod
     def _build_segments(parsed: ParsedTranscript, *, watermark: int, max_chars: int) -> list[tuple[str, str]]:

@@ -271,8 +271,12 @@ Owner decision C — **annotate, never auto-inject**. Distilled items carry an
 - **Accepted evidence sources by type**: `fact` / `procedure` / `pitfall` cite a
   tool result line or a user turn; `decision` cites a user turn or a tool result.
 - **Server verification is deterministic (no LLM, no code execution)**: the quote,
-  whitespace-collapsed and case-insensitive, must appear in the named turn's text
-  (body or attached tool-result lines).
+  whitespace-collapsed and case-insensitive, must appear in the named turn's
+  **eligible evidence text** — (a) the body of a User turn, (b) the
+  `result [...]:` lines of attached tool blocks, and (c) for `procedure`
+  additionally the `call:` lines of tool blocks whose result status is `ok`.
+  Assistant prose never counts for any type; in v1 transcripts (no tool blocks)
+  only User turns are eligible. Quotes from any other text stay unverified.
 - Verified items get frontmatter `verified: true` and a `## Evidence` section
   (`- T12: "quote"`). Unverifiable items are still written with `verified: false`
   and their (unverifiable) evidence listed.

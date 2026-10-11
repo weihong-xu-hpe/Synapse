@@ -705,6 +705,20 @@ class SynapseServerService:
     def _session_node_id(session_key: str) -> str:
         return f"mem_session_{hashlib.sha1(session_key.encode('utf-8')).hexdigest()[:16]}"
 
+    def _load_archived_node_metadata(self, node_id: str) -> NodeMetadata | None:
+        """Frontmatter of an archived copy of the node, if one exists."""
+
+        from synapse.storage import read_node_file
+
+        archived_path = self.runtime_paths.archive / f"{node_id}.md"
+        if not archived_path.exists():
+            return None
+        try:
+            return read_node_file(archived_path).metadata
+        except (OSError, ValueError) as exc:
+            self.logger.warning("Failed to read archived transcript metadata", extra={"node_id": node_id, "error": str(exc)})
+            return None
+
     def upsert_session_memory(
         self,
         *,
@@ -748,8 +762,23 @@ class SynapseServerService:
 
             existing_path = self.runtime_paths.active / f"{node_id}.md"
             existing: Node | None = None
+            revived_distilled_ids: list[str] = []
             if existing_path.exists():
                 existing = self._load_node(node_id)
+            else:
+                # P2c revival: the session_key may have an ARCHIVED copy (the
+                # distiller archives distilled transcripts). Re-keyed upsert
+                # creates a fresh ACTIVE transcript; carry over the archive's
+                # distilled_node_ids so own-distilled-titles dedupe still
+                # works on re-distill, while distilled_hash / distilled_turn
+                # stay unset so it re-distills fully.
+                archived_metadata = self._load_archived_node_metadata(node_id)
+                if archived_metadata is not None:
+                    revived_distilled_ids = list(archived_metadata.distilled_node_ids)
+                    self.logger.info(
+                        "Reviving archived session transcript",
+                        extra={"node_id": node_id, "carried_distilled_node_ids": len(revived_distilled_ids)},
+                    )
 
             if existing is not None and existing.title == clean_title and existing.content == content:
                 action = "unchanged"
@@ -774,6 +803,7 @@ class SynapseServerService:
                     type=normalized_type,
                     sensitivity=normalized_sensitivity,
                     session_key=clean_key,
+                    distilled_node_ids=revived_distilled_ids,
                 )
                 node = Node(
                     metadata=metadata,
