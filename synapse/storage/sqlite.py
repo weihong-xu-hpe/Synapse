@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Literal, Sequence
 
-from synapse.models import Node, NodeMetadata, NodeStatus
+from synapse.models import Node, NodeMetadata, NodeStatus, NodeType
 from synapse.storage.markdown import extract_wiki_links
 
 
@@ -174,7 +174,17 @@ class SearchEventMetrics:
     results: tuple[dict[str, Any], ...]
 
 
-OKF_META_FIELDS = ("okf_type", "okf_version", "sources", "project", "distilled_hash", "distilled_at", "distilled_node_ids")
+OKF_META_FIELDS = (
+    "okf_type",
+    "okf_version",
+    "sources",
+    "project",
+    "distilled_hash",
+    "distilled_at",
+    "distilled_node_ids",
+    "distilled_turn",
+    "verified",
+)
 
 
 def _okf_meta_json(metadata: Any) -> str:
@@ -1071,6 +1081,91 @@ class SQLiteNodeStore:
             """
         ).fetchall()
         return [str(row["id"]) for row in rows]
+
+    def find_synthesis_clusters(
+        self,
+        *,
+        cosine_threshold: float = 0.80,
+        min_size: int = 4,
+        max_size: int = 20,
+    ) -> list[list[Node]]:
+        """Cluster active typed (okf_type set, non-transcript) nodes by embedding similarity.
+
+        Connected components over the similarity graph (edge when cosine >=
+        threshold), grouped per ``project``; components outside
+        [min_size, max_size] are skipped. Hub nodes (tagged in Sources with a
+        member id already covered by an existing hub) must not re-cluster as
+        members — callers exclude them before invoking; this query already
+        excludes nodes whose content contains a ``From:``-style hub marker via
+        the caller's filter.
+        """
+
+        rows = self._connection.execute(
+            """
+            SELECT n.id
+            FROM nodes AS n
+            JOIN nodes_vec AS v ON v.id = n.id
+            WHERE n.status = ? AND n.type = ? AND n.okf_meta LIKE '%"okf_type": "%'
+            ORDER BY n.id ASC
+            """,
+            [NodeStatus.ACTIVE.value, NodeType.PERSISTENT.value],
+        ).fetchall()
+        candidate_ids = [str(row["id"]) for row in rows]
+        if len(candidate_ids) < min_size:
+            return []
+
+        embeddings: dict[str, list[float]] = {}
+        nodes: dict[str, Node] = {}
+        for node_id in candidate_ids:
+            node = self.get_node(node_id)
+            if node is None or not node.metadata.okf_type:
+                continue
+            vec_row = self._connection.execute(
+                "SELECT embedding FROM nodes_vec WHERE id = ?", [node_id]
+            ).fetchone()
+            if vec_row is None:
+                continue
+            try:
+                embeddings[node_id] = json.loads(str(vec_row["embedding"]))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            nodes[node_id] = node
+
+        # Union-find over similarity edges.
+        parent: dict[str, str] = {node_id: node_id for node_id in embeddings}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        ids = sorted(embeddings)
+        for i, id_a in enumerate(ids):
+            for id_b in ids[i + 1 :]:
+                # Same-project constraint: nodes only cluster within a project.
+                if (nodes[id_a].metadata.project or "") != (nodes[id_b].metadata.project or ""):
+                    continue
+                similarity = _safe_cosine_similarity(embeddings[id_a], embeddings[id_b])
+                if similarity is not None and similarity >= cosine_threshold:
+                    union(id_a, id_b)
+
+        components: dict[str, list[str]] = {}
+        for node_id in ids:
+            components.setdefault(find(node_id), []).append(node_id)
+
+        clusters: list[list[Node]] = []
+        for member_ids in components.values():
+            if not (min_size <= len(member_ids) <= max_size):
+                continue
+            clusters.append([nodes[member_id] for member_id in sorted(member_ids)])
+        clusters.sort(key=lambda cluster: cluster[0].id)
+        return clusters
 
     def find_orphan_candidates(
         self,

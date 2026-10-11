@@ -17,6 +17,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -30,8 +31,11 @@ from synapse.okf import (
     parse_okf_items,
     parse_title_repair,
     render_distiller_prompt,
+    render_reduce_prompt,
     render_title_repair_prompt,
+    verify_evidence,
 )
+from synapse.okf.transcript_format import ParsedTranscript, parse_transcript
 from synapse.okf.transcripts import is_session_transcript
 from synapse.models import slugify_english_title
 from synapse.server.service import SynapseServiceError, SynapseServerService
@@ -55,6 +59,8 @@ class DistillerReport:
     items_extracted: int = 0
     items_invalid: int = 0
     items_sources_dropped: int = 0
+    reduced_items: int = 0
+    reduce_failures: int = 0
     guard_fallback_creates: int = 0
     title_repairs: int = 0
     title_repair_failures: int = 0
@@ -98,6 +104,8 @@ class DistillerReport:
             "items_extracted": self.items_extracted,
             "items_invalid": self.items_invalid,
             "items_sources_dropped": self.items_sources_dropped,
+            "reduced_items": self.reduced_items,
+            "reduce_failures": self.reduce_failures,
             "guard_fallback_creates": self.guard_fallback_creates,
             "title_repairs": self.title_repairs,
             "title_repair_failures": self.title_repair_failures,
@@ -124,6 +132,75 @@ from synapse.okf.transcripts import (  # noqa: F401  (re-exported for callers/te
 
 # Backwards-compatible alias: pre-A1 name meant "distilled at current revision".
 is_fully_distilled = is_distilled_current
+
+
+def _build_turn_segments(
+    parsed: ParsedTranscript,
+    *,
+    watermark: int,
+    max_chars: int,
+) -> list[tuple[str, str]]:
+    """Split parsed turns into segments of at most ``max_chars`` chars.
+
+    The first segment includes the watermark turn (if any) as verbatim context
+    so extraction sees continuity; its start turn is the first NEW turn.
+    An oversized single turn is split by characters — every slice is kept,
+    nothing is truncated away. Returns ``(segment_text, start_turn_id)``
+    pairs in order.
+    """
+
+    def turn_block(turn) -> str:  # TranscriptTurn
+        lines = [f"## {turn.id} {turn.role}"]
+        if turn.body:
+            lines.append(turn.body)
+        lines.extend(turn.tool_sections)
+        return "\n".join(lines)
+
+    pending = [turn for turn in parsed.turns if turn.number > watermark]
+    if not pending:
+        return []
+
+    context_turn = parsed.turn(watermark)
+    context_block = turn_block(context_turn) if context_turn is not None else ""
+
+    segments: list[tuple[str, str]] = []
+    current_chunks: list[str] = []
+    current_len = 0
+    current_start = pending[0].id
+
+    def flush() -> None:
+        nonlocal current_chunks, current_len, current_start
+        if current_chunks:
+            segments.append(("\n\n".join(current_chunks), current_start))
+            current_chunks = []
+            current_len = 0
+            current_start = pending[0].id if not segments else current_start
+
+    for index, turn in enumerate(pending):
+        block = turn_block(turn)
+        # Context only rides along on the very first segment.
+        effective = f"{context_block}\n\n{block}" if index == 0 and context_block else block
+        if current_chunks and current_len + len(effective) > max_chars:
+            flush()
+            # After a flush the context no longer applies.
+            effective = block
+        if len(effective) > max_chars:
+            # Oversized single turn: hard-split by chars, all slices kept.
+            slices = [effective[i : i + max_chars] for i in range(0, len(effective), max_chars)]
+            for slice_index, slice_text in enumerate(slices):
+                if current_chunks:
+                    flush()
+                start_id = turn.id if slice_index == 0 else f"{turn.id}#{slice_index + 1}"
+                segments.append((slice_text, start_id))
+            current_start = turn.id
+            continue
+        if not current_chunks:
+            current_start = turn.id
+        current_chunks.append(effective)
+        current_len += len(effective)
+
+    flush()
+    return segments
 
 
 class Distiller:
@@ -307,16 +384,60 @@ class Distiller:
         dry_run: bool,
         downgrade_supersede: bool,
     ) -> dict[str, Any]:
-        prompt = self._build_prompt(transcript)
-        payload = self._sample_json(prompt)
-        items = parse_okf_items(payload)
+        parsed = parse_transcript(transcript.content)
+        # Incremental distillation (P2c): only turns after the watermark are
+        # processed; one previous turn is included as context.
+        watermark = transcript.metadata.distilled_turn or 0
+        pending = parsed.turns_after(watermark)
+        if not pending:
+            # Nothing new since the last distillation — treat as current.
+            if not dry_run:
+                self._stamp_transcript(transcript, [])
+            report.transcripts_distilled += 1
+            return {"transcript_id": transcript.id, "items": [], "skipped_new_turns": 0}
+
+        segments = self._build_segments(parsed, watermark=watermark, max_chars=self.settings.segment_chars)
+        own_titles = self._titles_for_ids(transcript.metadata.distilled_node_ids)
+
+        # One extraction call per segment (same call size as the old
+        # single-call flow); candidates merge afterwards.
+        candidates: list[OkfItem] = []
+        extraction_failures = 0
+        for segment_text, start_turn in segments:
+            prompt = self._build_prompt(
+                transcript_content=segment_text,
+                start_turn=start_turn,
+                own_titles=own_titles,
+            )
+            try:
+                payload = self._sample_json(prompt)
+                candidates.extend(parse_okf_items(payload))
+            except Exception as exc:  # noqa: BLE001 — one bad segment must not lose the others
+                extraction_failures += 1
+                self._logger.warning(
+                    "Segment extraction failed",
+                    extra={"node_id": transcript.id, "start_turn": start_turn, "error": str(exc)},
+                )
+        if extraction_failures and not candidates:
+            raise RuntimeError(f"All {extraction_failures} segment extraction(s) failed")
+
+        candidates = self._reduce_candidates(transcript, candidates, own_titles, report, dry_run=dry_run)
+
+        # Deterministic evidence verification (P2+, no LLM): quotes must
+        # appear (whitespace-collapsed, case-insensitive) in the named turn.
+        turn_texts = self._turn_texts_for_verification(parsed)
+        for item in candidates:
+            verified, unverified = verify_evidence(item.evidence, turns=turn_texts)
+            item.evidence = [*verified, *unverified]
+            item.verified = bool(item.evidence) and not unverified
+
         produced_ids: list[str] = []
-        detail: dict[str, Any] = {"transcript_id": transcript.id, "items": []}
+        detail: dict[str, Any] = {"transcript_id": transcript.id, "items": [], "segments": len(segments)}
 
         service = self._get_service()
         token = service.push_sampling_client(self._get_sampling_client())
         try:
-            for item in items:
+            for item in candidates:
                 # Title rule (docs/okf.md §3): English titles so IDs stay
                 # meaningful. One repair call for CJK/degenerate titles; never
                 # drop the item — fallback ID + warning if repair fails.
@@ -342,25 +463,52 @@ class Distiller:
                 item.sources = kept
                 action_note = self._write_item(service, transcript, item, report, dry_run=dry_run, downgrade_supersede=downgrade_supersede)
                 produced_ids.extend(action_note.get("node_ids", []))
-                detail["items"].append({"title": item.title, "okf_type": item.okf_type, **action_note})
+                detail["items"].append(
+                    {"title": item.title, "okf_type": item.okf_type, "verified": item.verified, **action_note}
+                )
         finally:
             service.reset_sampling_client(token)
 
-        report.items_extracted += len(items)
+        report.items_extracted += len(candidates)
         report.transcripts_distilled += 1
 
         if not dry_run:
-            self._stamp_transcript(transcript, produced_ids)
+            # The watermark covers everything parsed NOW (the client may have
+            # appended turns while we distilled); late turns surface on the
+            # next sweep via the content-hash gate.
+            self._stamp_transcript(transcript, produced_ids, distilled_turn=parsed.last_turn_number)
             self._logger.info(
                 "Distilled transcript",
                 extra={
                     "node_id": transcript.id,
-                    "items": len(items),
-                    "types": sorted({item.okf_type for item in items}),
+                    "segments": len(segments),
+                    "items": len(candidates),
+                    "types": sorted({item.okf_type for item in candidates}),
                     "knowledge_ids": produced_ids,
+                    "distilled_turn": parsed.last_turn_number,
                 },
             )
         return detail
+
+    @staticmethod
+    def _turn_texts_for_verification(parsed: ParsedTranscript) -> dict[str, str]:
+        """Turn id -> searchable text (body + attached tool-result lines)."""
+
+        return {
+            turn.id: "\n".join([turn.body, *turn.tool_sections])
+            for turn in parsed.turns
+        }
+
+    @staticmethod
+    def _build_segments(parsed: ParsedTranscript, *, watermark: int, max_chars: int) -> list[tuple[str, str]]:
+        """Split the transcript into ~max_chars blocks at turn boundaries.
+
+        Returns ``(segment_text, start_turn_id)`` pairs. The turn containing
+        the watermark is included as context for the first segment; a single
+        oversized turn is split by chars. Nothing is truncated away.
+        """
+
+        return _build_turn_segments(parsed, watermark=watermark, max_chars=max_chars)
 
     # Prompt-size guard: only the 200 most recently accessed persistent
     # titles go into the "already known" block (design A5).
@@ -423,21 +571,87 @@ class Distiller:
             return None
         return repaired
 
-    def _build_prompt(self, transcript: Node) -> str:
+    def _known_titles(self) -> list[str]:
         store = self._get_store()
         persistent = [
             node for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
         ]
         persistent.sort(key=lambda n: n.metadata.last_accessed or n.metadata.created_at, reverse=True)
-        known_titles = [node.title for node in persistent[: self.MAX_KNOWN_TITLES]]
-        own_titles = self._titles_for_ids(transcript.metadata.distilled_node_ids)
+        return [node.title for node in persistent[: self.MAX_KNOWN_TITLES]]
+
+    def _build_prompt(self, *, transcript_content: str, start_turn: str, own_titles: list[str]) -> str:
         return render_distiller_prompt(
-            transcript=transcript.content,
-            known_titles=known_titles,
+            transcript=transcript_content,
+            known_titles=self._known_titles(),
             own_distilled_titles=own_titles,
-            max_chars=self.settings.max_transcript_chars,
             max_items=self.settings.max_items_per_transcript,
+            start_turn=start_turn,
         )
+
+    def _reduce_candidates(
+        self,
+        transcript: Node,
+        candidates: list[OkfItem],
+        own_titles: list[str],
+        report: DistillerReport,
+        *,
+        dry_run: bool,
+    ) -> list[OkfItem]:
+        """Merge/dedupe per-segment candidates down to max_items_per_transcript.
+
+        LLM reduce call only when candidates exceed the cap or near-duplicate
+        titles are detected (whitespace-collapsed prefix match); otherwise the
+        deterministic path returns candidates unchanged — an LLM call cannot
+        dedupe what is provably distinct, and skipping it keeps single-segment
+        sweeps at exactly one extraction call.
+        """
+
+        max_items = self.settings.max_items_per_transcript
+        if not candidates:
+            return []
+
+        def _norm(title: str) -> str:
+            return " ".join(title.split()).casefold()
+
+        duplicates_likely = any(
+            _norm(a.title) == _norm(b.title) or _norm(a.title).startswith(_norm(b.title)) or _norm(b.title).startswith(_norm(a.title))
+            for i, a in enumerate(candidates)
+            for b in candidates[i + 1 :]
+        )
+        if len(candidates) <= max_items and not duplicates_likely:
+            return candidates
+
+        if dry_run:
+            return candidates
+
+        candidates_json = json.dumps(
+            {"items": [{"okf_type": item.okf_type, "title": item.title, "takeaway": item.takeaway,
+                        "sections": item.sections, "sources": item.sources,
+                        "evidence": [{"turn": e.turn, "quote": e.quote} for e in item.evidence]}
+                       for item in candidates]},
+            ensure_ascii=False,
+        )
+        prompt = render_reduce_prompt(
+            candidates_json=candidates_json,
+            max_items=max_items,
+            known_titles=self._known_titles(),
+            own_distilled_titles=own_titles,
+        )
+        try:
+            payload = self._sample_json(prompt)
+            merged = parse_okf_items(payload)
+        except Exception as exc:  # noqa: BLE001 — reduce failure keeps raw candidates (cap applied deterministically)
+            self._logger.warning(
+                "Reduce call failed; applying deterministic cap",
+                extra={"node_id": transcript.id, "error": str(exc)},
+            )
+            report.reduce_failures += 1
+            return candidates[:max_items]
+        if not merged:
+            report.reduce_failures += 1
+            return candidates[:max_items]
+        report.reduced_items += max(0, len(candidates) - len(merged))
+        return merged
 
     def _titles_for_ids(self, node_ids: list[str]) -> list[str]:
         if not node_ids:
@@ -487,6 +701,7 @@ class Distiller:
                 downgrade_supersede=downgrade_supersede,
                 node_id=forced_node_id,
                 route="distiller",
+                verified=item.verified,
             )
         except SynapseServiceError as exc:
             guard_fired = (
@@ -549,7 +764,7 @@ class Distiller:
     # Transcript state
     # ------------------------------------------------------------------
 
-    def _stamp_transcript(self, transcript: Node, knowledge_ids: list[str]) -> None:
+    def _stamp_transcript(self, transcript: Node, knowledge_ids: list[str], *, distilled_turn: int | None = None) -> None:
         path = self.runtime_paths.base / transcript.file_path
         if not path.exists():
             return
@@ -557,11 +772,15 @@ class Distiller:
         if node is None:
             return
         merged_ids = list(dict.fromkeys([*node.metadata.distilled_node_ids, *knowledge_ids]))
+        # Incremental watermark (P2c): only advance when this run covered
+        # turns; a stamp without a watermark keeps the previous value.
+        watermark = distilled_turn if distilled_turn is not None else node.metadata.distilled_turn
         metadata = node.metadata.model_copy(
             update={
                 "distilled_hash": content_sha256(node.content),
                 "distilled_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "distilled_node_ids": merged_ids,
+                "distilled_turn": watermark,
             }
         )
         write_node_file(node.model_copy(update={"metadata": metadata}), base_path=self.runtime_paths.base)

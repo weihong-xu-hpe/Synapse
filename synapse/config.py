@@ -215,6 +215,13 @@ class DreamerThresholdSettings(BaseModel):
     superseded_archive_days: int = Field(default=7, ge=1)
     low_structure_chars: int = Field(default=100, ge=1)
     max_missing_link_pairs_per_run: int = Field(default=100, ge=1)
+    # P3 synthesis stage: cluster active typed nodes per project by cosine
+    # similarity; clusters of size [min_synthesis_cluster, max_synthesis_cluster]
+    # above synthesis_cosine get one hub node each (max per run capped).
+    synthesis_cosine: float = Field(default=0.80, ge=0.0, le=1.0)
+    min_synthesis_cluster: int = Field(default=4, ge=2)
+    max_synthesis_cluster: int = Field(default=20, ge=2)
+    max_synthesis_hubs_per_run: int = Field(default=10, ge=1)
 
 
 class DreamerSettings(BaseModel):
@@ -236,6 +243,11 @@ class DistillerSettings(BaseModel):
     idle_minutes: int = Field(default=30, ge=1)
     retention_days: int = Field(default=45, ge=1)
     max_transcript_chars: int = Field(default=16_000, ge=1000)
+    # P2c: per-segment budget for chunked distillation. Transcripts are split
+    # at turn boundaries up to this many chars (one extraction call per
+    # segment, same call size as the old single-call flow); a single
+    # oversized turn is split by chars. Nothing is head/tail-truncated away.
+    segment_chars: int = Field(default=16_000, ge=1000)
     max_items_per_transcript: int = Field(default=5, ge=1, le=20)
     # When true, a decider supersede targeting an existing non-distilled
     # persistent node is downgraded to complement (backfill safety; default ON

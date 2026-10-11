@@ -1502,3 +1502,189 @@ def test_distiller_llm_timeout_uses_distiller_setting_not_decider(tmp_path: Path
 def test_distiller_llm_timeout_default_is_300(tmp_path: Path) -> None:
     config = _config(tmp_path)
     assert config.distiller.llm_timeout_seconds == 300
+
+
+# ---------------------------------------------------------------------------
+# P2c: chunked distillation + transcript format v2
+# ---------------------------------------------------------------------------
+
+
+def test_parse_transcript_v2_and_legacy_v1() -> None:
+    from synapse.okf.transcript_format import parse_transcript
+
+    v2 = (
+        "<!-- synapse-transcript v2 -->\n"
+        "## T1 User\nhelp fix bug\n\n"
+        "## T2 Assistant\ninvestigating\n"
+        "### Tool T2.1 grep\ncall: grep -rn bug\nresult [ok]: found it …elided… tail\n\n"
+        "## T3 User\nthanks\n"
+    )
+    parsed = parse_transcript(v2)
+    assert parsed.version == 2
+    assert [t.id for t in parsed.turns] == ["T1", "T2", "T3"]
+    assert parsed.turns[1].body == "investigating"
+    assert len(parsed.turns[1].tool_sections) == 1
+    assert "grep -rn bug" in parsed.turns[1].tool_sections[0]
+    assert parsed.last_turn_number == 3
+
+    legacy = "## User\nfirst\n\n## Assistant\nanswer\n\n## User\nsecond\n"
+    parsed_v1 = parse_transcript(legacy)
+    assert parsed_v1.version == 1
+    assert [t.id for t in parsed_v1.turns] == ["T1", "T2", "T3"]
+    assert [t.role for t in parsed_v1.turns] == ["User", "Assistant", "User"]
+
+
+def test_build_turn_segments_respects_budget_and_context() -> None:
+    from synapse.lifecycle.distiller import _build_turn_segments
+    from synapse.okf.transcript_format import parse_transcript
+
+    content = (
+        "<!-- synapse-transcript v2 -->\n"
+        "## T1 User\n" + "a" * 200 + "\n\n"
+        "## T2 User\n" + "b" * 200 + "\n\n"
+        "## T3 User\n" + "c" * 200 + "\n"
+    )
+    parsed = parse_transcript(content)
+    # Watermark 1: T1 is context on the first segment; start turn is T2.
+    segments = _build_turn_segments(parsed, watermark=1, max_chars=600)
+    assert segments[0][1] == "T2"
+    assert "## T1 User" in segments[0][0]
+    assert all(len(text) <= 600 for text, _ in segments)
+    # All turn content survives.
+    joined = "\n".join(text for text, _ in segments)
+    assert "a" * 200 in joined and "b" * 200 in joined and "c" * 200 in joined
+
+    # Oversized single turn splits by chars, nothing lost.
+    big = (
+        "<!-- synapse-transcript v2 -->\n"
+        "## T1 User\n" + "x" * 1500 + "\n"
+    )
+    parsed_big = parse_transcript(big)
+    big_segments = _build_turn_segments(parsed_big, watermark=0, max_chars=600)
+    assert len(big_segments) >= 3
+    assert sum(len(text) for text, _ in big_segments) >= 1500
+
+
+def test_chunked_distillation_one_call_per_segment_and_reduce(tmp_path: Path) -> None:
+    """A transcript over the segment budget gets one extraction call per
+    segment; candidates over max_items go through ONE reduce call."""
+
+    calls: list[dict[str, Any]] = []
+
+    class SegmentThenCapClient:
+        name = "fake-chunked"
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            calls.append({"prompt": prompt, "max_tokens": max_tokens})
+            # Extraction calls return one item each; the reduce call returns 2.
+            if '"title"' in prompt and "Reduce" not in prompt and "merge" in prompt.lower():
+                return {
+                    "items": [
+                        dict(_PITFALL_ITEM, title="Merged pitfall one"),
+                        dict(_PITFALL_ITEM, title="Merged pitfall two"),
+                    ]
+                }
+            return {"items": [dict(_PITFALL_ITEM, title=f"Segment pitfall {len(calls)}")]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            candidate_ids = [candidate.node_id for candidate in request.candidates]
+            if candidate_ids:
+                return MemoryWriteSamplingDecision(
+                    action="complement", target_node_ids=(candidate_ids[0],), reasoning="complement", confidence=0.9
+                )
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.segment_chars = 800
+    runtime_paths = bootstrap_runtime_directories(config)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=SegmentThenCapClient())
+    try:
+        import os
+
+        turn = "## T{n} User\n" + ("lesson about kafka offsets " * 20)
+        content = "<!-- synapse-transcript v2 -->\n" + "\n\n".join(
+            turn.format(n=n) for n in range(1, 9)
+        )
+        _write_transcript(runtime_paths, "mem_session_chunk1", content, session_key="sess-chunk")
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / "mem_session_chunk1.md", (old_ts, old_ts))
+
+        report = distiller.run(downgrade_supersede=False)
+        assert report.transcripts_distilled == 1
+        extraction_calls = [c for c in calls if "Transcript segment:" in c["prompt"]]
+        assert len(extraction_calls) >= 2, "large transcript must be split into segments"
+        # max_items default 5 < 8 candidates -> reduce happened.
+        assert report.reduced_items >= 1
+        # Watermark stamped to the last turn.
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / "mem_session_chunk1.md")
+        assert stamped.metadata.distilled_turn == 8
+    finally:
+        distiller.close()
+
+
+def test_incremental_distillation_only_processes_new_turns(tmp_path: Path) -> None:
+    """After a first distill, growing the transcript only extracts from new
+    turns (one previous turn as context), and unchanged transcripts re-distill
+    nothing."""
+
+    extraction_prompts: list[str] = []
+
+    class IncrementalClient:
+        name = "fake-incremental"
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            extraction_prompts.append(prompt)
+            return {"items": [dict(_PITFALL_ITEM, title=f"Incremental pitfall {len(extraction_prompts)}")]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            candidate_ids = [candidate.node_id for candidate in request.candidates]
+            if candidate_ids:
+                return MemoryWriteSamplingDecision(
+                    action="complement", target_node_ids=(candidate_ids[0],), reasoning="complement", confidence=0.9
+                )
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    runtime_paths = bootstrap_runtime_directories(config)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=IncrementalClient())
+    try:
+        import os
+
+        def turn(n: int, word: str) -> str:
+            return f"## T{n} User\n{word} " + ("durable offset lesson " * 20)
+
+        content = "<!-- synapse-transcript v2 -->\n" + "\n\n".join([turn(1, "alpha"), turn(2, "beta")])
+        transcript = _write_transcript(runtime_paths, "mem_session_inc9", content, session_key="sess-inc9")
+        ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / "mem_session_inc9.md", (ts, ts))
+        distiller.run(downgrade_supersede=False)
+        assert len(extraction_prompts) == 1
+        first_prompt = extraction_prompts[0]
+        assert "alpha" in first_prompt and "beta" in first_prompt
+
+        # Grow: add T3. Re-distill processes only T2 (context) + T3.
+        from synapse.storage import read_node_file
+
+        stamped_before = read_node_file(runtime_paths.active / "mem_session_inc9.md")
+        assert stamped_before.metadata.distilled_turn == 2
+        grown = stamped_before.model_copy(update={"content": content + "\n\n" + turn(3, "gamma")})
+        write_node_file(grown, base_path=runtime_paths.base)
+        _sync_all(runtime_paths)
+        os.utime(runtime_paths.active / "mem_session_inc9.md", (ts, ts))
+        report2 = distiller.run(downgrade_supersede=False)
+        assert report2.transcripts_distilled == 1
+        second_prompt = extraction_prompts[1]
+        assert "gamma" in second_prompt
+        assert "## T1 User" not in second_prompt, "turns before the watermark context must not reappear"
+
+        # Unchanged transcript: not re-selected.
+        report3 = distiller.run(downgrade_supersede=False)
+        assert report3.transcripts_scanned == 0
+    finally:
+        distiller.close()

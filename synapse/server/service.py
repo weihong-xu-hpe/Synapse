@@ -279,6 +279,7 @@ class SynapseServerService:
         sources: list[str] | None = None,
         project: str | None = None,
         node_id: str | None = None,
+        verified: bool | None = None,
     ) -> dict[str, Any]:
         """Execute an explicit memory write action decided by the higher-level orchestration layer.
 
@@ -338,6 +339,7 @@ class SynapseServerService:
             okf_version=okf_version,
             sources=list(sources) if sources else [],
             project=project,
+            verified=verified,
         )
         new_node = Node(
             metadata=metadata,
@@ -421,6 +423,7 @@ class SynapseServerService:
         node_id: str | None = None,
         downgrade_supersede: bool = False,
         route: str | None = None,
+        verified: bool | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -468,6 +471,7 @@ class SynapseServerService:
                 node_id=node_id,
                 downgrade_supersede=downgrade_supersede,
                 route=route,
+                verified=verified,
             )
 
     def _find_identical_active_node(self, title: str, content: str) -> Node | None:
@@ -500,6 +504,7 @@ class SynapseServerService:
         node_id: str | None = None,
         downgrade_supersede: bool = False,
         route: str | None = None,
+        verified: bool | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         warnings: list[dict[str, str]] = []
@@ -607,6 +612,7 @@ class SynapseServerService:
                 sources=sources,
                 project=project,
                 node_id=node_id,
+                verified=verified,
             )
         except SynapseServiceError as exc:
             self._record_write_memory_metrics(

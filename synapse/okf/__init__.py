@@ -7,7 +7,7 @@ strings so they are machine-checkable; body content may be zh/en/bilingual.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 OKF_VERSION = 1
@@ -31,6 +31,74 @@ SECTION_CAUSE = "Cause"
 SECTION_FIX = "Fix"
 
 TAKEAWAY_MAX_CHARS = 200
+
+# P2+ evidence (owner decision C, docs/okf.md §9): each distilled item carries
+# evidence quotes; the server verifies them deterministically.
+SECTION_EVIDENCE = "Evidence"
+EVIDENCE_QUOTE_MAX_CHARS = 200
+
+
+@dataclass(slots=True)
+class EvidenceEntry:
+    """One ``{"turn": "T12", "quote": "…"}`` pair from the extraction payload."""
+
+    turn: str
+    quote: str
+
+
+def parse_evidence(raw: object) -> list[EvidenceEntry]:
+    """Parse the evidence array of one item; malformed entries are dropped."""
+
+    if not isinstance(raw, list):
+        return []
+    entries: list[EvidenceEntry] = []
+    for raw_entry in raw:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        turn = str(raw_entry.get("turn") or "").strip()
+        quote = str(raw_entry.get("quote") or "").strip()
+        if not turn or not quote:
+            continue
+        entries.append(EvidenceEntry(turn=turn, quote=quote))
+    return entries
+
+
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def verify_evidence(
+    evidence: list[EvidenceEntry],
+    *,
+    turns: Mapping[str, str],
+) -> tuple[list[EvidenceEntry], list[EvidenceEntry]]:
+    """Deterministically verify evidence quotes against turn texts (NO LLM).
+
+    A quote verifies when, whitespace-collapsed and case-insensitive, it
+    appears in the named turn's body or attached tool-result lines. Returns
+    ``(verified, unverified)`` in input order.
+    """
+
+    verified: list[EvidenceEntry] = []
+    unverified: list[EvidenceEntry] = []
+    for entry in evidence:
+        turn_text = turns.get(entry.turn)
+        if turn_text is not None and _collapse_whitespace(entry.quote) in _collapse_whitespace(turn_text):
+            verified.append(entry)
+        else:
+            unverified.append(entry)
+    return verified, unverified
+
+
+def render_evidence_section(entries: list[EvidenceEntry]) -> str:
+    """Render the optional ``## Evidence`` section lines (``- T12: "quote"``)."""
+
+    lines = [f"## {SECTION_EVIDENCE}", ""]
+    for entry in entries:
+        quote = entry.quote if len(entry.quote) <= EVIDENCE_QUOTE_MAX_CHARS else entry.quote[:EVIDENCE_QUOTE_MAX_CHARS]
+        lines.append(f'- {entry.turn}: "{quote}"')
+    lines.append("")
+    return "\n".join(lines)
 
 # Allowed source entry shapes (docs/okf.md §2): bare node id, wiki-link-wrapped
 # node id, http(s) URL, or session-key reference.
@@ -273,9 +341,12 @@ class OkfItem:
     takeaway: str
     sections: dict[str, str]
     sources: list[str]
+    evidence: list[EvidenceEntry] = field(default_factory=list)
+    # True when every evidence entry verified against the source transcript.
+    verified: bool = False
 
     def render(self) -> str:
-        """Render the full OKF Markdown body per docs/okf.md §3."""
+        """Render the full OKF Markdown body per docs/okf.md §3 (and §9)."""
 
         required = TYPE_REQUIRED_SECTIONS[self.okf_type]
         lines: list[str] = [f"## {SECTION_TAKEAWAY}", "", self.takeaway.strip(), ""]
@@ -288,6 +359,8 @@ class OkfItem:
         for source in self.sources:
             lines.append(f"- {source}")
         lines.append("")
+        if self.evidence:
+            lines.append(render_evidence_section(self.evidence))
         return "\n".join(lines)
 
 
@@ -319,10 +392,13 @@ def parse_okf_items(payload: object) -> list[OkfItem]:
             continue
         sections = {str(k): str(v) for k, v in sections_raw.items()}
         sources = [str(s).strip() for s in sources_raw if str(s).strip()] if isinstance(sources_raw, list) else []
+        evidence = parse_evidence(raw.get("evidence"))
         missing = [s for s in TYPE_REQUIRED_SECTIONS[okf_type] if not sections.get(s, "").strip()]
         if missing or len(takeaway) > TAKEAWAY_MAX_CHARS or len(takeaway.splitlines()) != 1:
             continue
-        items.append(OkfItem(okf_type=okf_type, title=title, takeaway=takeaway, sections=sections, sources=sources))
+        items.append(
+            OkfItem(okf_type=okf_type, title=title, takeaway=takeaway, sections=sections, sources=sources, evidence=evidence)
+        )
     return items
 
 
@@ -368,16 +444,15 @@ def render_distiller_prompt(
     transcript: str,
     known_titles: list[str],
     own_distilled_titles: list[str],
-    max_chars: int,
     max_items: int,
+    start_turn: str = "T1",
 ) -> str:
-    """Build the distillation prompt (design doc §3)."""
+    """Build one extraction prompt for one transcript segment (design doc §3, §9).
 
-    content = transcript
-    if len(content) > max_chars:
-        head = max_chars // 2
-        tail = max_chars - head
-        content = content[:head] + "\n…\n" + content[-tail:]
+    ``transcript`` is a pre-rendered segment (already char-budgeted by the
+    caller's turn-boundary chunking — no truncation here). ``start_turn``
+    tells the model the segment begins mid-conversation.
+    """
 
     known_block = "\n".join(f"- {t}" for t in known_titles[:50]) or "- (none)"
     own_block = "\n".join(f"- {t}" for t in own_distilled_titles[:50]) or "- (none)"
@@ -385,18 +460,19 @@ def render_distiller_prompt(
     type_rules = []
     for okf_type, required in TYPE_REQUIRED_SECTIONS.items():
         type_rules.append(
-            f"- okf_type \"{okf_type}\": required sections {', '.join(f'## {s}' for s in (SECTION_TAKEAWAY, *required, SECTION_SOURCES))}"
+            f'- okf_type "{okf_type}": required sections {", ".join(f"## {s}" for s in (SECTION_TAKEAWAY, *required, SECTION_SOURCES))}'
         )
 
     return "\n".join(
         [
-            "You extract durable, reusable engineering knowledge from a coding-agent session transcript.",
+            "You extract durable, reusable engineering knowledge from a coding-agent session transcript segment.",
             "Extract ONLY knowledge that will still be valuable later: how a system works, decisions with rationale,",
             "step-by-step procedures, and pitfalls (symptom/cause/fix).",
             "NEVER extract: session narrative, status chatter (e.g. 'done', 'running tests'), raw tool output,",
             "or transient environment specifics (ports, pids, tmp paths) unless they are the durable lesson.",
             "Language: mirror the source language of the knowledge (Chinese, English, or mixed);",
             "section headings MUST be exactly the fixed English strings below.",
+            f"This segment starts at turn {start_turn}; earlier turns may appear only as context.",
             "",
             "OKF templates (pick one okf_type per item):",
             *type_rules,
@@ -406,6 +482,13 @@ def render_distiller_prompt(
             "identifiers (service/component/error/file). Do NOT prefix titles with the type (no 'Procedure:',",
             "'Decision:' etc) and no dates unless the knowledge is date-bound. Body/Takeaway keep the source language.",
             "",
+            "EVIDENCE (required per item): cite where the knowledge came from as",
+            '"evidence": [{"turn": "<Tn>", "quote": "<verbatim excerpt from that turn, <= 200 chars>"}].',
+            "Accepted evidence sources depend on the type:",
+            '- fact/procedure/pitfall: a quote from a tool result line or a user turn;',
+            "- decision: a quote from a user turn or a tool result.",
+            "The quote must appear VERBATIM in that turn — it is checked mechanically.",
+            "",
             f"Extract at most {max_items} items. Skip anything already covered by these known knowledge nodes:",
             known_block,
             "",
@@ -414,9 +497,48 @@ def render_distiller_prompt(
             "",
             "Respond with a single JSON object, no markdown fence, no extra prose:",
             '{"items": [{"okf_type": "decision|fact|procedure|pitfall", "title": "...", "takeaway": "...",',
-            '  "sections": {"<SectionName>": "markdown"}, "sources": ["..."]}]}',
+            '  "sections": {"<SectionName>": "markdown"}, "sources": ["..."],',
+            '  "evidence": [{"turn": "T12", "quote": "..."}]}]}',
             "",
-            "Transcript:",
-            content,
+            "Transcript segment:",
+            transcript,
+        ]
+    )
+
+
+def render_reduce_prompt(
+    *,
+    candidates_json: str,
+    max_items: int,
+    known_titles: list[str],
+    own_distilled_titles: list[str],
+) -> str:
+    """Reduce step: merge/dedupe extraction candidates down to <= max_items."""
+
+    known_block = "\n".join(f"- {t}" for t in known_titles[:50]) or "- (none)"
+    own_block = "\n".join(f"- {t}" for t in own_distilled_titles[:50]) or "- (none)"
+    return "\n".join(
+        [
+            "You merge knowledge items extracted from segments of one session transcript.",
+            "The candidates below were extracted independently per segment and may overlap or duplicate.",
+            "Merge duplicates and near-duplicates into single items; keep every distinct piece of knowledge.",
+            "Preserve each item's shape exactly: okf_type, English title (<= 90 chars), single-line takeaway",
+            "(<= 200 chars), sections, sources, and the evidence array (merge evidence lists when merging items).",
+            "Do not invent new items and do not drop evidence entries.",
+            "",
+            f"Respond with at most {max_items} items total (the most durable, highest-value knowledge).",
+            "Skip anything already covered by these known knowledge nodes:",
+            known_block,
+            "",
+            "Do not re-emit knowledge already distilled from this same transcript:",
+            own_block,
+            "",
+            "Respond with a single JSON object, no markdown fence, no extra prose:",
+            '{"items": [{"okf_type": "decision|fact|procedure|pitfall", "title": "...", "takeaway": "...",',
+            '  "sections": {"<SectionName>": "markdown"}, "sources": ["..."],',
+            '  "evidence": [{"turn": "T12", "quote": "..."}]}]}',
+            "",
+            "Candidates:",
+            candidates_json,
         ]
     )

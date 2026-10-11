@@ -120,6 +120,13 @@ class NodeMetadata(BaseModel):
     distilled_hash: str | None = None
     distilled_at: str | None = None
     distilled_node_ids: list[str] = Field(default_factory=list)
+    # P2c incremental distillation: last turn number covered by distillation.
+    # None = never (or legacy) distilled; re-distills process later turns only.
+    distilled_turn: int | None = None
+    # P2+ evidence (owner decision C): true when every evidence quote in the
+    # node was deterministically verified against the source transcript.
+    # Absent on pre-existing nodes — treated as unverified-only-if-present.
+    verified: bool | None = None
     tags: list[str] = Field(default_factory=list)
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
 
