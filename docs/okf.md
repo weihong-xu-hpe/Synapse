@@ -30,7 +30,7 @@ Required frontmatter:
 |---|---|---|
 | `okf_type` | string enum | `decision` \| `fact` \| `procedure` \| `pitfall` |
 | `okf_version` | integer | `1` (current spec version) |
-| `sources` | list of strings | ≥ 1 entry; each entry is a node id (`mem_…`), a session key, or a URI. Empty sources are invalid. |
+| `sources` | list of strings | ≥ 1 entry; each entry is a node id (`mem_…`), a session key, a `skill://<name>` URI (knowledge derived from an agent skill), or a URI. Empty sources are invalid. |
 
 Optional frontmatter: `project` (string, e.g. `acme/payments-svc`), `tags` (existing field), plus all
 system frontmatter (id/title/created_at/type/status/… — system-managed, unchanged).
@@ -202,7 +202,7 @@ warnings; later: codes marked ⛔ reject):
 | `okf_unknown_type` ⛔ | `okf_type` not in the enum §2 |
 | `okf_missing_version` | `okf_version` absent |
 | `okf_missing_sources` ⛔ | frontmatter `sources` empty/absent |
-| `okf_unresolvable_source` | a `sources` entry is neither a resolvable node id nor a URI/session key |
+| `okf_unresolvable_source` | a `sources` entry is neither a resolvable node id nor a URI/session key/`skill://<name>` |
 | `okf_missing_section:<Name>` ⛔ | a required section for the type (§3) absent or empty |
 | `okf_takeaway_invalid` | `## Takeaway` missing, multi-line, or first line > 200 chars |
 | `okf_takeaway_missing` ⛔ | `## Takeaway` section absent |

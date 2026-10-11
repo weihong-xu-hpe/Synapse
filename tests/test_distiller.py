@@ -601,10 +601,15 @@ def test_search_excludes_fully_distilled_transcripts_by_default(tmp_path: Path) 
         ]
         assert "mem_session_search1" in all_hits
 
-        # Undistilled transcripts remain in default search.
+        # P2b: ALL session transcripts are excluded from default search,
+        # distilled or not — transcripts are storage-only raw material.
         _write_transcript(runtime_paths, "mem_session_search2", "## User\nrrf fusion parameter\n\n## Assistant\nk=60", session_key="s9")
         default_hits2 = [r["node"]["id"] for r in service.search_memory("rrf fusion parameter", 10)["results"]]
-        assert "mem_session_search2" in default_hits2
+        assert "mem_session_search2" not in default_hits2
+        transcript_hits2 = [
+            r["node"]["id"] for r in service.search_memory("rrf fusion parameter", 10, include="transcripts")["results"]
+        ]
+        assert "mem_session_search2" in transcript_hits2
     finally:
         pass
 
@@ -919,6 +924,8 @@ def test_normalize_sources_keeps_conforming_drops_pseudo(tmp_path: Path) -> None
             "related: [[mem_20260820_ugm_kafka]]",                    # prose + wiki-link -> bare id kept, prose dropped
             "https://github.com/hpe-cds/settings/pull/264",           # URL
             "session:01a0df39-4a7f-7447-86e9-e09e3664f162",           # session key
+            "skill://authz-shim-triage-fast",                          # skill URI
+            "skill://",                                                # empty skill -> dropped
             "transcript://session/…（本会话）",                          # pseudo -> dropped
             "session transcript: AuthZ Shim Dashboard 落地全过程",       # pseudo -> dropped
             "mem_20260926_does_not_exist",                            # non-existent id -> dropped
@@ -931,9 +938,10 @@ def test_normalize_sources_keeps_conforming_drops_pseudo(tmp_path: Path) -> None
         "mem_20260820_ugm_kafka",
         "https://github.com/hpe-cds/settings/pull/264",
         "session:01a0df39-4a7f-7447-86e9-e09e3664f162",
+        "skill://authz-shim-triage-fast",
     ]
-    # dropped: prose remainder "related:" + 4 fully non-conforming entries
-    assert len(dropped) == 5
+    # dropped: prose remainder "related:" + 5 fully non-conforming entries
+    assert len(dropped) == 6
 
 
 def test_validator_fires_unresolvable_source() -> None:
@@ -943,7 +951,7 @@ def test_validator_fires_unresolvable_source() -> None:
         node_type="persistent",
         content="## Takeaway\nt\n\n## Details\nd\n\n## Sources\n- x",
         okf_type="fact",
-        sources=["mem_session_aaa", "https://example.com"],
+        sources=["mem_session_aaa", "https://example.com", "skill://fleetgraph-extract-round-runbook"],
     )
     assert not any(w.code == "okf_unresolvable_source" for w in good)
 

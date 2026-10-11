@@ -41,9 +41,9 @@ def normalize_sources(raw_sources: list[str], *, resolve_node=None) -> tuple[lis
     """Normalize an LLM-emitted ``sources`` list to conforming entries.
 
     Keep: bare ``mem_…`` node ids, ``[[mem_…]]`` (stripped to bare), existing
-    node ids, ``http(s)://`` URLs, ``session:<key>``. Drop everything else
-    (pseudo-sources like "session transcript: …（本会话）" or "related: [[…]]"
-    prose). Returns ``(normalized, dropped)``. ``resolve_node`` optionally
+    node ids, ``http(s)://`` URLs, ``session:<key>``, ``skill://<name>``. Drop
+    everything else (pseudo-sources like "session transcript: …（本会话）" or
+    "related: [[…]]" prose). Returns ``(normalized, dropped)``. ``resolve_node`` optionally
     validates that a ``mem_…`` id exists; non-existent ids are dropped.
     """
 
@@ -70,6 +70,9 @@ def normalize_sources(raw_sources: list[str], *, resolve_node=None) -> tuple[lis
             normalized.append(entry)
             continue
         if entry.casefold().startswith("session:") and len(entry) > len("session:"):
+            normalized.append(entry)
+            continue
+        if entry.startswith("skill://") and len(entry) > len("skill://"):
             normalized.append(entry)
             continue
         if entry.startswith("mem_"):
@@ -228,8 +231,9 @@ def validate_okf_node(
             text = str(entry).strip()
             is_url = text.startswith(_SOURCE_URL_PREFIXES)
             is_session_key = text.casefold().startswith("session:") and len(text) > len("session:")
+            is_skill_uri = bool(re.fullmatch(r"skill://[A-Za-z0-9._-]+", text))
             is_node_id = bool(re.fullmatch(r"mem_[A-Za-z0-9_\-]+", text))
-            if not (is_url or is_session_key or is_node_id):
+            if not (is_url or is_session_key or is_skill_uri or is_node_id):
                 warnings.append(
                     OkfWarning(
                         "okf_unresolvable_source",
