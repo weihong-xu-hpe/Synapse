@@ -283,14 +283,13 @@ def run_eval(
         config_path=str(config.config_path),
     )
 
-    from synapse.okf.transcripts import is_distilled_current, is_session_transcript
+    from synapse.okf.transcripts import is_session_transcript
 
     def _default_include(node) -> bool:
-        # Mirror the service default: distilled-current transcripts (represented
-        # OR zero-item) are excluded; only not-yet-distilled remain searchable.
-        if is_session_transcript(node) and is_distilled_current(node):
-            return False
-        return True
+        # Mirror the service default (P2b): ALL session transcripts are
+        # storage-only raw material and excluded from default search;
+        # include=transcripts|all on the service returns them explicitly.
+        return not is_session_transcript(node)
 
     import inspect
 
