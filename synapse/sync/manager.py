@@ -297,6 +297,7 @@ class SyncManager:
             return result
         retried = 0
         still_missing: list[str] = []
+        transcript_skipped = 0
         for node_id in missing:
             node = store.get_node(node_id)
             if node is None:
@@ -308,7 +309,7 @@ class SyncManager:
             # in `missing` after prune-transcript-vectors or a degraded write;
             # re-embedding them here would resurrect pruned vectors.
             if should_exclude_from_embedding(node):
-                still_missing.append(node_id)
+                transcript_skipped += 1
                 continue
             embedding = self._embed_for_persistence(node, path)
             if embedding is None:
@@ -316,11 +317,20 @@ class SyncManager:
                 continue
             store.upsert_embedding(node_id, embedding)
             retried += 1
+        # P2b: transcripts skipped by the embed gate are EXPECTED (storage-only
+        # raw material) — not degraded state. Log them at debug so health
+        # audits don't read them as a problem; warn only about real
+        # non-transcript nodes that still lack vectors.
         if retried or still_missing:
             self._logger.warning(
                 "Re-embedded %d previously degraded node(s); %d still without vector",
                 retried,
                 len(still_missing),
+            )
+        if transcript_skipped:
+            self._logger.debug(
+                "Startup re-embed skipped %d session transcript(s) (P2b: transcripts are storage-only, never embedded)",
+                transcript_skipped,
             )
         return result
 

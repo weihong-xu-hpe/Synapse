@@ -4,6 +4,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+from types import SimpleNamespace
+
 from synapse.config import load_config
 from synapse.models import Node, NodeMetadata, NodeType, SensitivityLevel
 from synapse.storage import SQLiteNodeStore, write_node_file
@@ -364,3 +366,82 @@ def test_reembed_vectorless_skips_transcripts(tmp_path: Path) -> None:
             assert rows == [], "transcript must not be re-embedded at startup"
     finally:
         manager.close()
+
+
+def test_reembed_warning_excludes_transcript_skips(tmp_path: Path) -> None:
+    """Transcripts skipped by the P2b gate are expected, not degraded: the
+    warning must count only real non-transcript nodes still missing vectors,
+    and transcript skips are logged separately at debug."""
+    import logging
+
+    config = load_config(write_config(tmp_path))
+    config = config.model_copy(update={
+        "embedding": config.embedding.model_copy(update={"provider": "remote_api"}),
+    })
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    transcript = Node(
+        metadata=NodeMetadata(
+            id="mem_session_skipwarn",
+            title="Session summary — skipwarn",
+            created_at=FIXED_TIME,
+            last_accessed=FIXED_TIME,
+            type=NodeType.TRANSIENT,
+            session_key="skipwarn-key",
+        ),
+        content="## User\ntranscript body\n",
+        file_path=Path("active/mem_session_skipwarn.md"),
+    )
+    transcript_path = write_node_file(transcript, base_path=runtime_paths.base)
+    # Stale disk mtimes so startup_sync's drain does not re-sync either file —
+    # both must reach the reembed pass as "missing".
+    old = FIXED_TIME.timestamp()
+    os.utime(transcript_path, (old, old))
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+        # Transcripts (expected skip) + one real degraded knowledge node.
+        store.upsert_node(transcript, embedding=None, source_mtime=FIXED_TIME)
+        knowledge = make_node(
+            node_id="mem_degraded1",
+            title="Degraded Note",
+            content="# Degraded Note\n\nTarget body.",
+            file_name="mem_degraded1.md",
+        )
+        knowledge_path = write_node_file(knowledge, base_path=runtime_paths.base)
+        os.utime(knowledge_path, (old, old))
+        store.upsert_node(knowledge, embedding=None, source_mtime=FIXED_TIME)
+        assert set(store.get_node_ids_without_vectors()) == {"mem_session_skipwarn", "mem_degraded1"}
+
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    sync_logger = logging.getLogger("synapse.sync.manager")
+    capture = Capture()
+    sync_logger.addHandler(capture)
+    sync_logger.setLevel(logging.DEBUG)
+
+    manager = SyncManager(config, runtime_paths=runtime_paths, embedding_engine=FakeRemoteEmbeddingEngine(), debounce_seconds=0.0, logger=sync_logger)
+    try:
+        # Invoke the reembed step directly: the drain path would embed
+        # degraded1 before the reembed pass and mask the warning counts.
+        result = SimpleNamespace(upserted=0, deleted=0)
+        manager._reembed_vectorless_nodes(result)
+    finally:
+        manager.close()
+        sync_logger.removeHandler(capture)
+
+    warnings = [r for r in records if r.levelno == logging.WARNING and "Re-embedded" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "1 previously degraded" in warnings[0].getMessage(), "only the non-transcript node counts as degraded"
+    debugs = [r for r in records if r.levelno == logging.DEBUG and "session transcript" in r.getMessage()]
+    assert len(debugs) == 1 and "1 session transcript(s)" in debugs[0].getMessage()
+
+
+class FakeRemoteEmbeddingEngine(FakeEmbeddingEngine):
+    """FakeEmbeddingEngine with backend_name='remote_api' so the startup
+    re-embed pass runs (it early-returns for non-remote backends)."""
+
+    backend_name = "remote_api"
