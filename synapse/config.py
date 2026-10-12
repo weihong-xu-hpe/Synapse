@@ -251,8 +251,9 @@ class DistillerSettings(BaseModel):
     # Concurrent LLM extraction calls (owner request 2026-10-12). 1 = today's
     # serial behavior. Applies ONLY to segment extraction within a transcript;
     # reduce → evidence verify → title repair → write path stay serialized.
-    # Writes and SQLite stay serialized regardless of this value.
-    max_concurrency: int = Field(default=1, ge=1, le=16)
+    # Writes and SQLite stay serialized regardless of this value. Hard owner
+    # limit 30 (bench: /tmp/distill-bench/report.md).
+    max_concurrency: int = Field(default=1, ge=1, le=30)
     max_items_per_transcript: int = Field(default=5, ge=1, le=20)
     # When true, a decider supersede targeting an existing non-distilled
     # persistent node is downgraded to complement (backfill safety; default ON

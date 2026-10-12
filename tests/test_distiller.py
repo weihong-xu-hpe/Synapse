@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from synapse.config import SynapseConfig
+from synapse.config import DistillerSettings
 from synapse.lifecycle.distiller import (
     Distiller,
     DistillerReport,
@@ -2296,3 +2297,21 @@ def test_partial_failure_out_of_order_holds_earliest_watermark(tmp_path: Path) -
         assert stamped.metadata.distilled_hash is None
     finally:
         distiller.close()
+
+
+def test_max_concurrency_upper_bound_30(tmp_path: Path) -> None:
+    """Owner hard limit 30 (bench-driven); default stays 1."""
+    config = _config(tmp_path)
+    assert config.distiller.max_concurrency == 1
+    from pydantic import ValidationError
+
+    config = config.model_copy(update={
+        "distiller": config.distiller.model_validate(
+            {**config.distiller.model_dump(), "max_concurrency": 30}
+        )
+    })
+    assert config.distiller.max_concurrency == 30
+    import pytest as _pytest
+
+    with _pytest.raises(ValidationError):
+        DistillerSettings(max_concurrency=31)
