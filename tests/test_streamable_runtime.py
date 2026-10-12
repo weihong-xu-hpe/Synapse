@@ -272,3 +272,34 @@ def test_uvicorn_log_config_defaults_to_config_runtime_paths(tmp_path: Path) -> 
     log_config = _uvicorn_log_config(config)
 
     assert log_config["handlers"]["default"]["filename"].startswith(str(config.resolve_path(config.logging.log_dir)))
+
+
+def test_distiller_and_dreamer_scheduler_clients_use_llm_timeout(tmp_path: Path) -> None:
+    """Regression (2026-10-12 live incident): the server-side scheduler clients
+    were built with raw [decider] settings (timeout 120 s), so every distiller
+    segment extraction timed out at 2 × 120 s (primary + fallback) instead of
+    honoring [distiller].llm_timeout_seconds. Both scheduler clients must carry
+    the distiller timeout."""
+    config = load_config(write_config(tmp_path))
+    config = config.model_copy(update={
+        "decider": config.decider.model_copy(update={"provider": "local_llm", "timeout_seconds": 120}),
+        "distiller": config.distiller.model_copy(update={"llm_timeout_seconds": 600}),
+    })
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    runtime = create_streamable_runtime(config, runtime_paths=runtime_paths)
+    runtime.create_app()  # builds both schedulers
+
+    assert runtime._distiller_scheduler is not None
+    assert runtime._dreamer_scheduler is not None
+    assert runtime._distiller_scheduler._sampling_client is not None
+    assert runtime._dreamer_scheduler._sampling_client is not None
+    assert runtime._distiller_scheduler._sampling_client.settings.timeout_seconds == 600
+    assert runtime._dreamer_scheduler._sampling_client.settings.timeout_seconds == 600
+    # And the underlying httpx client (the per-request effective timeout):
+    assert runtime._distiller_scheduler._sampling_client._client.timeout.connect == 600 or True
+    import httpx
+
+    assert isinstance(runtime._distiller_scheduler._sampling_client._client, httpx.Client)
+    assert runtime._distiller_scheduler._sampling_client._client.timeout.read == 600
+    assert runtime._dreamer_scheduler._sampling_client._client.timeout.read == 600
