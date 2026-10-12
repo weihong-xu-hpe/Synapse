@@ -2055,3 +2055,65 @@ def test_parse_okf_items_multi_line_section_takeaway_not_used_as_fallback() -> N
         ]
     }
     assert parse_okf_items(payload) == []
+
+
+def test_partial_segment_failure_holds_back_watermark(tmp_path: Path) -> None:
+    """Regression (2026-10-12 live incident): 3 segments, the middle one fails —
+    the watermark must hold at the end of segment 1 and distilled_hash must stay
+    unset so the next sweep retries segments 2-3. Items from successful segments
+    are kept."""
+
+    class FailMiddleSegmentClient:
+        name = "fake-fail-middle"
+        calls = 0
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            type(self).calls += 1
+            if type(self).calls == 2:
+                raise RuntimeError("timed out")
+            return {"items": [dict(_PITFALL_ITEM, title=f"Segment pitfall {type(self).calls}")]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.segment_chars = 400
+    runtime_paths = _runtime(tmp_path)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=FailMiddleSegmentClient())
+    try:
+        import os
+
+        turn = "## T{n} User\n" + ("durable kafka offset lesson " * 12)
+        content = "<!-- synapse-transcript v2 -->\n" + "\n\n".join(turn.format(n=n) for n in range(1, 7))
+        _write_transcript(runtime_paths, "mem_session_partial1", content, session_key="sess-partial")
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / "mem_session_partial1.md", (old_ts, old_ts))
+
+        report = distiller.run(downgrade_supersede=False)
+        assert report.transcripts_distilled == 1
+        assert report.items_extracted >= 1, "items from successful segments must be kept"
+
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / "mem_session_partial1.md")
+        # Watermark held back: the failed segment started at T3 → safe = T2's end.
+        assert stamped.metadata.distilled_turn is not None and stamped.metadata.distilled_turn < 6
+        # Hash left unset so the next sweep re-selects and retries the failed range.
+        assert stamped.metadata.distilled_hash is None
+
+        # Next run (all segments succeed now): watermark advances to the end,
+        # hash stamped → no further re-selection.
+        FailMiddleSegmentClient.calls = 100  # stop failing
+        os.utime(runtime_paths.active / "mem_session_partial1.md", (old_ts, old_ts))
+        report2 = distiller.run(downgrade_supersede=False)
+        assert report2.transcripts_distilled == 1
+        stamped2 = read_node_file(runtime_paths.active / "mem_session_partial1.md")
+        assert stamped2.metadata.distilled_hash == content_sha256(stamped2.content)
+        assert stamped2.metadata.distilled_turn == 6
+        # Third run: nothing selectable.
+        report3 = distiller.run(downgrade_supersede=False)
+        assert report3.transcripts_scanned == 0
+    finally:
+        distiller.close()

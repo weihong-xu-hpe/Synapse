@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 import hashlib
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -403,6 +404,7 @@ class Distiller:
         # single-call flow); candidates merge afterwards.
         candidates: list[OkfItem] = []
         extraction_failures = 0
+        first_failed_turn: int | None = None
         for segment_text, start_turn in segments:
             prompt = self._build_prompt(
                 transcript_content=segment_text,
@@ -414,6 +416,9 @@ class Distiller:
                 candidates.extend(parse_okf_items(payload))
             except Exception as exc:  # noqa: BLE001 — one bad segment must not lose the others
                 extraction_failures += 1
+                if first_failed_turn is None:
+                    m = re.match(r"T(\d+)", start_turn)
+                    first_failed_turn = int(m.group(1)) if m else parsed.last_turn_number
                 self._logger.warning(
                     "Segment extraction failed",
                     extra={"node_id": transcript.id, "start_turn": start_turn, "error": str(exc)},
@@ -477,10 +482,36 @@ class Distiller:
         report.transcripts_distilled += 1
 
         if not dry_run:
-            # The watermark covers everything parsed NOW (the client may have
-            # appended turns while we distilled); late turns surface on the
-            # next sweep via the content-hash gate.
-            self._stamp_transcript(transcript, produced_ids, distilled_turn=parsed.last_turn_number)
+            # Watermark safety (2026-10-12 live incident): on partial segment
+            # failure, advance the watermark only to the turn BEFORE the first
+            # failed segment — failed segments' knowledge would otherwise be
+            # permanently skipped. distilled_hash is still stamped (content
+            # hash gate) but the reduced watermark makes the next sweep
+            # re-process the failed range (via distilled_turn, provided the
+            # transcript hasn't changed since — the hash gate blocks same-
+            # content retries). To guarantee the retry, leave the hash unset
+            # when any segment failed so the next sweep re-selects it.
+            if extraction_failures:
+                safe_turn = max(watermark, first_failed_turn - 1) if first_failed_turn else watermark
+                self._stamp_transcript(
+                    transcript, produced_ids, distilled_turn=safe_turn, mark_current=False
+                )
+                self._mark_backoff(transcript)
+                self._logger.warning(
+                    "Distilled transcript with segment failures; watermark held back for retry",
+                    extra={
+                        "node_id": transcript.id,
+                        "segments": len(segments),
+                        "failed_segments": extraction_failures,
+                        "safe_watermark": safe_turn,
+                        "items": len(candidates),
+                    },
+                )
+            else:
+                # The watermark covers everything parsed NOW (the client may
+                # have appended turns while we distilled); late turns surface
+                # on the next sweep via the content-hash gate.
+                self._stamp_transcript(transcript, produced_ids, distilled_turn=parsed.last_turn_number)
             self._logger.info(
                 "Distilled transcript",
                 extra={
@@ -490,6 +521,7 @@ class Distiller:
                     "types": sorted({item.okf_type for item in candidates}),
                     "knowledge_ids": produced_ids,
                     "distilled_turn": parsed.last_turn_number,
+                    "segment_failures": extraction_failures,
                 },
             )
         return detail
@@ -761,7 +793,9 @@ class Distiller:
     # Transcript state
     # ------------------------------------------------------------------
 
-    def _stamp_transcript(self, transcript: Node, knowledge_ids: list[str], *, distilled_turn: int | None = None) -> None:
+    def _stamp_transcript(
+        self, transcript: Node, knowledge_ids: list[str], *, distilled_turn: int | None = None, mark_current: bool = True
+    ) -> None:
         path = self.runtime_paths.base / transcript.file_path
         if not path.exists():
             return
@@ -774,7 +808,10 @@ class Distiller:
         watermark = distilled_turn if distilled_turn is not None else node.metadata.distilled_turn
         metadata = node.metadata.model_copy(
             update={
-                "distilled_hash": content_sha256(node.content),
+                # mark_current=False (partial segment failure): leave the hash
+                # unset so the next sweep re-selects the transcript and retries
+                # the failed segment range from the held-back watermark.
+                "distilled_hash": content_sha256(node.content) if mark_current else None,
                 "distilled_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "distilled_node_ids": merged_ids,
                 "distilled_turn": watermark,
