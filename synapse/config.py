@@ -254,7 +254,13 @@ class DistillerSettings(BaseModel):
     # Writes and SQLite stay serialized regardless of this value. Hard owner
     # limit 30 (bench: /tmp/distill-bench/report.md).
     max_concurrency: int = Field(default=1, ge=1, le=30)
-    max_items_per_transcript: int = Field(default=5, ge=1, le=20)
+    # Owner 2026-10-12 rework: the fixed item-count concept is removed (the
+    # model extracts everything durable; reduce = dedupe only). No cap field.
+    # Warn (never drop) when a transcript yields more than this many items.
+    item_warn_threshold: int = Field(default=40, ge=1)
+    # Optional reasoning_effort for the distiller's OWN LLM calls only (never
+    # the write-path decider). None = field omitted (today's behavior).
+    reasoning_effort: str | None = Field(default=None)
     # When true, a decider supersede targeting an existing non-distilled
     # persistent node is downgraded to complement (backfill safety; default ON
     # for backfill/CLI --apply over legacy groups, OFF for the live sweep).

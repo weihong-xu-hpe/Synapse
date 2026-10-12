@@ -62,6 +62,7 @@ class DistillerReport:
     items_sources_dropped: int = 0
     reduced_items: int = 0
     reduce_failures: int = 0
+    reduce_groups_llm: int = 0
     guard_fallback_creates: int = 0
     title_repairs: int = 0
     title_repair_failures: int = 0
@@ -424,7 +425,6 @@ class Distiller:
                 transcript=segment_text,
                 known_titles=known_titles,
                 own_distilled_titles=own_titles,
-                max_items=self.settings.max_items_per_transcript,
                 start_turn=start_turn,
             )
             try:
@@ -478,6 +478,7 @@ class Distiller:
             item.verified = bool(item.evidence) and not unverified
 
         produced_ids: list[str] = []
+        action_counts: dict[str, int] = {}
         detail: dict[str, Any] = {"transcript_id": transcript.id, "items": [], "segments": len(segments)}
 
         service = self._get_service()
@@ -512,11 +513,20 @@ class Distiller:
                 detail["items"].append(
                     {"title": item.title, "okf_type": item.okf_type, "verified": item.verified, **action_note}
                 )
+                action_counts[action_note.get("action", "")] = action_counts.get(action_note.get("action", ""), 0) + 1
         finally:
             service.reset_sampling_client(token)
 
         report.items_extracted += len(candidates)
         report.transcripts_distilled += 1
+
+        # Runaway guard (owner 2026-10-12): warn (never drop) when a transcript
+        # yields an unusual number of items.
+        if len(candidates) > self.settings.item_warn_threshold:
+            self._logger.warning(
+                "Transcript yielded more than item_warn_threshold items; all written",
+                extra={"node_id": transcript.id, "items": len(candidates), "threshold": self.settings.item_warn_threshold},
+            )
 
         if not dry_run:
             # Watermark safety (2026-10-12 live incident): on partial segment
@@ -554,7 +564,12 @@ class Distiller:
                 extra={
                     "node_id": transcript.id,
                     "segments": len(segments),
+                    "candidates": len(candidates),
+                    "after_reduce": len(candidates) - report.reduced_items if report.reduced_items else len(candidates),
+                    "reduce_groups_llm": report.reduce_groups_llm,
+                    "reduce_failure": report.reduce_failures > 0,
                     "items": len(candidates),
+                    "written_by_action": action_counts,
                     "types": sorted({item.okf_type for item in candidates}),
                     "knowledge_ids": produced_ids,
                     "distilled_turn": parsed.last_turn_number,
@@ -648,7 +663,6 @@ class Distiller:
             transcript=transcript_content,
             known_titles=self._known_titles(),
             own_distilled_titles=own_titles,
-            max_items=self.settings.max_items_per_transcript,
             start_turn=start_turn,
         )
 
@@ -661,61 +675,120 @@ class Distiller:
         *,
         dry_run: bool,
     ) -> list[OkfItem]:
-        """Merge/dedupe per-segment candidates down to max_items_per_transcript.
+        """Dedupe per-segment candidates — NEVER compress to a count cap.
 
-        LLM reduce call only when candidates exceed the cap or near-duplicate
-        titles are detected (whitespace-collapsed prefix match); otherwise the
-        deterministic path returns candidates unchanged — an LLM call cannot
-        dedupe what is provably distinct, and skipping it keeps single-segment
-        sweeps at exactly one extraction call.
+        Grouping is deterministic: normalized-title exact match or prefix
+        relation groups items that are likely the same claim. Only groups with
+        >= 2 members go to the LLM (in bounded batches so the reduce prompt
+        stays small); singletons pass through untouched. The LLM may merge
+        same-claim items and split composites; every other item must come back
+        unchanged. On reduce failure: retry once, then a deterministic
+        exact-title dedupe keeps ALL distinct items. No truncation anywhere.
         """
 
-        max_items = self.settings.max_items_per_transcript
         if not candidates:
             return []
 
         def _norm(title: str) -> str:
             return " ".join(title.split()).casefold()
 
-        duplicates_likely = any(
-            _norm(a.title) == _norm(b.title) or _norm(a.title).startswith(_norm(b.title)) or _norm(b.title).startswith(_norm(a.title))
-            for i, a in enumerate(candidates)
-            for b in candidates[i + 1 :]
-        )
-        if len(candidates) <= max_items and not duplicates_likely:
-            return candidates
+        # Deterministic grouping: union items whose normalized titles are equal
+        # or prefix-related. Groups of size 1 pass through untouched.
+        parent = list(range(len(candidates)))
 
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(i: int, j: int) -> None:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+
+        normed = [_norm(item.title) for item in candidates]
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                a, b = normed[i], normed[j]
+                if a == b or a.startswith(b) or b.startswith(a):
+                    union(i, j)
+
+        groups: dict[int, list[int]] = {}
+        for i in range(len(candidates)):
+            groups.setdefault(find(i), []).append(i)
+        multi_groups = [g for g in groups.values() if len(g) >= 2]
+        report.reduce_groups_llm = len(multi_groups)
+
+        if not multi_groups:
+            return candidates  # all singletons → nothing to dedupe
         if dry_run:
             return candidates
 
-        candidates_json = json.dumps(
-            {"items": [{"okf_type": item.okf_type, "title": item.title, "takeaway": item.takeaway,
-                        "sections": item.sections, "sources": item.sources,
-                        "evidence": [{"turn": e.turn, "quote": e.quote} for e in item.evidence]}
-                       for item in candidates]},
-            ensure_ascii=False,
-        )
-        prompt = render_reduce_prompt(
-            candidates_json=candidates_json,
-            max_items=max_items,
-            known_titles=self._known_titles(),
-            own_distilled_titles=own_titles,
-        )
-        try:
-            payload = self._sample_json(prompt)
-            merged = parse_okf_items(payload)
-        except Exception as exc:  # noqa: BLE001 — reduce failure keeps raw candidates (cap applied deterministically)
-            self._logger.warning(
-                "Reduce call failed; applying deterministic cap",
-                extra={"node_id": transcript.id, "error": str(exc)},
+        # LLM reduce over the multi-item groups, in bounded batches.
+        merged_extra: list[OkfItem] = []
+        reduce_failed = False
+        batch_size = 12  # groups per LLM call — keeps the prompt small
+        for batch_start in range(0, len(multi_groups), batch_size):
+            batch = multi_groups[batch_start : batch_start + batch_size]
+            batch_items = [item for g in batch for item in (candidates[i] for i in g)]
+            candidates_json = json.dumps(
+                {"items": [{"okf_type": item.okf_type, "title": item.title, "takeaway": item.takeaway,
+                            "sections": item.sections, "sources": item.sources,
+                            "evidence": [{"turn": e.turn, "quote": e.quote} for e in item.evidence]}
+                           for item in batch_items]},
+                ensure_ascii=False,
             )
+            merged: list[OkfItem] | None = None
+            for attempt in (1, 2):  # retry once on failure
+                try:
+                    payload = self._sample_json(
+                        render_reduce_prompt(
+                            candidates_json=candidates_json,
+                            known_titles=self._known_titles(),
+                            own_distilled_titles=own_titles,
+                        )
+                    )
+                    merged = parse_okf_items(payload)
+                    break
+                except Exception as exc:  # noqa: BLE001 — retry once, then deterministic fallback
+                    self._logger.warning(
+                        "Reduce call failed",
+                        extra={"node_id": transcript.id, "attempt": attempt, "error": str(exc)},
+                    )
+            if not merged:
+                reduce_failed = True
+                continue
+            merged_extra.extend(merged)
+
+        if reduce_failed:
             report.reduce_failures += 1
-            return candidates[:max_items]
-        if not merged:
-            report.reduce_failures += 1
-            return candidates[:max_items]
-        report.reduced_items += max(0, len(candidates) - len(merged))
-        return merged
+            # Deterministic fallback: exact-normalized-title dedupe keeping ALL
+            # distinct items — never truncate. merged results from successful
+            # batches are dropped in favor of the originals so nothing the LLM
+            # returned is silently half-applied.
+            seen: set[str] = set()
+            deduped: list[OkfItem] = []
+            for item in candidates:
+                key = _norm(item.title)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+            report.reduced_items += max(0, len(candidates) - len(deduped))
+            return deduped
+
+        # Successful reduce: multi-group members are replaced by the LLM's
+        # merged output; singletons pass through untouched.
+        multi_indexes = {i for g in multi_groups for i in g}
+        result: list[OkfItem] = []
+        for i, item in enumerate(candidates):
+            if i in multi_indexes:
+                continue
+            result.append(item)
+        result.extend(merged_extra)
+        report.reduced_items += max(0, len(candidates) - len(result))
+        return result
 
     def _titles_for_ids(self, node_ids: list[str]) -> list[str]:
         if not node_ids:
@@ -727,7 +800,15 @@ class Distiller:
         client = self._get_sampling_client()
         # Owner rule: no tight token cap — wall time is bounded by the LLM
         # timeout, so extraction/reduce calls use [decider] max_tokens as-is.
-        return client.sample_json(prompt=prompt, system_prompt="", max_tokens=self.config.decider.max_tokens)
+        # [distiller].reasoning_effort (optional) is passed as the OpenAI
+        # reasoning_effort field on the distiller's OWN calls only; the
+        # write-path decider is unaffected.
+        kwargs: dict[str, Any] = {}
+        if self.settings.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.settings.reasoning_effort
+        return client.sample_json(
+            prompt=prompt, system_prompt="", max_tokens=self.config.decider.max_tokens, **kwargs
+        )
 
     # ------------------------------------------------------------------
     # Item → write path

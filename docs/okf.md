@@ -297,11 +297,26 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
 - Transcripts are split into segments at turn boundaries
   (`[distiller].segment_chars`, default 16 000 — same size as the old single-call
   budget); a single oversized turn is split by characters. One extraction LLM call
-  runs per segment; nothing is head/tail-truncated away.
-- A reduce step merges/dedupes per-segment candidates to
-  `max_items_per_transcript`. The reduce LLM call runs only when candidates exceed
-  the cap or near-duplicate titles are detected; otherwise merging is skipped
-  deterministically. Known-titles / own-distilled-titles dedupe still applies.
+  runs per segment; nothing is head/tail-truncated away. **No item-count cap**:
+  the model extracts everything durable — one item per distinct claim, never
+  bundling unrelated topics.
+- Reduce = **dedupe only, never "compress to N"**: candidates whose normalized
+  titles are equal or prefix-related are grouped deterministically; only groups
+  with ≥2 members go to the LLM (in bounded batches, 12 groups per call), and the
+  reduce prompt may merge same-claim items and split composites — every other
+  item must be returned unchanged. Singletons pass through untouched. On reduce
+  failure: retry once, then deterministic exact-normalized-title dedupe keeping
+  ALL distinct items — no truncation. `[distiller].item_warn_threshold` (default
+  40) logs a warning when a transcript yields more items than that; nothing is
+  dropped. Known-titles / own-distilled-titles dedupe still applies.
+- `[distiller].reasoning_effort` (optional; `low`/`medium`/`high`) is passed as
+  the OpenAI `reasoning_effort` field on the distiller's OWN LLM calls only
+  (never the write-path decider). Unset = field omitted.
+- Segment extraction calls run concurrently (`[distiller].max_concurrency`,
+  default 1, hard limit 30); the reduce → verify → write path stays serialized.
 - Progress watermark: `distilled_turn` on the transcript frontmatter records the
   last turn covered; a re-distill after new turns arrive processes only later
   turns (one previous turn as context). `distilled_hash` semantics are unchanged.
+  On a partial segment failure the watermark is held back to the turn before the
+  first failed segment and `distilled_hash` is left unset so the next sweep
+  retries the failed range.

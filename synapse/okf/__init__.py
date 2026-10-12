@@ -471,14 +471,14 @@ def render_distiller_prompt(
     transcript: str,
     known_titles: list[str],
     own_distilled_titles: list[str],
-    max_items: int,
     start_turn: str = "T1",
 ) -> str:
     """Build one extraction prompt for one transcript segment (design doc §3, §9).
 
     ``transcript`` is a pre-rendered segment (already char-budgeted by the
     caller's turn-boundary chunking — no truncation here). ``start_turn``
-    tells the model the segment begins mid-conversation.
+    tells the model the segment begins mid-conversation. No item-count cap:
+    the model should extract EVERYTHING durable — one item per distinct claim.
     """
 
     known_block = "\n".join(f"- {t}" for t in known_titles[:50]) or "- (none)"
@@ -511,12 +511,16 @@ def render_distiller_prompt(
             "",
             "EVIDENCE (required per item): cite where the knowledge came from as",
             '"evidence": [{"turn": "<Tn>", "quote": "<verbatim excerpt from that turn, <= 200 chars>"}].',
+            "The quote MUST be copied VERBATIM — an exact substring of the eligible text.",
+            "NEVER paraphrase and NEVER quote the assistant's own prose.",
             "Accepted evidence sources depend on the type:",
             '- fact/procedure/pitfall: a quote from a tool result line or a user turn;',
             "- decision: a quote from a user turn or a tool result.",
-            "The quote must appear VERBATIM in that turn — it is checked mechanically.",
+            "Prefer short quotes (<= 200 chars). The quote is checked mechanically.",
             "",
-            f"Extract at most {max_items} items. Skip anything already covered by these known knowledge nodes:",
+            "Extract EVERYTHING durable — there is no item-count limit. Emit ONE item per",
+            "distinct claim; never bundle unrelated topics into a single item.",
+            "Skip anything already covered by these known knowledge nodes:",
             known_block,
             "",
             "Do not re-emit knowledge already distilled from this same transcript:",
@@ -536,25 +540,29 @@ def render_distiller_prompt(
 def render_reduce_prompt(
     *,
     candidates_json: str,
-    max_items: int,
     known_titles: list[str],
     own_distilled_titles: list[str],
 ) -> str:
-    """Reduce step: merge/dedupe extraction candidates down to <= max_items."""
+    """Reduce step: dedupe only — merge items stating the SAME claim, split
+    composites, and return every other item unchanged. No count cap."""
 
     known_block = "\n".join(f"- {t}" for t in known_titles[:50]) or "- (none)"
     own_block = "\n".join(f"- {t}" for t in own_distilled_titles[:50]) or "- (none)"
     return "\n".join(
         [
-            "You merge knowledge items extracted from segments of one session transcript.",
+            "You dedupe knowledge items extracted from segments of one session transcript.",
             "The candidates below were extracted independently per segment and may overlap or duplicate.",
-            "Merge duplicates and near-duplicates into single items; keep every distinct piece of knowledge.",
-            "Preserve each item's shape exactly: okf_type, English title (<= 90 chars), single-line takeaway",
-            "(<= 200 chars), sections, sources, and the evidence array (merge evidence lists when merging items).",
-            "Do not invent new items and do not drop evidence entries.",
-            "",
-            f"Respond with at most {max_items} items total (the most durable, highest-value knowledge).",
-            "Skip anything already covered by these known knowledge nodes:",
+            "Rules:",
+            "1. Merge two items ONLY when they state the SAME claim (same fact/rule/pitfall/decision,",
+            "   same subject and same assertion). If in doubt, keep them separate.",
+            "2. If an item bundles several UNRELATED topics, split it into one item per topic",
+            "   (same okf_type and shape, sections divided accordingly).",
+            "3. Return EVERY other item unchanged — do not drop, summarize, compress, or rephrase.",
+            "   There is NO item-count limit.",
+            "4. Preserve each item's shape exactly: okf_type, English title (<= 90 chars), single-line",
+            "   takeaway (<= 200 chars), sections, sources, and the evidence array (merge evidence",
+            "   lists when merging items). Do not invent new items and do not drop evidence entries.",
+            "5. Drop an item entirely ONLY if it is already covered by these known knowledge nodes:",
             known_block,
             "",
             "Do not re-emit knowledge already distilled from this same transcript:",

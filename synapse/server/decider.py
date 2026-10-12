@@ -39,11 +39,13 @@ class LocalLLMDecider:
         system_prompt: str,
         max_tokens: int = 600,
         model_hints: tuple[str, ...] = (),
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         del system_prompt, model_hints
         return self._complete(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
             parser=lambda payload: _extract_json_payload(self._extract_content(payload)),
         )
 
@@ -75,6 +77,7 @@ class LocalLLMDecider:
         messages: list[dict[str, str]],
         max_tokens: int,
         parser: Callable[[dict[str, Any]], Any],
+        reasoning_effort: str | None = None,
     ) -> Any:
         last_error: Exception | None = None
         endpoints = (
@@ -93,6 +96,7 @@ class LocalLLMDecider:
                     api_key_env=api_key_env,
                     messages=messages,
                     max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                 )
                 return parser(response_payload)
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
@@ -110,6 +114,7 @@ class LocalLLMDecider:
         api_key_env: str,
         messages: list[dict[str, str]],
         max_tokens: int,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Accept": "application/json",
@@ -120,16 +125,21 @@ class LocalLLMDecider:
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
 
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": self.settings.temperature,
+            "response_format": {"type": "json_object"},
+        }
+        # OpenAI-style reasoning-effort control (owner 2026-10-12): passed only
+        # when explicitly configured ([distiller].reasoning_effort).
+        if reasoning_effort is not None:
+            body["reasoning_effort"] = reasoning_effort
         response = self._client.post(
             f"{base_url.rstrip('/')}{_CHAT_COMPLETIONS_PATH}",
             headers=headers,
-            json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": self.settings.temperature,
-                "response_format": {"type": "json_object"},
-            },
+            json=body,
         )
         response.raise_for_status()
         payload = response.json()

@@ -85,7 +85,7 @@ class FakeDistillSamplingClient:
         self.items = items
         self.calls: list[dict[str, Any]] = []
 
-    def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+    def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
         self.calls.append({"prompt": prompt, "max_tokens": max_tokens})
         if isinstance(self.items, Exception):
             raise self.items
@@ -365,7 +365,7 @@ def test_incremental_growth_complements_existing_knowledge(tmp_path: Path) -> No
         name = "fake-incremental"
         calls = 0
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             type(self).calls += 1
             item = dict(_PITFALL_ITEM)
             if type(self).calls == 1:
@@ -508,7 +508,7 @@ def test_legacy_backfill_apply_downgrades_supersede(tmp_path: Path) -> None:
         def __init__(self):
             self.decider_calls = 0
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             item = dict(_PITFALL_ITEM)
             item["title"] = "Curated knowledge"  # matches the curated node -> supersede candidate
             return {"items": [item]}
@@ -836,7 +836,7 @@ def test_distilled_vs_distilled_supersede_not_downgraded(tmp_path: Path) -> None
     class AlwaysSupersedeClient:
         name = "fake-supersede2"
 
-        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=(), reasoning_effort=None):
             item = dict(_PITFALL_ITEM)
             item["title"] = "Distilled pitfall v1"  # matches the earlier distilled node
             return {"items": [item]}
@@ -1016,7 +1016,7 @@ def test_distiller_normalizes_sources_and_counts_dropped(tmp_path: Path) -> None
     class PseudoSourceClient:
         name = "fake-pseudo"
 
-        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=(), reasoning_effort=None):
             item = dict(_PITFALL_ITEM)
             item["sources"] = [
                 "session transcript: AuthZ Shim Dashboard 落地全过程",
@@ -1111,7 +1111,7 @@ def test_write_path_candidates_exclude_transcripts(tmp_path: Path) -> None:
         name = "probe"
         seen_candidates = []
 
-        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=(), reasoning_effort=None):
             return {"items": []}
 
         def decide_memory_write(self, request):
@@ -1176,7 +1176,7 @@ def test_guard_backstop_falls_back_to_create_item_not_lost(tmp_path: Path) -> No
         name = "fake-guard-fire"
         calls = 0
 
-        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=(), reasoning_effort=None):
             return {"items": [dict(_PITFALL_ITEM)]}
 
         def decide_memory_write(self, request):
@@ -1317,7 +1317,7 @@ def test_distiller_title_repair_success_and_failure(tmp_path: Path) -> None:
         repair_calls = 0
         repair_works = True
 
-        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=(), reasoning_effort=None):
             if "invalid title" in prompt.casefold() or "english title" in prompt.casefold():
                 type(self).repair_calls += 1
                 if type(self).repair_works:
@@ -1438,7 +1438,7 @@ def test_supersede_of_legacy_sourced_node_not_downgraded(tmp_path: Path) -> None
     class SupersedeLegacyClient:
         name = "fake-supersede-legacy"
 
-        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=()):
+        def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=(), reasoning_effort=None):
             item = dict(_PITFALL_ITEM)
             item["title"] = "Legacy-sourced knowledge"
             return {"items": [item]}
@@ -1584,26 +1584,28 @@ def test_build_turn_segments_respects_budget_and_context() -> None:
     assert sum(len(text) for text, _ in big_segments) >= 1500
 
 
-def test_chunked_distillation_one_call_per_segment_and_reduce(tmp_path: Path) -> None:
+def test_chunked_distillation_one_call_per_segment_and_dedupe(tmp_path: Path) -> None:
     """A transcript over the segment budget gets one extraction call per
-    segment; candidates over max_items go through ONE reduce call."""
+    segment; near-duplicate candidates go through ONE dedupe reduce call."""
 
     calls: list[dict[str, Any]] = []
 
     class SegmentThenCapClient:
         name = "fake-chunked"
+        uid = 0
+        lock = __import__("threading").Lock()
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             calls.append({"prompt": prompt, "max_tokens": max_tokens})
-            # Extraction calls return one item each; the reduce call returns 2.
-            if '"title"' in prompt and "Reduce" not in prompt and "merge" in prompt.lower():
+            # Extraction calls return one item each; the dedupe call returns 2.
+            if "You dedupe knowledge items" in prompt:
                 return {
                     "items": [
                         dict(_PITFALL_ITEM, title="Merged pitfall one"),
                         dict(_PITFALL_ITEM, title="Merged pitfall two"),
                     ]
                 }
-            return {"items": [dict(_PITFALL_ITEM, title=f"Segment pitfall {len(calls)}")]}
+            return {"items": [dict(_PITFALL_ITEM, title="Segment pitfall duplicate")]}
 
         def decide_memory_write(self, request):
             from synapse.server.sampling import MemoryWriteSamplingDecision
@@ -1634,7 +1636,10 @@ def test_chunked_distillation_one_call_per_segment_and_reduce(tmp_path: Path) ->
         assert report.transcripts_distilled == 1
         extraction_calls = [c for c in calls if "Transcript segment:" in c["prompt"]]
         assert len(extraction_calls) >= 2, "large transcript must be split into segments"
-        # max_items default 5 < 8 candidates -> reduce happened.
+        # 8 identical-title candidates -> deterministic grouping forms one
+        # multi-item group -> ONE dedupe reduce call; it merged them into 2,
+        # so reduced_items = 8 - 2 = 6.
+        assert report.reduce_groups_llm >= 1
         assert report.reduced_items >= 1
         # Watermark stamped to the last turn.
         from synapse.storage import read_node_file
@@ -1655,7 +1660,7 @@ def test_incremental_distillation_only_processes_new_turns(tmp_path: Path) -> No
     class IncrementalClient:
         name = "fake-incremental"
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             extraction_prompts.append(prompt)
             return {"items": [dict(_PITFALL_ITEM, title=f"Incremental pitfall {len(extraction_prompts)}")]}
 
@@ -1759,7 +1764,7 @@ def test_distiller_stamps_verified_frontmatter_and_evidence_section(tmp_path: Pa
     class EvidenceClient:
         name = "fake-evidence"
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             if "merge" in prompt.lower():
                 return {"items": [good_item, bad_item]}
             return {"items": [good_item, bad_item]}
@@ -1770,7 +1775,6 @@ def test_distiller_stamps_verified_frontmatter_and_evidence_section(tmp_path: Pa
             return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
 
     config = _config(tmp_path)
-    config.distiller.max_items_per_transcript = 5
     runtime_paths = bootstrap_runtime_directories(config)
     distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=EvidenceClient())
     try:
@@ -1909,7 +1913,7 @@ def test_archived_transcript_revives_on_reupsert_and_redisills(tmp_path: Path) -
     assert node_id.startswith("mem_session_")
 
     class OneItemClient(FakeDistillSamplingClient):
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             return {"items": [dict(_PITFALL_ITEM, title="Revived session pitfall")]}
 
     distiller = Distiller(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=OneItemClient([dict(_PITFALL_ITEM, title="Revived session pitfall")]))
@@ -2071,7 +2075,7 @@ def test_partial_segment_failure_holds_back_watermark(tmp_path: Path) -> None:
         name = "fake-fail-middle"
         calls = 0
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             type(self).calls += 1
             if type(self).calls == 2:
                 raise RuntimeError("timed out")
@@ -2150,7 +2154,7 @@ def test_concurrent_extraction_same_result_as_serial(tmp_path: Path) -> None:
             self.write_overlap = False
             self._in_write = False
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             with self.lock:
                 self.calls += 1
                 n = self.calls
@@ -2245,23 +2249,23 @@ def test_partial_failure_out_of_order_holds_earliest_watermark(tmp_path: Path) -
 
     class OutOfOrderClient:
         name = "fake-ooo"
-        # Segment 1 (index 0) succeeds; segment 2 (index 1) sleeps then fails;
-        # segment 3 (index 2) fails FAST. Completion order: 3, 1, 2 — the
-        # watermark must still hold at segment 2's start turn.
-        calls = 0
-        lock = threading.Lock()
+        # Segments start at T1..T6 (one per turn). Behavior by TURN (robust to
+        # nondeterministic pool scheduling): T1 succeeds slowly; T2 fails after
+        # a delay; T3 succeeds fast; T4..T6 succeed fast. Completion order:
+        # T3, T4.., T1, then T2 fails last — the watermark must still hold at
+        # the EARLIEST failed segment in turn order (T2 → watermark 1).
 
-        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
-            with type(self).lock:
-                type(self).calls += 1
-                n = type(self).calls
-            if n == 3:  # third SUBMITTED call = segment index 2 → fails fast
-                return {"items": [dict(_PITFALL_ITEM, title="OOO pitfall early")]}
-            if n == 1:  # first submitted = segment index 0 → succeeds slowly
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            import re as _re
+            m = _re.search(r"This segment starts at turn (T\d+)", prompt)
+            turn = m.group(1) if m else "T1"
+            if turn == "T1":
                 time.sleep(0.25)
                 return {"items": [dict(_PITFALL_ITEM, title="OOO pitfall slow")]}
-            time.sleep(0.4)  # second submitted = segment index 1 → fails LAST
-            raise RuntimeError("timed out")
+            if turn == "T2":
+                time.sleep(0.4)  # fails LAST despite being earliest failure
+                raise RuntimeError("timed out")
+            return {"items": [dict(_PITFALL_ITEM, title=f"OOO pitfall {turn}")]}
 
         def decide_memory_write(self, request):
             from synapse.server.sampling import MemoryWriteSamplingDecision
@@ -2315,3 +2319,228 @@ def test_max_concurrency_upper_bound_30(tmp_path: Path) -> None:
 
     with _pytest.raises(ValidationError):
         DistillerSettings(max_concurrency=31)
+
+
+def test_reduce_failure_retries_then_dedupes_never_truncates(tmp_path: Path) -> None:
+    """Reduce failure: retry once, then deterministic exact-title dedupe keeping
+    ALL distinct items. No candidates[:N] truncation anywhere."""
+    attempts = {"n": 0}
+
+    class AlwaysFailReduceClient:
+        name = "fake-reduce-fail"
+        uid = 0
+        lock = __import__("threading").Lock()
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            if "You dedupe knowledge items" in prompt:
+                attempts["n"] += 1
+                raise RuntimeError("reduce timed out")
+            with type(self).lock:
+                type(self).uid += 1
+                n = type(self).uid
+            # Segment 2 and 3 emit the SAME title (near-duplicates → one reduce
+            # group); the rest are distinct.
+            title = "Duplicate pitfall" if n in (2, 3) else f"Distinct pitfall {n}"
+            return {"items": [dict(_PITFALL_ITEM, title=title)]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.segment_chars = 400
+    runtime_paths = _runtime(tmp_path)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=AlwaysFailReduceClient())
+    try:
+        import os
+
+        turn = "## T{n} User\n" + ("durable distinct lesson " * 12)
+        content = "<!-- synapse-transcript v2 -->\n" + "\n\n".join(turn.format(n=n) for n in range(1, 7))
+        _write_transcript(runtime_paths, "mem_session_nofail1", content, session_key="sess-nofail")
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / "mem_session_nofail1.md", (old_ts, old_ts))
+
+        report = distiller.run(downgrade_supersede=False)
+        assert report.transcripts_distilled == 1
+        # 6 candidates (2 share a title → one reduce group); reduce failed twice
+        # (retry once); deterministic fallback deduped the pair → 5 distinct
+        # items written. NOTHING truncated beyond the exact-title dedupe.
+        assert attempts["n"] == 2, "reduce retried exactly once"
+        assert report.items_extracted == 5
+        assert report.reduce_failures == 1
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / "mem_session_nofail1.md")
+        assert len(stamped.metadata.distilled_node_ids) == 5
+    finally:
+        distiller.close()
+
+
+def test_item_warn_threshold_logs_but_writes_everything(tmp_path: Path, caplog) -> None:
+    import logging as _logging
+
+    class ProlificClient:
+        name = "fake-prolific"
+        uid = 0
+        lock = __import__("threading").Lock()
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            with type(self).lock:
+                type(self).uid += 1
+                n = type(self).uid
+            # 3 distinct items per call → 4 segments × 3 = 12 items > threshold 2.
+            return {"items": [
+                dict(_PITFALL_ITEM, title=f"Prolific pitfall {n}.1"),
+                dict(_PITFALL_ITEM, title=f"Prolific pitfall {n}.2"),
+                dict(_PITFALL_ITEM, title=f"Prolific pitfall {n}.3"),
+            ]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.segment_chars = 200
+    config.distiller.item_warn_threshold = 2
+    runtime_paths = _runtime(tmp_path)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=ProlificClient())
+    try:
+        import os
+
+        turn = "## T{n} User\n" + ("prolific lesson " * 8)
+        content = "<!-- synapse-transcript v2 -->\n" + "\n\n".join(turn.format(n=n) for n in range(1, 5))
+        _write_transcript_raw(config, runtime_paths, "mem_session_warn1", content, session_key="sess-warn")
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / "mem_session_warn1.md", (old_ts, old_ts))
+
+        records: list = []
+
+        class Capture(_logging.Handler):
+            def emit(self, record: _logging.LogRecord) -> None:
+                records.append(record)
+
+        capture = Capture()
+        dist_logger = _logging.getLogger("synapse.distiller")
+        dist_logger.addHandler(capture)
+        try:
+            report = distiller.run(downgrade_supersede=False)
+        finally:
+            dist_logger.removeHandler(capture)
+        assert report.transcripts_distilled == 1
+        assert report.items_extracted > config.distiller.item_warn_threshold
+        warns = [r for r in records if "item_warn_threshold" in r.getMessage()]
+        assert len(warns) == 1, "warned once, but NOTHING was dropped"
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / "mem_session_warn1.md")
+        assert len(stamped.metadata.distilled_node_ids) == report.items_extracted
+    finally:
+        distiller.close()
+
+
+def test_reasoning_effort_passed_only_when_set(tmp_path: Path) -> None:
+    """[distiller].reasoning_effort must reach sample_json as the reasoning_effort
+    kwarg ONLY when configured; default None must omit the field."""
+
+    class CapturingClient:
+        name = "fake-capture"
+
+        def __init__(self) -> None:
+            self.seen: list = []
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            self.seen.append(reasoning_effort)
+            return {"items": [dict(_PITFALL_ITEM, title="Capture pitfall")]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    content = "<!-- synapse-transcript v2 -->\n## T1 User\ndurable capture lesson content\n"
+
+    # Default: None.
+    config = _config(tmp_path)
+    runtime_paths = _runtime(tmp_path)
+    client = CapturingClient()
+    d = Distiller(config, runtime_paths=runtime_paths, sampling_client=client)
+    try:
+        _write_transcript(runtime_paths, "mem_session_eff1", content, session_key="eff1")
+        import os as _os
+        old = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        _os.utime(runtime_paths.active / "mem_session_eff1.md", (old, old))
+        d.run(downgrade_supersede=False)
+    finally:
+        d.close()
+    assert client.seen and all(v is None for v in client.seen)
+
+    # Set: "low" passed through.
+    config2 = _config(tmp_path)
+    config2.distiller.reasoning_effort = "low"
+    runtime_paths2 = _runtime(tmp_path)
+    client2 = CapturingClient()
+    d2 = Distiller(config2, runtime_paths=runtime_paths2, sampling_client=client2)
+    try:
+        _write_transcript(runtime_paths2, "mem_session_eff2", content, session_key="eff2")
+        import os as _os
+        old = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        _os.utime(runtime_paths2.active / "mem_session_eff2.md", (old, old))
+        d2.run(downgrade_supersede=False)
+    finally:
+        d2.close()
+    assert client2.seen and all(v == "low" for v in client2.seen)
+
+
+def test_funnel_fields_in_distilled_log(tmp_path: Path) -> None:
+    import logging as _logging
+
+    class FunnelClient:
+        name = "fake-funnel"
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            if "You dedupe knowledge items" in prompt:
+                return {"items": [dict(_PITFALL_ITEM, title="Funnel merged pitfall")]}
+            return {"items": [dict(_PITFALL_ITEM, title="Funnel segment pitfall")]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.segment_chars = 200
+    runtime_paths = _runtime(tmp_path)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=FunnelClient())
+    import os
+
+    turn = "## T{n} User\n" + ("funnel lesson " * 10)
+    content = "<!-- synapse-transcript v2 -->\n" + "\n\n".join(turn.format(n=n) for n in range(1, 5))
+    _write_transcript_raw(config, runtime_paths, "mem_session_fun1", content, session_key="sess-fun")
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(runtime_paths.active / "mem_session_fun1.md", (old_ts, old_ts))
+
+    records: list = []
+
+    class Capture2(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:
+            records.append(record)
+
+    capture2 = Capture2()
+    dist_logger2 = _logging.getLogger("synapse.distiller")
+    dist_logger2.addHandler(capture2)
+    try:
+        distiller.run(downgrade_supersede=False)
+    finally:
+        distiller.close()
+        dist_logger2.removeHandler(capture2)
+
+        entries = [r for r in records if r.getMessage() == "Distilled transcript"]
+        assert len(entries) == 1
+        data = entries[0].__dict__
+        assert "candidates" in data, "funnel: pre-reduce candidate count"
+        assert "after_reduce" in data, "funnel: post-reduce count"
+        assert "reduce_groups_llm" in data
+        assert "reduce_failure" in data and data["reduce_failure"] is False
+        assert "written_by_action" in data and data["written_by_action"].get("create", 0) >= 1
