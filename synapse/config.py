@@ -248,6 +248,11 @@ class DistillerSettings(BaseModel):
     # segment, same call size as the old single-call flow); a single
     # oversized turn is split by chars. Nothing is head/tail-truncated away.
     segment_chars: int = Field(default=16_000, ge=1000)
+    # Concurrent LLM extraction calls (owner request 2026-10-12). 1 = today's
+    # serial behavior. Applies ONLY to segment extraction within a transcript;
+    # reduce → evidence verify → title repair → write path stay serialized.
+    # Writes and SQLite stay serialized regardless of this value.
+    max_concurrency: int = Field(default=1, ge=1, le=16)
     max_items_per_transcript: int = Field(default=5, ge=1, le=20)
     # When true, a decider supersede targeting an existing non-distilled
     # persistent node is downgraded to complement (backfill safety; default ON

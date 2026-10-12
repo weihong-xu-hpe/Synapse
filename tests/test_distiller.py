@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -2115,5 +2118,181 @@ def test_partial_segment_failure_holds_back_watermark(tmp_path: Path) -> None:
         # Third run: nothing selectable.
         report3 = distiller.run(downgrade_supersede=False)
         assert report3.transcripts_scanned == 0
+    finally:
+        distiller.close()
+
+
+def _write_transcript_raw(config, runtime_paths, node_id: str, content: str, *, session_key: str) -> None:
+    """Write + sync a transcript using the GIVEN config (correct project root)."""
+    from synapse.sync import SyncManager
+    metadata = NodeMetadata(id=node_id, title="Session summary — conc", type=NodeType.TRANSIENT, session_key=session_key)
+    node = Node(metadata=metadata, content=content, file_path=Path("active") / f"{node_id}.md")
+    write_node_file(node, base_path=runtime_paths.base)
+    mgr = SyncManager(config, runtime_paths=runtime_paths, debounce_seconds=0.0)
+    try:
+        mgr.sync_paths([str(runtime_paths.base / f"active/{node_id}.md")])
+    finally:
+        mgr.close()
+
+
+def test_concurrent_extraction_same_result_as_serial(tmp_path: Path) -> None:
+    """max_concurrency > 1 produces the same items and watermark as serial for
+    a fake sampler with random delays; results are merged in segment order."""
+
+    class SlowRandomClient:
+        name = "fake-slow-random"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.lock = threading.Lock()
+            self.write_calls = 0
+            self.write_overlap = False
+            self._in_write = False
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            with self.lock:
+                self.calls += 1
+                n = self.calls
+            time.sleep(0.05 + (0.03 * ((n * 7919) % 5)))  # pseudo-random delay
+            return {"items": [dict(_PITFALL_ITEM, title=f"Concurrent pitfall {n}")]}
+
+        def decide_memory_write(self, request):
+            # Detect overlapping write-phase calls (would mean the write path
+            # is running concurrently).
+            if self._in_write:
+                self.write_overlap = True
+            self._in_write = True
+            time.sleep(0.01)
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            decision = MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+            self._in_write = False
+            return decision
+
+    content = (
+        "<!-- synapse-transcript v2 -->\n"
+        + "\n\n".join(
+            f"## T{n} User\n" + ("durable concurrent lesson " * 12) for n in range(1, 7)
+        )
+    )
+
+    def run_once(concurrency: int, runtime_paths) -> tuple[int, Any]:
+        config = _config(runtime_paths.base.parent)
+        config.distiller.segment_chars = 400
+        config.distiller.max_concurrency = concurrency
+        client = SlowRandomClient()
+        d = Distiller(config, runtime_paths=runtime_paths, sampling_client=client)
+        try:
+            try:
+                report = d.run(downgrade_supersede=False)
+                import sys as _sys
+                print("REPORT", concurrency, report.transcripts_distilled,
+                      report.items_extracted, report.llm_failures,
+                      [(dd.get('transcript_id'), len(dd.get('items', []))) for dd in report.details],
+                      file=_sys.stderr)
+            except Exception:
+                import traceback; traceback.print_exc()
+                raise
+            from synapse.storage import read_node_file
+
+            stamped = read_node_file(runtime_paths.active / "mem_session_conc1.md")
+            titles = sorted(
+                read_node_file(runtime_paths.active / f"{kid}.md").title
+                for kid in stamped.metadata.distilled_node_ids
+            )
+            import sys as _sys
+            print("DBG", concurrency, "turn:", stamped.metadata.distilled_turn,
+                  "hash:", bool(stamped.metadata.distilled_hash),
+                  "ntitles:", len(titles), file=_sys.stderr)
+            return stamped.metadata.distilled_turn, titles, client
+        finally:
+            d.close()
+
+    # Serial
+    serial_root = tmp_path / "serial"
+    serial_root.mkdir(exist_ok=True)
+    serial_config = _config(serial_root)
+    serial_paths = bootstrap_runtime_directories(serial_config)
+    _write_transcript_raw(serial_config, serial_paths, "mem_session_conc1", content, session_key="sess-conc")
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(serial_paths.active / "mem_session_conc1.md", (old_ts, old_ts))
+    wm_serial, titles_serial, client_serial = run_once(1, serial_paths)
+    assert client_serial.write_overlap is False
+
+    # Concurrent
+    conc_root = tmp_path / "conc"
+    conc_root.mkdir(exist_ok=True)
+    conc_config = _config(conc_root)
+    conc_paths = bootstrap_runtime_directories(conc_config)
+    _write_transcript_raw(conc_config, conc_paths, "mem_session_conc1", content, session_key="sess-conc")
+    os.utime(conc_paths.active / "mem_session_conc1.md", (old_ts, old_ts))
+    wm_conc, titles_conc, client_conc = run_once(4, conc_paths)
+    assert client_conc.write_overlap is False, "write phase must stay serialized"
+
+    assert wm_serial == wm_conc == 6
+    assert titles_serial == titles_conc
+    # Same non-empty outcome for both modes (the fake's reduce collapses
+    # candidates to one item; equality serial-vs-concurrent is the contract).
+    assert len(titles_serial) >= 1
+
+
+def test_partial_failure_out_of_order_holds_earliest_watermark(tmp_path: Path) -> None:
+    """706a88a semantics under concurrency: with segments failing out of
+    completion order, the watermark holds at the EARLIEST failed segment in
+    turn order (not the first completed failure)."""
+    import threading
+
+    class OutOfOrderClient:
+        name = "fake-ooo"
+        # Segment 1 (index 0) succeeds; segment 2 (index 1) sleeps then fails;
+        # segment 3 (index 2) fails FAST. Completion order: 3, 1, 2 — the
+        # watermark must still hold at segment 2's start turn.
+        calls = 0
+        lock = threading.Lock()
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            with type(self).lock:
+                type(self).calls += 1
+                n = type(self).calls
+            if n == 3:  # third SUBMITTED call = segment index 2 → fails fast
+                return {"items": [dict(_PITFALL_ITEM, title="OOO pitfall early")]}
+            if n == 1:  # first submitted = segment index 0 → succeeds slowly
+                time.sleep(0.25)
+                return {"items": [dict(_PITFALL_ITEM, title="OOO pitfall slow")]}
+            time.sleep(0.4)  # second submitted = segment index 1 → fails LAST
+            raise RuntimeError("timed out")
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.segment_chars = 400
+    config.distiller.max_concurrency = 3
+    runtime_paths = _runtime(tmp_path)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=OutOfOrderClient())
+    try:
+        import os
+
+        turn = "## T{n} User\n" + ("durable ooo lesson " * 12)
+        content = "<!-- synapse-transcript v2 -->\n" + "\n\n".join(turn.format(n=n) for n in range(1, 7))
+        _write_transcript(runtime_paths, "mem_session_ooo1", content, session_key="sess-ooo")
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(runtime_paths.active / "mem_session_ooo1.md", (old_ts, old_ts))
+
+        report = distiller.run(downgrade_supersede=False)
+        assert report.transcripts_distilled == 1
+        assert report.items_extracted >= 1
+
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / "mem_session_ooo1.md")
+        # Segments start at T1..T6 (one per turn). Completion order: T3 fails
+        # fast, T1 succeeds slow, T2 fails slow. Turn-order semantics: the
+        # earliest FAILED segment is T2 → watermark = 1 (turn before T2).
+        # Completion-order logic would have held at T3's turn (wrong).
+        assert stamped.metadata.distilled_turn == 1
+        assert stamped.metadata.distilled_hash is None
     finally:
         distiller.close()

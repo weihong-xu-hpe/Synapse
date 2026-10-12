@@ -399,30 +399,67 @@ class Distiller:
 
         segments = self._build_segments(parsed, watermark=watermark, max_chars=self.settings.segment_chars)
         own_titles = self._titles_for_ids(transcript.metadata.distilled_node_ids)
+        # known_titles computed ONCE: identical for every segment, and the
+        # store's SQLite connection must not be touched from pool threads.
+        known_titles = self._known_titles()
 
         # One extraction call per segment (same call size as the old
         # single-call flow); candidates merge afterwards.
         candidates: list[OkfItem] = []
         extraction_failures = 0
         first_failed_turn: int | None = None
-        for segment_text, start_turn in segments:
-            prompt = self._build_prompt(
-                transcript_content=segment_text,
+        # P2c concurrency (owner request 2026-10-12): extraction calls are the
+        # LLM-bound part; run them concurrently. Results are collected into a
+        # segment-indexed list so watermark logic uses TURN ORDER (first failed
+        # segment in turn order, not completion order — 706a88a semantics).
+        # Everything after extraction (reduce → verify → title repair → write
+        # path → SQLite) stays serialized in the calling thread. The shared
+        # httpx.Client in LocalLLMDecider is thread-safe (connection-pooled),
+        # and no sampling-client contextvar is involved here (the distiller's
+        # client is passed explicitly).
+        extraction_results: list[tuple[int, str, list[OkfItem] | Exception]] = []
+
+        def _extract(index: int, segment_text: str, start_turn: str) -> None:
+            prompt = render_distiller_prompt(
+                transcript=segment_text,
+                known_titles=known_titles,
+                own_distilled_titles=own_titles,
+                max_items=self.settings.max_items_per_transcript,
                 start_turn=start_turn,
-                own_titles=own_titles,
             )
             try:
                 payload = self._sample_json(prompt)
-                candidates.extend(parse_okf_items(payload))
+                extraction_results.append((index, start_turn, parse_okf_items(payload)))
             except Exception as exc:  # noqa: BLE001 — one bad segment must not lose the others
+                extraction_results.append((index, start_turn, exc))
+
+        concurrency = max(1, min(self.settings.max_concurrency, len(segments)))
+        if concurrency <= 1:
+            for index, (segment_text, start_turn) in enumerate(segments):
+                _extract(index, segment_text, start_turn)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [
+                    pool.submit(_extract, index, segment_text, start_turn)
+                    for index, (segment_text, start_turn) in enumerate(segments)
+                ]
+                for future in futures:
+                    future.result()
+
+        for _index, start_turn, result in sorted(extraction_results, key=lambda item: item[0]):
+            if isinstance(result, Exception):
                 extraction_failures += 1
                 if first_failed_turn is None:
                     m = re.match(r"T(\d+)", start_turn)
                     first_failed_turn = int(m.group(1)) if m else parsed.last_turn_number
                 self._logger.warning(
                     "Segment extraction failed",
-                    extra={"node_id": transcript.id, "start_turn": start_turn, "error": str(exc)},
+                    extra={"node_id": transcript.id, "start_turn": start_turn, "error": str(result)},
                 )
+            else:
+                candidates.extend(result)
         if extraction_failures and not candidates:
             raise RuntimeError(f"All {extraction_failures} segment extraction(s) failed")
 
