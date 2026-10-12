@@ -304,6 +304,12 @@ class SyncManager:
             path = self.runtime_paths.base / node.file_path
             if not path.exists():
                 continue
+            # P2b gate: session transcripts never get vectors — they may land
+            # in `missing` after prune-transcript-vectors or a degraded write;
+            # re-embedding them here would resurrect pruned vectors.
+            if should_exclude_from_embedding(node):
+                still_missing.append(node_id)
+                continue
             embedding = self._embed_for_persistence(node, path)
             if embedding is None:
                 still_missing.append(node_id)

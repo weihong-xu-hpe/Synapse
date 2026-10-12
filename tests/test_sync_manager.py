@@ -325,3 +325,42 @@ def test_transcript_reupsert_deletes_stale_vector(tmp_path: Path) -> None:
         assert rows == []
     finally:
         manager.close()
+
+
+def test_reembed_vectorless_skips_transcripts(tmp_path: Path) -> None:
+    """P2b gate: the startup re-embed pass must not resurrect pruned transcript
+    vectors — transcripts land in `missing` after prune-transcript-vectors."""
+    config = load_config(write_config(tmp_path))
+    # remote_api backend is required for the reembed loop to run.
+    config = config.model_copy(update={
+        "embedding": config.embedding.model_copy(update={"provider": "remote_api"}),
+    })
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    transcript_metadata = NodeMetadata(
+        id="mem_session_reembed1",
+        title="Session summary — reembed",
+        created_at=FIXED_TIME,
+        last_accessed=FIXED_TIME,
+        type=NodeType.TRANSIENT,
+        session_key="reembed-key",
+    )
+    transcript = Node(
+        metadata=transcript_metadata,
+        content="## User\nno vector for me\n\n## Assistant\nright",
+        file_path=Path("active/mem_session_reembed1.md"),
+    )
+    transcript_path = write_node_file(transcript, base_path=runtime_paths.base)
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+        store.upsert_node(transcript, embedding=None, source_mtime=FIXED_TIME)
+        assert store.get_node_ids_without_vectors() == ["mem_session_reembed1"]
+
+    manager = SyncManager(config, runtime_paths=runtime_paths, embedding_engine=FakeEmbeddingEngine(), debounce_seconds=0.0)
+    try:
+        result = manager.startup_sync()
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            rows = store.connection.execute("SELECT id FROM nodes_vec").fetchall()
+            assert rows == [], "transcript must not be re-embedded at startup"
+    finally:
+        manager.close()
