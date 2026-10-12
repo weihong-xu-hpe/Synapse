@@ -302,7 +302,7 @@ class Dreamer:
                         low_structure_chars=self.config.dreamer.thresholds.low_structure_chars,
                     ),
                     system_prompt=_TRIAGE_SYSTEM,
-                    max_tokens=1500,
+                    max_tokens=self.config.decider.max_tokens,
                 )
                 payload = result
                 for item in payload.get("decisions") or []:
@@ -342,7 +342,7 @@ class Dreamer:
                 result = self._sampling_client.sample_json(
                     prompt=build_link_weaving_prompt(tuple(batch)),
                     system_prompt=_LINK_WEAVING_SYSTEM,
-                    max_tokens=1500,
+                    max_tokens=self.config.decider.max_tokens,
                 )
                 payload = result
                 for item in payload.get("decisions") or []:
@@ -382,7 +382,7 @@ class Dreamer:
                 result = self._sampling_client.sample_json(
                     prompt=build_conflict_resolution_prompt(tuple(batch)),
                     system_prompt=_CONFLICT_SYSTEM,
-                    max_tokens=1500,
+                    max_tokens=self.config.decider.max_tokens,
                 )
                 payload = result
                 for item in payload.get("decisions") or []:
@@ -443,7 +443,7 @@ class Dreamer:
                 result = self._sampling_client.sample_json(
                     prompt=build_synthesis_prompt(tuple(cluster)),
                     system_prompt=_SYNTHESIS_SYSTEM,
-                    max_tokens=1500,
+                    max_tokens=self.config.decider.max_tokens,
                 )
                 payload = result
                 title = str(payload.get("title") or "").strip()

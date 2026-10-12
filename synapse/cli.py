@@ -190,10 +190,15 @@ def run_dreamer(
     logger = state.loggers[DAEMON_LOGGER_NAME]
     logger.info("Dreamer command invoked", extra={"batch_size": effective_batch_size})
 
+    # Same reasoning-scale prompts as the distiller: reuse its dedicated
+    # timeout instead of the write-path [decider] timeout (120 s live).
+    dreamer_settings = state.config.decider.model_copy(
+        update={"timeout_seconds": state.config.distiller.llm_timeout_seconds}
+    )
     dreamer = Dreamer(
         state.config,
         runtime_paths=state.runtime_paths,
-        sampling_client=LocalLLMDecider(state.config.decider),
+        sampling_client=LocalLLMDecider(dreamer_settings),
         logger=logger,
     )
     try:

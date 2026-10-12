@@ -553,7 +553,7 @@ class Distiller:
         prompt = render_title_repair_prompt(title=item.title, takeaway=item.takeaway, body_excerpt=body_excerpt)
         try:
             payload = self._get_sampling_client().sample_json(
-                prompt=prompt, system_prompt="", max_tokens=400
+                prompt=prompt, system_prompt="", max_tokens=self.config.decider.max_tokens
             )
         except Exception as exc:  # noqa: BLE001 — repair failure falls back, never drops
             self._logger.warning("Title repair call failed", extra={"item": item.title, "error": str(exc)})
@@ -656,7 +656,9 @@ class Distiller:
 
     def _sample_json(self, prompt: str) -> dict[str, Any]:
         client = self._get_sampling_client()
-        return client.sample_json(prompt=prompt, system_prompt="", max_tokens=self.settings.llm_max_tokens)
+        # Owner rule: no tight token cap — wall time is bounded by the LLM
+        # timeout, so extraction/reduce calls use [decider] max_tokens as-is.
+        return client.sample_json(prompt=prompt, system_prompt="", max_tokens=self.config.decider.max_tokens)
 
     # ------------------------------------------------------------------
     # Item → write path

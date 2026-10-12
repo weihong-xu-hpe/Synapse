@@ -338,8 +338,9 @@ def test_sweep_distills_transcript_and_stamps_state(tmp_path: Path) -> None:
         assert knowledge.metadata.okf_type == "pitfall"
         assert "mem_session_e2e1" in knowledge.metadata.sources
 
-        # Prompt carried the reasoning-aware token budget.
-        assert client.calls and client.calls[0]["max_tokens"] == 16000
+        # Prompt carried the [decider] max_tokens budget (owner rule: no
+        # tight cap; defaults to 600 in test config).
+        assert client.calls and client.calls[0]["max_tokens"] == 600
 
         # Second run with unchanged content is a no-op.
         report2 = distiller.run()
@@ -673,9 +674,23 @@ def test_distiller_settings_defaults_and_overrides(tmp_path: Path) -> None:
     assert config.distiller.idle_minutes == 30
     assert config.distiller.retention_days == 45
     assert config.distiller.max_transcript_chars == 16_000
-    assert config.distiller.llm_max_tokens == 16_000
     assert config.distiller.enforce_okf is False
     assert config.distiller.downgrade_supersede is True
+
+
+def test_distiller_calls_use_decider_max_tokens(tmp_path: Path) -> None:
+    """Owner rule: no tight token cap — the distiller's extraction calls pass
+    [decider] max_tokens through unchanged (wall time bounded by timeout)."""
+
+    config = _config(tmp_path)
+    config.decider = config.decider.model_copy(update={"max_tokens": 200_000})
+    client = FakeDistillSamplingClient([])
+    distiller = Distiller(config, runtime_paths=_runtime(tmp_path), sampling_client=client)
+    try:
+        distiller._sample_json("prompt")
+        assert client.calls and client.calls[0]["max_tokens"] == 200_000
+    finally:
+        distiller.close()
 
 
 def test_word_limit_warning_suppressed_for_session_transcripts(tmp_path: Path) -> None:
@@ -1957,3 +1972,86 @@ def test_archived_transcript_revives_on_reupsert_and_redisills(tmp_path: Path) -
         assert carried_ids[0] in restamped.metadata.distilled_node_ids, "carried ids survive re-stamping"
     finally:
         distiller2.close()
+
+
+# ---------------------------------------------------------------------------
+# Tolerant parse: section-key normalization + takeaway fallback
+# ---------------------------------------------------------------------------
+
+
+def test_parse_okf_items_normalizes_hash_prefixed_section_keys() -> None:
+    """glm-5.3-flash sometimes emits '"## Details"' instead of '"Details"';
+    such items must parse instead of being dropped (live variance)."""
+    payload = {
+        "items": [
+            {
+                "okf_type": "fact",
+                "title": "Hash-prefixed sections still parse",
+                "takeaway": "single line takeaway",
+                "sections": {"## Takeaway": "single line takeaway", "## Details": "body text"},
+                "sources": ["mem_session_x"],
+            }
+        ]
+    }
+    items = parse_okf_items(payload)
+    assert len(items) == 1
+    assert items[0].sections["Details"] == "body text"
+    assert items[0].takeaway == "single line takeaway"
+
+
+def test_parse_okf_items_falls_back_to_sections_takeaway() -> None:
+    """Observed live: the model fills '## Takeaway' but leaves the top-level
+    'takeaway' field empty; the section body is used when it is one line."""
+    payload = {
+        "items": [
+            {
+                "okf_type": "fact",
+                "title": "Takeaway only under sections",
+                "takeaway": "",
+                "sections": {"Takeaway": "fallback takeaway line", "Details": "body"},
+                "sources": [],
+            }
+        ]
+    }
+    items = parse_okf_items(payload)
+    assert len(items) == 1
+    assert items[0].takeaway == "fallback takeaway line"
+
+
+def test_parse_okf_items_still_rejects_when_both_takeaways_empty() -> None:
+    payload = {
+        "items": [
+            {
+                "okf_type": "fact",
+                "title": "Both empty",
+                "takeaway": "",
+                "sections": {"Takeaway": "", "Details": "body"},
+                "sources": [],
+            },
+            {
+                "okf_type": "fact",
+                "title": "Missing everything",
+                "takeaway": "",
+                "sections": {},
+                "sources": [],
+            },
+        ]
+    }
+    assert parse_okf_items(payload) == []
+
+
+def test_parse_okf_items_multi_line_section_takeaway_not_used_as_fallback() -> None:
+    """A multi-line section body is not a valid takeaway; no fallback happens
+    and the item is rejected."""
+    payload = {
+        "items": [
+            {
+                "okf_type": "fact",
+                "title": "Multi-line section takeaway",
+                "takeaway": "",
+                "sections": {"Takeaway": "line one\nline two", "Details": "body"},
+                "sources": [],
+            }
+        ]
+    }
+    assert parse_okf_items(payload) == []

@@ -256,10 +256,6 @@ class DistillerSettings(BaseModel):
     # Rejection timeline flag (NOT active in this change): when true, fatal
     # okf_* codes reject persistent writes instead of warning. Default off.
     enforce_okf: bool = False
-    # Reasoning models (glm-5.3-flash) spend thinking tokens from the same
-    # budget: a 9k-char zh transcript measured 13k reasoning tokens before any
-    # content. 16000 leaves room for the JSON payload after thinking.
-    llm_max_tokens: int = Field(default=16_000, ge=200)
     # Distiller-specific LLM HTTP timeout. Live sweeps timed out at the shared
     # decider timeout (120 s) on 8.6k/16k-char transcripts; backfill succeeded
     # at 300 s. Applied only to the distiller's own LLM client — the write-path

@@ -364,11 +364,31 @@ class OkfItem:
         return "\n".join(lines)
 
 
+def _normalize_section_keys(sections_raw: Mapping) -> dict[str, str]:
+    """Normalize LLM section keys: strip leading '#' markers and whitespace.
+
+    glm-5.3-flash occasionally emits ``"## Details"`` instead of
+    ``"Details"``; without normalization every item is rejected as missing
+    sections. First occurrence wins per normalized name.
+    """
+
+    normalized: dict[str, str] = {}
+    for key, value in sections_raw.items():
+        name = str(key).lstrip("#").strip()
+        if not name:
+            continue
+        normalized.setdefault(name, str(value))
+    return normalized
+
+
 def parse_okf_items(payload: object) -> list[OkfItem]:
     """Parse and validate the strict distiller JSON payload into OkfItems.
 
     Invalid items are skipped (reported via OkfValidationError by the caller's
     counter); valid items from a partially invalid response are returned.
+    Tolerant shapes (LLM variance): section keys with leading ``#`` markers
+    are normalized, and an empty top-level ``takeaway`` falls back to the
+    ``Takeaway`` section body when that is a single non-empty line.
     """
 
     if not isinstance(payload, Mapping):
@@ -386,15 +406,22 @@ def parse_okf_items(payload: object) -> list[OkfItem]:
         takeaway = str(raw.get("takeaway") or "").strip()
         sections_raw = raw.get("sections")
         sources_raw = raw.get("sources")
-        if not is_okf_type(okf_type) or not title or not takeaway:
+        if not is_okf_type(okf_type) or not title:
             continue
         if not isinstance(sections_raw, Mapping):
             continue
-        sections = {str(k): str(v) for k, v in sections_raw.items()}
+        sections = _normalize_section_keys(sections_raw)
+        # Tolerant fallback: the model sometimes leaves the top-level
+        # 'takeaway' field empty while filling '## Takeaway' (observed live on
+        # glm-5.3-flash). Use the section body when it is a usable single line.
+        if not takeaway:
+            section_takeaway = (sections.get(SECTION_TAKEAWAY) or "").strip()
+            if section_takeaway and len(section_takeaway.splitlines()) == 1:
+                takeaway = section_takeaway
         sources = [str(s).strip() for s in sources_raw if str(s).strip()] if isinstance(sources_raw, list) else []
         evidence = parse_evidence(raw.get("evidence"))
         missing = [s for s in TYPE_REQUIRED_SECTIONS[okf_type] if not sections.get(s, "").strip()]
-        if missing or len(takeaway) > TAKEAWAY_MAX_CHARS or len(takeaway.splitlines()) != 1:
+        if missing or len(takeaway.splitlines()) != 1 or len(takeaway) > TAKEAWAY_MAX_CHARS:
             continue
         items.append(
             OkfItem(okf_type=okf_type, title=title, takeaway=takeaway, sections=sections, sources=sources, evidence=evidence)

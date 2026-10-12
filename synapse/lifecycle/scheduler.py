@@ -52,7 +52,15 @@ class DreamerScheduler:
         if sampling_client is None:
             from synapse.server.decider import LocalLLMDecider
 
-            sampling_client = LocalLLMDecider(config.decider)
+            # The Dreamer's LLM stages run against the same long reasoning
+            # prompts as the distiller (measured 150-160 s/call on
+            # glm-5.3-flash), so it reuses the distiller's dedicated timeout
+            # instead of the write-path [decider] timeout_seconds (120 s live),
+            # which would abort every stage mid-call.
+            settings = self.config.decider.model_copy(
+                update={"timeout_seconds": self.config.distiller.llm_timeout_seconds}
+            )
+            sampling_client = LocalLLMDecider(settings)
         self._sampling_client = sampling_client
         self._lock_path = lock_path or self.runtime_paths.logs / "dreamer.lock"
         self._timer_factory = timer_factory or Timer
