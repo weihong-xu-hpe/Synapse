@@ -2321,6 +2321,62 @@ def test_max_concurrency_upper_bound_30(tmp_path: Path) -> None:
         DistillerSettings(max_concurrency=31)
 
 
+def test_near_duplicate_create_redirects_to_complement(tmp_path: Path) -> None:
+    """Pre-write near-duplicate gate (owner rework 2026-10-13): when the decider
+    decides "create" for an item whose title is a near-duplicate (token Jaccard
+    >= 0.5) of an existing node, the write becomes a complement of THAT node —
+    no sibling is created. Decider complement/supersede decisions are respected."""
+
+    class CreateClient:
+        name = "fake-create"
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            # Same component, near-identical title tokens → gate fires.
+            return {"items": [dict(_PITFALL_ITEM, title="Genie app healthz endpoint timeout")]}
+
+        def decide_memory_write(self, request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    runtime_paths = _runtime(tmp_path)
+    service = SynapseServerService(_config(tmp_path), runtime_paths=runtime_paths)
+    existing = service.integrate_knowledge(
+        title="Genie app healthz endpoint timeouts",
+        content="## Context\nhealthz probe wisdom",
+        node_type="persistent",
+        action="create",
+    )
+
+    distiller = Distiller(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=CreateClient(), service=service)
+    try:
+        transcript = _write_transcript(runtime_paths, "mem_session_dup1", "## User\nq\n\n## Assistant\n" + "a " * 100, session_key="dup1")
+        import os as _os
+        old = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        _os.utime(runtime_paths.active / "mem_session_dup1.md", (old, old))
+
+        report = distiller.run(downgrade_supersede=False)
+        assert report.transcripts_distilled == 1
+        assert report.items_extracted == 1
+        assert report.decider_creates == 0
+        assert report.decider_complements == 1, "create redirected to complement by the gate"
+
+        store = distiller._get_store()
+        refreshed = store.get_node(existing["node"]["id"])
+        assert refreshed is not None
+        # Complement contract: both nodes stay active and cross-linked; the
+        # existing node is updated in place (never superseded).
+        assert refreshed.metadata.superseded_by is None
+        assert refreshed.metadata.status is NodeStatus.ACTIVE
+        item_notes = report.details[0]["items"] if report.details else []
+        assert item_notes and item_notes[0]["action"] == "complement", "gate redirected create to complement"
+        written = store.get_node(item_notes[0]["node_ids"][0])
+        assert written is not None
+        assert f"[[{existing['node']['id']}]]" in (written.content or ""), "new item cross-links the near-dup target"
+    finally:
+        distiller.close()
+
+
 def test_reduce_failure_retries_then_dedupes_never_truncates(tmp_path: Path) -> None:
     """Reduce failure: retry once, then deterministic exact-title dedupe keeping
     ALL distinct items. No candidates[:N] truncation anywhere."""
@@ -2391,9 +2447,9 @@ def test_item_warn_threshold_logs_but_writes_everything(tmp_path: Path, caplog) 
                 n = type(self).uid
             # 3 distinct items per call → 4 segments × 3 = 12 items > threshold 2.
             return {"items": [
-                dict(_PITFALL_ITEM, title=f"Prolific pitfall {n}.1"),
-                dict(_PITFALL_ITEM, title=f"Prolific pitfall {n}.2"),
-                dict(_PITFALL_ITEM, title=f"Prolific pitfall {n}.3"),
+                dict(_PITFALL_ITEM, title=f"Prolific {n} kafka offset pitfall"),
+                dict(_PITFALL_ITEM, title=f"Prolific {n} redis sentinel pitfall"),
+                dict(_PITFALL_ITEM, title=f"Prolific {n} grpc timeout pitfall"),
             ]}
 
         def decide_memory_write(self, request):
@@ -2529,18 +2585,21 @@ def test_funnel_fields_in_distilled_log(tmp_path: Path) -> None:
 
     capture2 = Capture2()
     dist_logger2 = _logging.getLogger("synapse.distiller")
+    old_level = dist_logger2.level
+    dist_logger2.setLevel(_logging.INFO)
     dist_logger2.addHandler(capture2)
     try:
         distiller.run(downgrade_supersede=False)
     finally:
         distiller.close()
         dist_logger2.removeHandler(capture2)
+        dist_logger2.setLevel(old_level)
 
-        entries = [r for r in records if r.getMessage() == "Distilled transcript"]
-        assert len(entries) == 1
-        data = entries[0].__dict__
-        assert "candidates" in data, "funnel: pre-reduce candidate count"
-        assert "after_reduce" in data, "funnel: post-reduce count"
-        assert "reduce_groups_llm" in data
-        assert "reduce_failure" in data and data["reduce_failure"] is False
-        assert "written_by_action" in data and data["written_by_action"].get("create", 0) >= 1
+    entries = [r for r in records if r.getMessage() == "Distilled transcript"]
+    assert len(entries) == 1
+    data = entries[0].__dict__
+    assert "candidates" in data, "funnel: pre-reduce candidate count"
+    assert "after_reduce" in data, "funnel: post-reduce count"
+    assert "reduce_groups_llm" in data
+    assert "reduce_failure" in data and data["reduce_failure"] is False
+    assert "written_by_action" in data and data["written_by_action"].get("create", 0) >= 1
