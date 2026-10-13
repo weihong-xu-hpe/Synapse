@@ -424,6 +424,7 @@ class SynapseServerService:
         downgrade_supersede: bool = False,
         route: str | None = None,
         verified: bool | None = None,
+        complement_target: str | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -472,6 +473,7 @@ class SynapseServerService:
                 downgrade_supersede=downgrade_supersede,
                 route=route,
                 verified=verified,
+                complement_target=complement_target,
             )
 
     def _find_identical_active_node(self, title: str, content: str) -> Node | None:
@@ -505,6 +507,7 @@ class SynapseServerService:
         downgrade_supersede: bool = False,
         route: str | None = None,
         verified: bool | None = None,
+        complement_target: str | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         warnings: list[dict[str, str]] = []
@@ -566,6 +569,21 @@ class SynapseServerService:
         )
 
         decision_payload = payload["decision"].copy()
+        # Distiller pre-write near-duplicate gate (owner rework 2026-10-13):
+        # when a complement target is provided and the decider decides
+        # "create" (which would make a sibling), redirect to a complement of
+        # the existing node instead. Decider complement/supersede decisions
+        # are respected as-is.
+        if (
+            complement_target
+            and decision_payload.get("action") == "create"
+        ):
+            decision_payload["action"] = "complement"
+            decision_payload["target_node_ids"] = [complement_target]
+            decision_payload["reasoning"] = (
+                "distiller near-duplicate gate: redirected create to complement "
+                f"of existing node {complement_target}"
+            )
         downgrade_note: dict[str, Any] | None = None
         # Downgrade scope (design A3): only supersede of CURATED knowledge —
         # persistent nodes without distiller provenance — is downgraded.
