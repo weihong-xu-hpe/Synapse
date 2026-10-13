@@ -1889,6 +1889,57 @@ def test_evidence_eligible_sources_strict_by_type() -> None:
     assert [e.turn for e in verified_v1] == ["T1"]
 
 
+def test_evidence_across_read_line_number_prefixes_verifies() -> None:
+    """§9 verifier boundary (judge report_v3 §1): read-tool results carry
+    per-line numbering (``12:`` / ``12-`` / ``12-18:``) embedded in the result
+    line. A quote that is verbatim modulo those prefixes verifies — the
+    stripped form is eligible alongside the raw text. Assistant prose and
+    fabricated quotes still fail."""
+
+    from synapse.okf import EvidenceEntry, verify_evidence
+    from synapse.okf.transcript_format import parse_transcript
+
+    content = (
+        "<!-- synapse-transcript v2 -->\n"
+        "## T1 User\nshow me the loader config\n\n"
+        "## T2 Assistant\nthe loader config is at line 10\n"
+        "### Tool T2.1 read\n"
+        "call: read conf/loader.toml\n"
+        "result [ok]: [conf/loader.toml] 10: workers = 4\n12: timeout = 30\n13-16: retries = [1, 2]\n"
+    )
+    parsed = parse_transcript(content)
+    turns = {turn.id: turn.eligible_evidence_text() for turn in parsed.turns}
+
+    # A multi-line quote spanning numbered read lines (model dropped the
+    # prefixes) verifies via the stripped variant.
+    verified, _ = verify_evidence(
+        [EvidenceEntry(turn="T2", quote="workers = 4 timeout = 30 retries = [1, 2]")],
+        turns=turns,
+    )
+    assert len(verified) == 1, "numbering-stripped quote must verify"
+
+    # The RAW form (prefixes kept) still verifies — existing behavior kept.
+    verified_raw, _ = verify_evidence(
+        [EvidenceEntry(turn="T2", quote="12: timeout = 30")],
+        turns=turns,
+    )
+    assert len(verified_raw) == 1, "raw form with prefixes must stay verified"
+
+    # Assistant prose still fails.
+    verified_prose, _ = verify_evidence(
+        [EvidenceEntry(turn="T2", quote="the loader config is at line 10")],
+        turns=turns,
+    )
+    assert verified_prose == []
+
+    # A fabricated quote still fails.
+    verified_fake, _ = verify_evidence(
+        [EvidenceEntry(turn="T2", quote="workers = 99 concurrency = 8")],
+        turns=turns,
+    )
+    assert verified_fake == []
+
+
 # ---------------------------------------------------------------------------
 # P2c: archived-transcript revival (backfill resubmission)
 # ---------------------------------------------------------------------------

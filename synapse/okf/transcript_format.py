@@ -41,23 +41,43 @@ class TranscriptTurn:
     _TOOL_CALL_LINE = re.compile(r"^\s*call:\s*(.*)$")
     _TOOL_RESULT_STATUS = re.compile(r"^\s*result \[([^\]]*)\]:")
 
+    # Read-tool line numbering at the start of an embedded result line:
+    # "12:", "12-" and anchored "12-18:" forms (docs/okf.md §9). Quotes that
+    # cross these prefixes fail verbatim matching when the model drops the
+    # numbering, so the stripped form is eligible alongside the raw text.
+    _LINE_NUMBER_PREFIX = re.compile(r"(?:(?<=\n)|(?<=\A))\s*\d+(?::|-)(?:\d+:)?[ \t]*")
+
+    @staticmethod
+    def _strip_line_number_prefixes(text: str) -> str:
+        return TranscriptTurn._LINE_NUMBER_PREFIX.sub("", text)
+
     def eligible_evidence_text(self, *, okf_type: str | None = None) -> str:
         """Text a verified evidence quote may come from (docs/okf.md §9).
 
         Eligible: (a) the body of a User turn, (b) the ``result [...] :``
         lines of attached tool blocks, (c) for okf_type ``procedure``
         additionally the ``call:`` lines of tool blocks whose result status
-        is ``ok``. Assistant prose never counts for any type.
+        is ``ok``. Assistant prose never counts for any type. Tool-result
+        text is eligible in both raw and line-number-stripped form, so a
+        quote that drops read-tool ``12:``/``12-`` prefixes still verifies.
         """
 
         if self.role == ROLE_USER:
             return self.body
         chunks: list[str] = []
         for block in self.tool_sections:
+            result_lines: list[str] = []
+            in_result = False
             for line in block.splitlines():
                 result_match = self._TOOL_RESULT_LINE.match(line)
                 if result_match is not None:
-                    chunks.append(result_match.group(1))
+                    in_result = True
+                    result_lines.append(result_match.group(1))
+                    continue
+                if in_result and line.strip() and not line.startswith("### "):
+                    # Continuation lines of a wrapped multi-line result (the
+                    # read tool emits numbered lines: "12:", "12-", "12-18:").
+                    result_lines.append(line.strip())
                     continue
                 if okf_type == "procedure":
                     status_match = self._TOOL_RESULT_STATUS.search(line)
@@ -66,6 +86,12 @@ class TranscriptTurn:
                     call_match = self._TOOL_CALL_LINE.match(line)
                     if call_match is not None and self._tool_result_status_for(block) == "ok":
                         chunks.append(call_match.group(1))
+            if result_lines:
+                raw = "\n".join(result_lines)
+                chunks.append(raw)
+                stripped = self._strip_line_number_prefixes(raw)
+                if stripped != raw:
+                    chunks.append(stripped)
         return "\n".join(chunks)
 
     def _tool_result_status_for(self, block: str) -> str | None:

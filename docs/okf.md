@@ -273,8 +273,11 @@ Owner decision C — **annotate, never auto-inject**. Distilled items carry an
 - **Server verification is deterministic (no LLM, no code execution)**: the quote,
   whitespace-collapsed and case-insensitive, must appear in the named turn's
   **eligible evidence text** — (a) the body of a User turn, (b) the
-  `result [...]:` lines of attached tool blocks, and (c) for `procedure`
-  additionally the `call:` lines of tool blocks whose result status is `ok`.
+  `result [...]:` lines of attached tool blocks (including their wrapped
+  continuation lines), and (c) for `procedure` additionally the `call:` lines
+  of tool blocks whose result status is `ok`. Tool-result text counts in both
+  raw form and with read-tool per-line numbering prefixes (`12:`, `12-`,
+  `12-18:`) stripped, so a quote that drops the numbering still verifies.
   Assistant prose never counts for any type; in v1 transcripts (no tool blocks)
   only User turns are eligible. Quotes from any other text stay unverified.
 - Verified items get frontmatter `verified: true` and a `## Evidence` section
