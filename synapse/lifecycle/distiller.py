@@ -692,9 +692,16 @@ class Distiller:
         def _norm(title: str) -> str:
             return " ".join(title.split()).casefold()
 
-        # Deterministic grouping: union items whose normalized titles are equal
-        # or prefix-related. Groups of size 1 pass through untouched.
+        # Deterministic grouping (owner rework 2026-10-13): union items whose
+        # normalized titles are equal/prefix-related OR share >=3 significant
+        # tokens (stopwords removed) — same-component siblings like
+        # genie_app_healthz* / hub_* / oauth_* families. Calibrated on the
+        # 32-item 41975f14 run: 22 groups, 7 multi-groups to the LLM, max 5
+        # members (judge ideal ~12 nodes). Groups of size 1 pass through.
         parent = list(range(len(candidates)))
+
+        _STOP = {'the', 'a', 'an', 'for', 'and', 'or', 'of', 'to', 'in', 'on',
+                 'with', 'is', 'are', 'not', 'from', 'by', 'at', 'as'}
 
         def find(i: int) -> int:
             while parent[i] != i:
@@ -708,10 +715,17 @@ class Distiller:
                 parent[rj] = ri
 
         normed = [_norm(item.title) for item in candidates]
+        token_sets = [
+            {w for w in re.split(r'[^a-z0-9]+', item.title.lower()) if len(w) > 3 and w not in _STOP}
+            for item in candidates
+        ]
         for i in range(len(candidates)):
             for j in range(i + 1, len(candidates)):
                 a, b = normed[i], normed[j]
-                if a == b or a.startswith(b) or b.startswith(a):
+                linked = a == b or a.startswith(b) or b.startswith(a)
+                if not linked and len(token_sets[i] & token_sets[j]) >= 3:
+                    linked = True
+                if linked:
                     union(i, j)
 
         groups: dict[int, list[int]] = {}
@@ -814,6 +828,41 @@ class Distiller:
     # Item → write path
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _title_jaccard(a: str, b: str) -> float:
+        _STOP = {'the', 'a', 'an', 'for', 'and', 'or', 'of', 'to', 'in', 'on',
+                 'with', 'is', 'are', 'not', 'from', 'by', 'at', 'as'}
+        ta = {w for w in re.split(r'[^a-z0-9]+', a.lower()) if len(w) > 3 and w not in _STOP}
+        tb = {w for w in re.split(r'[^a-z0-9]+', b.lower()) if len(w) > 3 and w not in _STOP}
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / len(ta | tb)
+
+    def _find_near_duplicate(
+        self, item: OkfItem, transcript: Node, store: SQLiteNodeStore
+    ) -> Node | None:
+        """Pre-write near-duplicate gate (owner rework 2026-10-13): return the
+        best-matching active node (own prior distilled_node_ids first, then
+        recent persistent nodes) with title-token Jaccard >= 0.5, or None."""
+
+        candidates_nodes: list[Node] = []
+        seen: set[str] = set()
+        for nid in transcript.metadata.distilled_node_ids:
+            n = store.get_node(nid)
+            if n is not None and n.id not in seen:
+                candidates_nodes.append(n)
+                seen.add(n.id)
+        for n in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}):
+            if n.id not in seen:
+                candidates_nodes.append(n)
+                seen.add(n.id)
+        best: tuple[float, Node] | None = None
+        for cand in candidates_nodes:
+            jac = self._title_jaccard(item.title, cand.title)
+            if jac >= 0.5 and (best is None or jac > best[0]):
+                best = (jac, cand)
+        return best[1] if best else None
+
     def _write_item(
         self,
         service: SynapseServerService,
@@ -826,6 +875,8 @@ class Distiller:
     ) -> dict[str, Any]:
         if dry_run:
             return {"action": "planned", "node_ids": []}
+        store = self._get_store()
+        near_dup = self._find_near_duplicate(item, transcript, store)
         # item.sources already includes transcript.id (merged in _distill_transcript).
         sources = list(item.sources)
         # Degenerate-title fallback (docs/okf.md §7): if the slug is still
@@ -849,6 +900,10 @@ class Distiller:
                 node_id=forced_node_id,
                 route="distiller",
                 verified=item.verified,
+                # Pre-write near-duplicate gate (owner rework 2026-10-13): a
+                # near-dup of an existing node becomes a complement of THAT
+                # node (the existing update path) instead of a new sibling.
+                complement_target=(near_dup.id if near_dup is not None else None),
             )
         except SynapseServiceError as exc:
             guard_fired = (
