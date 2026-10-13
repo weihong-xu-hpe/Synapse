@@ -2321,17 +2321,27 @@ def test_max_concurrency_upper_bound_30(tmp_path: Path) -> None:
         DistillerSettings(max_concurrency=31)
 
 
-def test_near_duplicate_create_redirects_to_complement(tmp_path: Path) -> None:
-    """Pre-write near-duplicate gate (owner rework 2026-10-13): when the decider
-    decides "create" for an item whose title is a near-duplicate (token Jaccard
-    >= 0.5) of an existing node, the write becomes a complement of THAT node —
-    no sibling is created. Decider complement/supersede decisions are respected."""
+def test_near_duplicate_merged_into_existing_node(tmp_path: Path) -> None:
+    """Pre-write near-duplicate gate (owner rework 2026-10-13, gap 1): when the
+    decider decides "create" for an item near-duplicating an existing node
+    (title-token Jaccard >= 0.5), the item is MERGED INTO that node — same
+    node id, body updated, sources gain the new transcript, node count
+    unchanged. Decider complement/supersede decisions are respected as-is."""
 
     class CreateClient:
         name = "fake-create"
 
         def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             # Same component, near-identical title tokens → gate fires.
+            if "You merge new knowledge INTO an existing OKF knowledge node" in prompt:
+                return {
+                    "takeaway": "Genie app healthz endpoints time out under load; raise the probe deadline.",
+                    "sections": {
+                        "Symptom": "healthz probe timeouts on the genie app under load.",
+                        "Cause": "probe deadline too low.",
+                        "Fix": "raise the probe deadline.",
+                    },
+                }
             return {"items": [dict(_PITFALL_ITEM, title="Genie app healthz endpoint timeout")]}
 
         def decide_memory_write(self, request):
@@ -2347,6 +2357,7 @@ def test_near_duplicate_create_redirects_to_complement(tmp_path: Path) -> None:
         node_type="persistent",
         action="create",
     )
+    existing_id = existing["node"]["id"]
 
     distiller = Distiller(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=CreateClient(), service=service)
     try:
@@ -2355,24 +2366,30 @@ def test_near_duplicate_create_redirects_to_complement(tmp_path: Path) -> None:
         old = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
         _os.utime(runtime_paths.active / "mem_session_dup1.md", (old, old))
 
+        store = distiller._get_store()
+        before_ids = {n.id for n in store.list_nodes({"status": NodeStatus.ACTIVE}) if not n.id.startswith("mem_session_")}
+
         report = distiller.run(downgrade_supersede=False)
         assert report.transcripts_distilled == 1
         assert report.items_extracted == 1
-        assert report.decider_creates == 0
-        assert report.decider_complements == 1, "create redirected to complement by the gate"
+        assert report.decider_creates == 0, "create redirected by the gate"
 
-        store = distiller._get_store()
-        refreshed = store.get_node(existing["node"]["id"])
-        assert refreshed is not None
-        # Complement contract: both nodes stay active and cross-linked; the
-        # existing node is updated in place (never superseded).
-        assert refreshed.metadata.superseded_by is None
-        assert refreshed.metadata.status is NodeStatus.ACTIVE
         item_notes = report.details[0]["items"] if report.details else []
-        assert item_notes and item_notes[0]["action"] == "complement", "gate redirected create to complement"
-        written = store.get_node(item_notes[0]["node_ids"][0])
-        assert written is not None
-        assert f"[[{existing['node']['id']}]]" in (written.content or ""), "new item cross-links the near-dup target"
+        assert item_notes and item_notes[0]["action"] == "updated", "gate merged the item into the existing node"
+        assert item_notes[0]["node_ids"] == [existing_id], "same node id — merged in place"
+
+        after_ids = {n.id for n in store.list_nodes({"status": NodeStatus.ACTIVE}) if not n.id.startswith("mem_session_")}
+        assert after_ids == before_ids, "node count unchanged — no sibling written"
+
+        refreshed = store.get_node(existing_id)
+        assert refreshed is not None
+        assert refreshed.metadata.status is NodeStatus.ACTIVE
+        assert refreshed.metadata.superseded_by is None
+        assert "mem_session_dup1" in refreshed.metadata.sources, "sources include the new transcript"
+        # The LLM-merged body replaced the content in place: the merged
+        # takeaway is present, the old probe-wisdom body is gone.
+        assert "raise the probe deadline" in (refreshed.content or ""), "merged body written"
+        assert "healthz probe wisdom" not in (refreshed.content or ""), "old body replaced by the merge"
     finally:
         distiller.close()
 
@@ -2395,8 +2412,17 @@ def test_reduce_failure_retries_then_dedupes_never_truncates(tmp_path: Path) -> 
                 type(self).uid += 1
                 n = type(self).uid
             # Segment 2 and 3 emit the SAME title (near-duplicates → one reduce
-            # group); the rest are distinct.
-            title = "Duplicate pitfall" if n in (2, 3) else f"Distinct pitfall {n}"
+            # group); the rest are distinct lessons with disjoint title tokens
+            # (so the near-dup gate does not merge them).
+            titles = {
+                1: "Kafka consumer offset reset pitfall",
+                2: "Duplicate pitfall",
+                3: "Duplicate pitfall",
+                4: "Redis sentinel failover pitfall",
+                5: "Grpc deadline exceeded pitfall",
+                6: "Nginx worker connections pitfall",
+            }
+            title = titles[n]
             return {"items": [dict(_PITFALL_ITEM, title=title)]}
 
         def decide_memory_write(self, request):
@@ -2446,11 +2472,24 @@ def test_item_warn_threshold_logs_but_writes_everything(tmp_path: Path, caplog) 
                 type(self).uid += 1
                 n = type(self).uid
             # 3 distinct items per call → 4 segments × 3 = 12 items > threshold 2.
-            return {"items": [
-                dict(_PITFALL_ITEM, title=f"Prolific {n} kafka offset pitfall"),
-                dict(_PITFALL_ITEM, title=f"Prolific {n} redis sentinel pitfall"),
-                dict(_PITFALL_ITEM, title=f"Prolific {n} grpc timeout pitfall"),
-            ]}
+            # Fully disjoint title tokens per item (no shared prefix/suffix
+            # words): the near-dup gate's 0.25-jaccard band would otherwise
+            # merge these distinct lessons.
+            titles = [
+                "Kafka offset commit pitfall",
+                "Redis sentinel failover pitfall",
+                "Grpc deadline propagation pitfall",
+                "Nginx worker connection pitfall",
+                "Sqlite lock contention pitfall",
+                "Docker network bridge pitfall",
+                "Git submodule sync pitfall",
+                "Make parallel job pitfall",
+                "Yaml anchor merge pitfall",
+                "Ssh tunnel keepalive pitfall",
+                "Homebrew link conflict pitfall",
+                "Pytest fixture scope pitfall",
+            ]
+            return {"items": [dict(_PITFALL_ITEM, title=title) for title in titles[(n - 1) * 3 : n * 3]]}
 
         def decide_memory_write(self, request):
             from synapse.server.sampling import MemoryWriteSamplingDecision

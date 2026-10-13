@@ -21,7 +21,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from synapse.config import SynapseConfig
 from synapse.models import Node, NodeStatus, NodeType
@@ -32,6 +32,8 @@ from synapse.okf import (
     parse_okf_items,
     parse_title_repair,
     render_distiller_prompt,
+    render_evidence_section,
+    render_merge_update_prompt,
     render_reduce_prompt,
     render_title_repair_prompt,
     verify_evidence,
@@ -70,6 +72,9 @@ class DistillerReport:
     decider_complements: int = 0
     decider_supersedes: int = 0
     decider_downgrades: int = 0
+    # Near-duplicate gate: items merged INTO an existing node (same id,
+    # in-place body update) instead of written as a new sibling.
+    merged_updates: int = 0
     llm_failures: int = 0
     archived_transcripts: int = 0
     # Backfill-safety record: supersede decisions downgraded to complement.
@@ -203,6 +208,19 @@ def _build_turn_segments(
 
     flush()
     return segments
+
+
+def _extract_section(content: str, name: str) -> str | None:
+    """Body of the ``## <name>`` section in *content*, or None when absent."""
+
+    pattern = re.compile(rf"(?ms)^## {re.escape(name)}\s*\n(.*?)(?=^## |\Z)")
+    match = pattern.search(content)
+    return match.group(1).strip() if match else None
+
+
+def _first_section_line(content: str, name: str) -> str:
+    body = _extract_section(content, name) or ""
+    return body.splitlines()[0].strip() if body else ""
 
 
 class Distiller:
@@ -841,12 +859,51 @@ class Distiller:
     def _find_near_duplicate(
         self, item: OkfItem, transcript: Node, store: SQLiteNodeStore
     ) -> Node | None:
-        """Pre-write near-duplicate gate (owner rework 2026-10-13): return the
-        best-matching active node (own prior distilled_node_ids first, then
-        recent persistent nodes) with title-token Jaccard >= 0.5, or None."""
+        """Pre-write near-duplicate gate (owner rework 2026-10-13, gap 2).
 
+        Candidate finder: vector_search over the stored bge-m3 embeddings
+        (query = item title+takeaway, top 8) — the production signal, so a
+        node without a stored vector is not findable by this leg. Fallback
+        and secondary signal: title-token Jaccard over the transcript's own
+        distilled_node_ids plus ALL active persistent nodes.
+
+        Merge decision on the best candidate (calibrated 2026-10-13 on the
+        judge's dup pairs + related-same-surface + clear non-dups; bge-reranker
+        -v2-m3 scores: dups/paraphrases 5.4-7.5, related-different-lesson
+        3.2 with jaccard 0.17, unrelated <1.3):
+          rerank >= 3.0 AND jaccard >= 0.25, OR
+          rerank >= 1.5 AND jaccard >= 0.5, OR
+          (reranker unavailable) jaccard >= 0.5 alone.
+        """
+
+        query_text = f"{item.title}\n{item.takeaway}".strip()
         candidates_nodes: list[Node] = []
         seen: set[str] = set()
+
+        # Embedding leg: top-k over stored vectors (knowledge only; vector
+        # search covers active+archived rows, filter to ACTIVE persistent).
+        query_vector: list[float] | None = None
+        try:
+            from synapse.embedding import create_embedding_engine
+
+            engine = create_embedding_engine(self.config.embedding, providers=self.config.providers)
+            if getattr(engine, "backend_name", "") != "unavailable" and engine.is_available():
+                query_vector = engine.embed(query_text)
+        except (OSError, RuntimeError, ValueError):
+            query_vector = None
+        if query_vector:
+            for node_id, _distance in store.vector_search(query_vector, limit=8):
+                node = store.get_node(node_id)
+                if (
+                    node is not None
+                    and node.metadata.status is NodeStatus.ACTIVE
+                    and node.metadata.type is NodeType.PERSISTENT
+                    and node.id not in seen
+                ):
+                    candidates_nodes.append(node)
+                    seen.add(node.id)
+
+        # Jaccard leg: own prior distilled nodes first, then all persistent.
         for nid in transcript.metadata.distilled_node_ids:
             n = store.get_node(nid)
             if n is not None and n.id not in seen:
@@ -856,12 +913,114 @@ class Distiller:
             if n.id not in seen:
                 candidates_nodes.append(n)
                 seen.add(n.id)
-        best: tuple[float, Node] | None = None
-        for cand in candidates_nodes:
-            jac = self._title_jaccard(item.title, cand.title)
-            if jac >= 0.5 and (best is None or jac > best[0]):
-                best = (jac, cand)
-        return best[1] if best else None
+        if not candidates_nodes:
+            return None
+
+        jaccards = [self._title_jaccard(item.title, cand.title) for cand in candidates_nodes]
+        best_jaccard = max(jaccards)
+        if best_jaccard <= 0.0:
+            return None
+
+        # Reranker signal over the candidate shortlist.
+        rerank_scores: list[float | None] = [None] * len(candidates_nodes)
+        try:
+            from synapse.embedding import create_reranker_engine
+            from synapse.utils.documents import render_node_document
+
+            reranker = create_reranker_engine(self.config.reranker, providers=self.config.providers)
+            documents = [render_node_document(cand) for cand in candidates_nodes]
+            for index, score in reranker.rerank(query_text, documents):
+                rerank_scores[index] = float(score)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+        best_index = max(
+            range(len(candidates_nodes)),
+            key=lambda i: (rerank_scores[i] if rerank_scores[i] is not None else -1e9, jaccards[i]),
+        )
+        jaccard = jaccards[best_index]
+        score = rerank_scores[best_index]
+        if score is None:
+            return candidates_nodes[best_index] if jaccard >= 0.5 else None
+        if (score >= 3.0 and jaccard >= 0.25) or (score >= 1.5 and jaccard >= 0.5):
+            return candidates_nodes[best_index]
+        return None
+
+    def _merge_item_into_node(self, item: OkfItem, existing: Node) -> str | None:
+        """LLM merge of the existing node body + the new item (gap 1).
+
+        Returns the merged OKF body for the in-place update, or None when the
+        merge call fails or the response does not validate. The EXISTING
+        node's okf_type governs the required sections; the merged body keeps
+        the existing node's knowledge language.
+        """
+
+        import json as _json
+
+        okf_type = existing.metadata.okf_type
+        if okf_type is None or okf_type not in TYPE_REQUIRED_SECTIONS:
+            # Untyped legacy node: merge only when the item type matches the
+            # item's own sections (the common distiller case).
+            okf_type = item.okf_type
+        required = TYPE_REQUIRED_SECTIONS[okf_type]
+        existing_doc = {
+            "okf_type": okf_type,
+            "title": existing.title,
+            "takeaway": _first_section_line(existing.content, "Takeaway"),
+            "sections": {
+                name: _extract_section(existing.content, name) or ""
+                for name in ["Takeaway", *required, "Sources"]
+            },
+        }
+        new_doc = {
+            "okf_type": item.okf_type,
+            "title": item.title,
+            "takeaway": item.takeaway,
+            "sections": dict(item.sections),
+        }
+        prompt = render_merge_update_prompt(
+            existing_node_json=_json.dumps(existing_doc, ensure_ascii=False),
+            new_item_json=_json.dumps(new_doc, ensure_ascii=False),
+        )
+        try:
+            payload = self._sample_json(prompt)
+        except Exception as exc:  # noqa: BLE001 — merge failure falls back to plain update
+            self._logger.warning(
+                "Merge-update call failed; falling back to plain item body",
+                extra={"node_id": existing.id, "error": str(exc)},
+            )
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        sections = payload.get("sections")
+        takeaway = str(payload.get("takeaway") or "").strip()
+        if not isinstance(sections, Mapping) or not takeaway or len(takeaway.splitlines()) != 1:
+            return None
+        normalized: dict[str, str] = {}
+        for key, value in sections.items():
+            name = str(key).lstrip("#").strip()
+            if name:
+                normalized.setdefault(name, str(value))
+        missing = [s for s in required if not normalized.get(s, "").strip()]
+        if missing:
+            return None
+        lines: list[str] = ["## Takeaway", "", takeaway, ""]
+        for section in required:
+            lines.extend([f"## {section}", "", normalized[section].strip(), ""])
+        # Evidence from the new item (already deterministically verified) is
+        # appended; existing node sources stay in frontmatter via the service.
+        if item.evidence:
+            lines.append(render_evidence_section(item.evidence).rstrip("\n"))
+            lines.append("")
+        lines.append("## Sources")
+        lines.append("")
+        for source in existing.metadata.sources:
+            lines.append(f"- {source}")
+        for source in item.sources:
+            if source not in existing.metadata.sources:
+                lines.append(f"- {source}")
+        lines.append("")
+        return "\n".join(lines)
 
     def _write_item(
         self,
@@ -877,6 +1036,13 @@ class Distiller:
             return {"action": "planned", "node_ids": []}
         store = self._get_store()
         near_dup = self._find_near_duplicate(item, transcript, store)
+        content = item.render()
+        if near_dup is not None and not dry_run:
+            merged = self._merge_item_into_node(item, near_dup)
+            if merged is not None:
+                content = merged
+            # Merge LLM failure falls through to the plain item body; the
+            # server's in-place update still preserves the existing node.
         # item.sources already includes transcript.id (merged in _distill_transcript).
         sources = list(item.sources)
         # Degenerate-title fallback (docs/okf.md §7): if the slug is still
@@ -890,7 +1056,7 @@ class Distiller:
         try:
             result = service.write_memory(
                 title=item.title,
-                content=item.render(),
+                content=content,
                 node_type=NodeType.PERSISTENT,
                 sources=sources,
                 okf_type=item.okf_type,
@@ -901,9 +1067,9 @@ class Distiller:
                 route="distiller",
                 verified=item.verified,
                 # Pre-write near-duplicate gate (owner rework 2026-10-13): a
-                # near-dup of an existing node becomes a complement of THAT
-                # node (the existing update path) instead of a new sibling.
-                complement_target=(near_dup.id if near_dup is not None else None),
+                # near-dup of an existing node is MERGED INTO that node (same
+                # id, in-place body update) instead of writing a new sibling.
+                merge_update_target=(near_dup.id if near_dup is not None else None),
             )
         except SynapseServiceError as exc:
             guard_fired = (
@@ -939,6 +1105,11 @@ class Distiller:
         action = str(decision.get("action", ""))
         node_payload = result.get("execution", {}).get("result", {}).get("node", {})
         node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
+        if not action and result.get("action") == "updated":
+            # Near-duplicate merge-update payload (no decider decision shape).
+            action = "updated"
+            merged_node = result.get("node")
+            node_id = merged_node.get("id") if isinstance(merged_node, dict) else None
         self._count_action(report, action)
         downgrade = result.get("downgrade")
         if isinstance(downgrade, dict):
@@ -961,6 +1132,8 @@ class Distiller:
             report.decider_complements += 1
         elif action == "supersede":
             report.decider_supersedes += 1
+        elif action == "updated":
+            report.merged_updates += 1
 
     # ------------------------------------------------------------------
     # Transcript state

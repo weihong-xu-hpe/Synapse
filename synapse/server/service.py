@@ -424,7 +424,7 @@ class SynapseServerService:
         downgrade_supersede: bool = False,
         route: str | None = None,
         verified: bool | None = None,
-        complement_target: str | None = None,
+        merge_update_target: str | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -473,8 +473,63 @@ class SynapseServerService:
                 downgrade_supersede=downgrade_supersede,
                 route=route,
                 verified=verified,
-                complement_target=complement_target,
+                merge_update_target=merge_update_target,
             )
+
+    def _merge_update_node(
+        self,
+        *,
+        target_id: str,
+        content: str,
+        title: str,
+        sources: list[str],
+        verified: bool | None,
+        route: str | None,
+    ) -> dict[str, Any]:
+        """Merge-update an existing node IN PLACE (near-duplicate gate).
+
+        Same node id, body replaced by the caller's merged OKF body; sources
+        are unioned (existing + new) into the frontmatter; evidence and
+        ``verified`` come from the caller (already verified against the
+        transcript). Records action "updated" with route attribution.
+        """
+
+        existing = self._load_node(target_id)
+        if existing is None or existing.metadata.status is not NodeStatus.ACTIVE:
+            raise SynapseServiceError(
+                "INVALID_TARGET",
+                "merge_update_target must reference an ACTIVE node",
+                status_code=422,
+                details={"merge_update_target": target_id},
+            )
+        merged_sources = list(dict.fromkeys([*existing.metadata.sources, *sources]))
+        merged_metadata = existing.metadata.model_copy(
+            update={"sources": merged_sources, "verified": verified if verified is not None else existing.metadata.verified}
+        )
+        node = existing.model_copy(update={"content": content, "metadata": merged_metadata})
+        absolute_path = write_node_file(node, base_path=self.runtime_paths.base)
+        sync_result = self._sync_paths([absolute_path])
+        stored_node = self._load_node(target_id)
+
+        self._record_route_write_event(
+            node_id=target_id,
+            node_type=stored_node.metadata.type.value,
+            action="updated",
+            route=route,
+        )
+        payload = {
+            "node": self._serialize_node(stored_node),
+            "action": "updated",
+            "merged_into": target_id,
+        }
+        if sync_result is not None:
+            payload["sync"] = self._serialize_sync_result(sync_result)
+        self._log_tool_call(
+            "write_memory_merge_update",
+            {"merge_update_target": target_id, "title": title.strip()},
+            payload,
+        )
+        return payload
 
     def _find_identical_active_node(self, title: str, content: str) -> Node | None:
         """ACTIVE node with the same title and byte-identical content, if any."""
@@ -507,7 +562,7 @@ class SynapseServerService:
         downgrade_supersede: bool = False,
         route: str | None = None,
         verified: bool | None = None,
-        complement_target: str | None = None,
+        merge_update_target: str | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
         warnings: list[dict[str, str]] = []
@@ -569,20 +624,21 @@ class SynapseServerService:
         )
 
         decision_payload = payload["decision"].copy()
-        # Distiller pre-write near-duplicate gate (owner rework 2026-10-13):
-        # when a complement target is provided and the decider decides
-        # "create" (which would make a sibling), redirect to a complement of
-        # the existing node instead. Decider complement/supersede decisions
-        # are respected as-is.
-        if (
-            complement_target
-            and decision_payload.get("action") == "create"
-        ):
-            decision_payload["action"] = "complement"
-            decision_payload["target_node_ids"] = [complement_target]
-            decision_payload["reasoning"] = (
-                "distiller near-duplicate gate: redirected create to complement "
-                f"of existing node {complement_target}"
+        # Pre-write near-duplicate MERGE (owner rework 2026-10-13, gap 1):
+        # the caller's gate found an existing node stating the same lesson.
+        # The decider runs first — its complement/supersede decisions are
+        # legit even for near-dups (same-title supersede is the normal
+        # knowledge-update flow). Only a "create" decision is redirected:
+        # the item is merged INTO the existing node (same id, in-place body
+        # update) instead of minting a duplicate sibling.
+        if merge_update_target and decision_payload.get("action") == "create":
+            return self._merge_update_node(
+                target_id=merge_update_target,
+                content=content,
+                title=title,
+                sources=sources or [],
+                verified=verified,
+                route=route,
             )
         downgrade_note: dict[str, Any] | None = None
         # Downgrade scope (design A3): only supersede of CURATED knowledge —

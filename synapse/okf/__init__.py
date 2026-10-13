@@ -583,3 +583,46 @@ def render_reduce_prompt(
             candidates_json,
         ]
     )
+
+
+def render_merge_update_prompt(
+    *,
+    existing_node_json: str,
+    new_item_json: str,
+) -> str:
+    """Pre-write near-duplicate merge prompt (owner rework 2026-10-13, gap 1).
+
+    The distiller's near-duplicate gate found an existing node stating the SAME
+    lesson as the new item. Instead of writing a sibling, the item is merged
+    INTO the existing node: one well-structured OKF body combining both, under
+    the EXISTING node's okf_type. The LLM merges prose; the server owns
+    frontmatter (title/id keep the existing node's id), sources, evidence.
+    """
+
+    return "\n".join(
+        [
+            "You merge new knowledge INTO an existing OKF knowledge node.",
+            "The existing node and the new item state the SAME durable lesson.",
+            "Produce ONE merged OKF node body: combine the information of both into",
+            "well-structured sections — do not lose any concrete detail from either,",
+            "do not invent claims, do not repeat the same statement twice.",
+            "",
+            f"Keep the EXISTING node's okf_type ({', '.join(TYPE_REQUIRED_SECTIONS)}).",
+            f"Required sections for that type: exactly the fixed English headings.",
+            f"Rules:",
+            "1. The Takeaway must be ONE line (<= 200 chars) covering the merged lesson.",
+            "2. Merge corresponding sections: same-named sections combine; information only",
+            "   in the new item is folded into the best-fitting required section.",
+            "3. Preserve concrete specifics (commands, paths, config keys, version numbers).",
+            "4. Keep the body in the source language of the existing node's knowledge.",
+            "",
+            "Respond with a single JSON object, no markdown fence, no extra prose:",
+            '{"takeaway": "...", "sections": {"<SectionName>": "markdown"}}',
+            "",
+            "Existing node:",
+            existing_node_json,
+            "",
+            "New item to merge in:",
+            new_item_json,
+        ]
+    )
