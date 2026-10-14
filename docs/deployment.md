@@ -30,7 +30,7 @@ The CLI no longer exposes transport selection. Synapse starts its single server 
 
 ## Health checks
 
-`GET /health` returns runtime status, component checks, and warnings; `GET /` returns server metadata and transport discovery information.
+`GET /health` is a fast liveness probe (`{"status":"ok"}`); `GET /` returns server metadata and transport discovery information.
 
 ## macOS daemonization
 

@@ -294,7 +294,7 @@ def test_streamable_http_auth_token_is_enforced_for_mcp_only(tmp_path: Path) -> 
         assert root_response.status_code == 200
         health_response = client.get("/health")
         assert health_response.status_code == 200
-        assert "status" in health_response.json()
+        assert health_response.json() == {"status": "ok"}
 
         unauthorized = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         assert unauthorized.status_code == 401
