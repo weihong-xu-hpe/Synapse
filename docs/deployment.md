@@ -28,6 +28,10 @@ python -m synapse serve --run-server
 
 The CLI no longer exposes transport selection. Synapse starts its single server runtime through the same entrypoint each time.
 
+## Health checks
+
+`GET /health` returns runtime status, component checks, and warnings; `GET /` returns server metadata and transport discovery information.
+
 ## macOS daemonization
 
 Synapse supports user-level `launchd` integration.

@@ -337,6 +337,13 @@ def _create_root_handler():
     return root
 
 
+def _create_health_handler(service: SynapseServerService):
+    def health() -> dict[str, Any]:
+        return service.health()
+
+    return health
+
+
 def _create_rest_search_handler(service: SynapseServerService):
     """Thin REST wrapper around service.search_memory for non-MCP clients (e.g. omp hooks)."""
 
@@ -528,6 +535,7 @@ def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None,
     app.get("/mcp")(_create_mcp_get_handler(session_manager))
     app.delete("/mcp")(_create_mcp_delete_handler(session_manager))
     app.get("/")(_create_root_handler())
+    app.get("/health")(_create_health_handler(service))
     app.post("/api/search")(_create_rest_search_handler(service))
     app.post("/api/write")(_create_rest_write_handler(service))
 
