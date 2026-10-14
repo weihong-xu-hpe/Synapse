@@ -191,19 +191,31 @@ class LoggingSettings(BaseModel):
     log_dir: Path = Path("./.synapse/.logs")
 
 
+class DeciderEndpointSettings(BaseModel):
+    """One OpenAI-compatible endpoint in the local LLM pool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    model: str
+    api_key_env: str = ""
+
+
 class DeciderSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: str = "local_llm"
-    base_url: str = "http://localhost:8000/v1"
-    model: str = "deepseek-v4-pro"
-    api_key_env: str = ""
-    fallback_base_url: str = ""
-    fallback_model: str = ""
-    fallback_api_key_env: str = "OPENAI_COMPATIBLE_API_KEY"
+    endpoints: list[DeciderEndpointSettings] = Field(
+        default_factory=lambda: [
+            DeciderEndpointSettings(base_url="http://localhost:8000/v1", model="deepseek-v4-pro")
+        ],
+        min_length=1,
+    )
     timeout_seconds: int = 30
-    max_tokens: int = 600
-    temperature: float = 0.1
+    max_tokens: int = 200_000
+    # Maximum in-flight HTTP calls per endpoint; the pool uses all endpoints concurrently.
+    endpoint_max_concurrency: int = Field(default=30, ge=1, le=64)
+    temperature: float = 0.0
 
 
 class DreamerThresholdSettings(BaseModel):
@@ -248,12 +260,10 @@ class DistillerSettings(BaseModel):
     # segment, same call size as the old single-call flow); a single
     # oversized turn is split by chars. Nothing is head/tail-truncated away.
     segment_chars: int = Field(default=16_000, ge=1000)
-    # Concurrent LLM extraction calls (owner request 2026-10-12). 1 = today's
-    # serial behavior. Applies ONLY to segment extraction within a transcript;
-    # reduce → evidence verify → title repair → write path stay serialized.
-    # Writes and SQLite stay serialized regardless of this value. Hard owner
-    # limit 30 (bench: /tmp/distill-bench/report.md).
-    max_concurrency: int = Field(default=1, ge=1, le=30)
+    # Concurrent segment extraction calls per transcript; endpoint pool caps total calls.
+    max_concurrency: int = Field(default=30, ge=1, le=30)
+    # Concurrent transcript workers inside one sweep.
+    transcript_concurrency: int = Field(default=4, ge=1, le=16)
     # Owner 2026-10-12 rework: the fixed item-count concept is removed (the
     # model extracts everything durable; reduce = dedupe only). No cap field.
     # Warn (never drop) when a transcript yields more than this many items.
@@ -273,7 +283,8 @@ class DistillerSettings(BaseModel):
     # at 300 s. Applied only to the distiller's own LLM client — the write-path
     # decider keeps [decider] timeout_seconds.
     llm_timeout_seconds: int = Field(default=300, ge=1)
-    max_transcripts_per_run: int = Field(default=5, ge=1, le=50)
+    # Per-sweep safety cap; candidates are refilled into free transcript slots until this limit or backlog exhaustion.
+    max_transcripts_per_run: int = Field(default=500, ge=1, le=5000)
     backoff_sweeps: int = Field(default=3, ge=0)
 
 

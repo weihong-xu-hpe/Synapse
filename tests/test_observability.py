@@ -42,7 +42,10 @@ model = "bge-reranker-v2-m3"
 
 [decider]
 provider = "local_llm"
+
+[[decider.endpoints]]
 base_url = "http://localhost:1/v1"
+model = "test-model"
 
 [observability]
 eval_history_path = "eval-history.jsonl"

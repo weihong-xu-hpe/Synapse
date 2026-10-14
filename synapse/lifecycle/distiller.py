@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
+import threading
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -76,6 +79,9 @@ class DistillerReport:
     # in-place body update) instead of written as a new sibling.
     merged_updates: int = 0
     llm_failures: int = 0
+    segments_total: int = 0
+    endpoint_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
+    actions_by_endpoint: dict[str, dict[str, int]] = field(default_factory=dict)
     archived_transcripts: int = 0
     # Backfill-safety record: supersede decisions downgraded to complement.
     downgraded: list[dict[str, str]] = field(default_factory=list)
@@ -123,6 +129,8 @@ class DistillerReport:
                 "downgraded_to_complement": self.decider_downgrades,
             },
             "llm_failures": self.llm_failures,
+            "segments_total": self.segments_total,
+            "endpoint_calls": self.endpoint_calls,
             "archived_transcripts": self.archived_transcripts,
             "downgraded": self.downgraded,
         }
@@ -242,23 +250,75 @@ class Distiller:
         self._service = service
         self._logger = logger or LOGGER
         self._store: SQLiteNodeStore | None = None
+        self._store_local = threading.local()
+        self._owner_thread_id = threading.get_ident()
+        self._llm_executor: ThreadPoolExecutor | None = None
+        self._llm_executor_lock = threading.Lock()
+        self._write_commit_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Store / service access
     # ------------------------------------------------------------------
 
     def _get_store(self) -> SQLiteNodeStore:
-        if self._store is None:
-            self._store = SQLiteNodeStore(
+        store = getattr(self._store_local, "store", None)
+        if store is None:
+            store = SQLiteNodeStore(
                 self.runtime_paths.base / "synapse.db",
                 embedding_dimension=self.config.embedding.dimension or 0,
             )
-        return self._store
+            self._store_local.store = store
+            if threading.get_ident() == self._owner_thread_id:
+                self._store = store
+        return store
+
+    def _close_thread_store(self) -> None:
+        store = getattr(self._store_local, "store", None)
+        if store is not None:
+            store.close()
+            self._store_local.store = None
+            if threading.get_ident() == self._owner_thread_id:
+                self._store = None
 
     def close(self) -> None:
-        if self._store is not None:
-            self._store.close()
-            self._store = None
+        if self._llm_executor is not None:
+            self._llm_executor.shutdown(wait=True)
+            self._llm_executor = None
+        self._close_thread_store()
+
+    def _get_llm_executor(self) -> ThreadPoolExecutor:
+        if self._llm_executor is None:
+            with self._llm_executor_lock:
+                if self._llm_executor is None:
+                    workers = len(self.config.decider.endpoints) * self.config.decider.endpoint_max_concurrency
+                    self._llm_executor = ThreadPoolExecutor(
+                        max_workers=max(1, workers),
+                        thread_name_prefix="synapse-distiller-llm",
+                    )
+        return self._llm_executor
+
+    def _sampling_call_context(self, transcript: Node, stage: str):
+        client = self._get_sampling_client()
+        call_context = getattr(client, "call_context", None)
+        if not callable(call_context):
+            return nullcontext()
+        timeout_seconds = (
+            self.config.decider.timeout_seconds
+            if stage == "write_decider"
+            else self.settings.llm_timeout_seconds
+        )
+        try:
+            return call_context(
+                transcript_id=transcript.id,
+                stage=stage,
+                timeout_seconds=timeout_seconds,
+            )
+        except TypeError:
+            return call_context(transcript_id=transcript.id, stage=stage)
+
+    def _llm_calls_per_transcript(self) -> int:
+        total = len(self.config.decider.endpoints) * self.config.decider.endpoint_max_concurrency
+        return max(1, min(self.settings.max_concurrency, total // self.settings.transcript_concurrency))
 
     def _get_service(self) -> SynapseServerService:
         if self._service is None:
@@ -327,43 +387,173 @@ class Distiller:
         started = datetime.now(UTC)
         report = DistillerReport(started_at=started.isoformat().replace("+00:00", "Z"), completed_at="")
         downgrade = self.settings.downgrade_supersede if downgrade_supersede is None else downgrade_supersede
+        max_transcripts = self.settings.max_transcripts_per_run if limit is None else max(0, limit)
+        self._get_service()
+        self._get_llm_executor()
 
-        transcripts = self.select_transcripts(limit=limit or self.settings.max_transcripts_per_run)
-        report.transcripts_scanned = len(transcripts)
-
-        for transcript in transcripts:
-            try:
-                detail = self._distill_transcript(transcript, report, dry_run=dry_run, downgrade_supersede=downgrade)
-                report.details.append(detail)
-            except Exception as exc:  # noqa: BLE001 — one bad transcript must not stop the sweep
-                report.llm_failures += 1
-                report.transcripts_skipped += 1
-                self._logger.warning(
-                    "Distill failed for transcript; backing off",
-                    extra={"node_id": transcript.id, "error": str(exc)},
-                )
-                if not dry_run:
-                    self._mark_backoff(transcript)
+        seen: set[str] = set()
+        in_flight: dict[Future[DistillerReport], Node] = {}
+        with ThreadPoolExecutor(
+            max_workers=self.settings.transcript_concurrency,
+            thread_name_prefix="synapse-distiller-transcript",
+        ) as pool:
+            while in_flight or len(seen) < max_transcripts:
+                free_slots = self.settings.transcript_concurrency - len(in_flight)
+                if free_slots and len(seen) < max_transcripts:
+                    candidates = [node for node in self.select_transcripts() if node.id not in seen]
+                    for transcript in candidates[: min(free_slots, max_transcripts - len(seen))]:
+                        seen.add(transcript.id)
+                        report.transcripts_scanned += 1
+                        future = pool.submit(
+                            self._run_transcript_task,
+                            transcript,
+                            dry_run=dry_run,
+                            downgrade_supersede=downgrade,
+                        )
+                        in_flight[future] = transcript
+                if not in_flight:
+                    break
+                completed, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    in_flight.pop(future)
+                    self._merge_transcript_report(report, future.result())
 
         if not dry_run:
             report.archived_transcripts = self._archive_expired(report)
 
-        completed = datetime.now(UTC)
-        report.completed_at = completed.isoformat().replace("+00:00", "Z")
-        report.duration_ms = int((completed - started).total_seconds() * 1000)
+        completed_at = datetime.now(UTC)
+        report.completed_at = completed_at.isoformat().replace("+00:00", "Z")
+        for endpoint_stats in report.endpoint_calls.values():
+            endpoint_stats["avg_latency_ms"] = (
+                endpoint_stats["latency_total_ms"] / endpoint_stats["calls"]
+                if endpoint_stats["calls"]
+                else 0.0
+            )
+            endpoint_stats["wall_time_ms"] = endpoint_stats["latency_total_ms"]
+        report.duration_ms = int((completed_at - started).total_seconds() * 1000)
         if not dry_run:
             self._get_store().record_distiller_run(report.metrics())
         self._logger.info(
             "Distiller run complete",
             extra={
+                "transcripts_scanned": report.transcripts_scanned,
                 "transcripts_distilled": report.transcripts_distilled,
+                "transcripts_skipped": report.transcripts_skipped,
+                "segments": report.segments_total,
                 "items_extracted": report.items_extracted,
+                "decider_actions": {
+                    "create": report.decider_creates,
+                    "complement": report.decider_complements,
+                    "supersede": report.decider_supersedes,
+                    "updated": report.merged_updates,
+                },
                 "llm_failures": report.llm_failures,
                 "archived_transcripts": report.archived_transcripts,
                 "duration_ms": report.duration_ms,
+                "endpoint_calls": report.endpoint_calls,
             },
         )
         return report
+
+    def _run_transcript_task(
+        self,
+        transcript: Node,
+        *,
+        dry_run: bool,
+        downgrade_supersede: bool,
+    ) -> DistillerReport:
+        started = datetime.now(UTC)
+        report = DistillerReport(started_at=started.isoformat().replace("+00:00", "Z"), completed_at="")
+        try:
+            detail = self._distill_transcript(
+                transcript,
+                report,
+                dry_run=dry_run,
+                downgrade_supersede=downgrade_supersede,
+            )
+            report.details.append(detail)
+        except Exception as exc:  # noqa: BLE001 — one bad transcript must not stop the sweep
+            report.llm_failures += 1
+            report.transcripts_skipped += 1
+            self._logger.warning(
+                "Distill failed for transcript; backing off",
+                extra={
+                    "node_id": transcript.id,
+                    "error": str(exc),
+                    "endpoint_calls": self._get_sampling_client().call_metrics(transcript_id=transcript.id)
+                    if callable(getattr(self._get_sampling_client(), "call_metrics", None))
+                    else {},
+                },
+            )
+            if not dry_run:
+                try:
+                    self._mark_backoff(transcript)
+                except Exception as backoff_exc:  # noqa: BLE001 — retry eligibility is retained without the touch
+                    self._logger.warning(
+                        "Failed to update transcript backoff timestamp",
+                        extra={"node_id": transcript.id, "error": str(backoff_exc)},
+                    )
+        finally:
+            client = self._get_sampling_client()
+            metrics = getattr(client, "call_metrics", None)
+            if callable(metrics):
+                report.endpoint_calls = metrics(transcript_id=transcript.id, reset=True)
+                for endpoint, endpoint_stats in report.endpoint_calls.items():
+                    stages = endpoint_stats.get("stages", {})
+                    endpoint_stats.update(
+                        transcripts=1,
+                        segments=stages.get("extract", {}).get("successes", 0),
+                        items=stages.get("write_decider", {}).get("successes", 0),
+                        actions=report.actions_by_endpoint.get(endpoint, {}),
+                    )
+            for detail in report.details:
+                detail["endpoint_calls"] = report.endpoint_calls
+            self._close_thread_store()
+        completed_at = datetime.now(UTC)
+        report.completed_at = completed_at.isoformat().replace("+00:00", "Z")
+        report.duration_ms = int((completed_at - started).total_seconds() * 1000)
+        return report
+
+    @staticmethod
+    def _merge_transcript_report(target: DistillerReport, source: DistillerReport) -> None:
+        for name in (
+            "transcripts_distilled", "transcripts_skipped", "items_extracted", "items_invalid",
+            "items_sources_dropped", "reduced_items", "reduce_failures", "reduce_groups_llm",
+            "guard_fallback_creates", "title_repairs", "title_repair_failures", "decider_creates",
+            "decider_complements", "decider_supersedes", "decider_downgrades", "merged_updates",
+            "llm_failures", "segments_total",
+        ):
+            setattr(target, name, getattr(target, name) + getattr(source, name))
+        target.downgraded.extend(source.downgraded)
+        target.details.extend(source.details)
+        for endpoint, source_stats in source.endpoint_calls.items():
+            target_stats = target.endpoint_calls.setdefault(endpoint, {
+                "base_url": source_stats["base_url"],
+                "model": source_stats["model"],
+                "calls": 0,
+                "successes": 0,
+                "failures": 0,
+                "latency_total_ms": 0.0,
+                "latency_max_ms": 0.0,
+                "transcripts": 0,
+                "segments": 0,
+                "items": 0,
+                "stages": {},
+                "actions": {},
+            })
+            for name in ("calls", "successes", "failures", "latency_total_ms", "transcripts", "segments", "items"):
+                target_stats[name] += source_stats.get(name, 0)
+            target_stats["latency_max_ms"] = max(
+                target_stats["latency_max_ms"], source_stats.get("latency_max_ms", 0.0)
+            )
+            for stage, source_stage in source_stats.get("stages", {}).items():
+                target_stage = target_stats["stages"].setdefault(
+                    stage, {"calls": 0, "successes": 0, "failures": 0, "latency_total_ms": 0.0}
+                )
+                for name in ("calls", "successes", "failures", "latency_total_ms"):
+                    target_stage[name] += source_stage.get(name, 0)
+            for action, count in source_stats.get("actions", {}).items():
+                target_stats["actions"][action] = target_stats["actions"].get(action, 0) + count
 
     # ------------------------------------------------------------------
     # Per-transcript distillation
@@ -417,6 +607,7 @@ class Distiller:
             return {"transcript_id": transcript.id, "items": [], "skipped_new_turns": 0}
 
         segments = self._build_segments(parsed, watermark=watermark, max_chars=self.settings.segment_chars)
+        report.segments_total += len(segments)
         own_titles = self._titles_for_ids(transcript.metadata.distilled_node_ids)
         # known_titles computed ONCE: identical for every segment, and the
         # store's SQLite connection must not be touched from pool threads.
@@ -427,18 +618,11 @@ class Distiller:
         candidates: list[OkfItem] = []
         extraction_failures = 0
         first_failed_turn: int | None = None
-        # P2c concurrency (owner request 2026-10-12): extraction calls are the
-        # LLM-bound part; run them concurrently. Results are collected into a
-        # segment-indexed list so watermark logic uses TURN ORDER (first failed
-        # segment in turn order, not completion order — 706a88a semantics).
-        # Everything after extraction (reduce → verify → title repair → write
-        # path → SQLite) stays serialized in the calling thread. The shared
-        # httpx.Client in LocalLLMDecider is thread-safe (connection-pooled),
-        # and no sampling-client contextvar is involved here (the distiller's
-        # client is passed explicitly).
+        # Extraction shares one executor across all transcript workers. Batch
+        # per transcript so a very long transcript cannot monopolize it.
         extraction_results: list[tuple[int, str, list[OkfItem] | Exception]] = []
 
-        def _extract(index: int, segment_text: str, start_turn: str) -> None:
+        def _extract(segment_text: str, start_turn: str) -> list[OkfItem] | Exception:
             prompt = render_distiller_prompt(
                 transcript=segment_text,
                 known_titles=known_titles,
@@ -446,25 +630,26 @@ class Distiller:
                 start_turn=start_turn,
             )
             try:
-                payload = self._sample_json(prompt)
-                extraction_results.append((index, start_turn, parse_okf_items(payload)))
+                with self._sampling_call_context(transcript, "extract"):
+                    payload = self._sample_json(prompt)
+                return parse_okf_items(payload)
             except Exception as exc:  # noqa: BLE001 — one bad segment must not lose the others
-                extraction_results.append((index, start_turn, exc))
+                return exc
 
-        concurrency = max(1, min(self.settings.max_concurrency, len(segments)))
-        if concurrency <= 1:
-            for index, (segment_text, start_turn) in enumerate(segments):
-                _extract(index, segment_text, start_turn)
-        else:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futures = [
-                    pool.submit(_extract, index, segment_text, start_turn)
-                    for index, (segment_text, start_turn) in enumerate(segments)
-                ]
-                for future in futures:
-                    future.result()
+        executor = self._get_llm_executor()
+        concurrency = max(1, min(self._llm_calls_per_transcript(), len(segments)))
+        for offset in range(0, len(segments), concurrency):
+            batch = segments[offset : offset + concurrency]
+            futures = [
+                (executor.submit(_extract, segment_text, start_turn), offset + index, start_turn)
+                for index, (segment_text, start_turn) in enumerate(batch)
+            ]
+            for future, index, start_turn in futures:
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    result = exc
+                extraction_results.append((index, start_turn, result))
 
         for _index, start_turn, result in sorted(extraction_results, key=lambda item: item[0]):
             if isinstance(result, Exception):
@@ -481,7 +666,8 @@ class Distiller:
         if extraction_failures and not candidates:
             raise RuntimeError(f"All {extraction_failures} segment extraction(s) failed")
 
-        candidates = self._reduce_candidates(transcript, candidates, own_titles, report, dry_run=dry_run)
+        with self._sampling_call_context(transcript, "reduce"):
+            candidates = self._reduce_candidates(transcript, candidates, own_titles, report, dry_run=dry_run)
 
         # Deterministic evidence verification (P2+, no LLM): quotes must
         # appear in the named turn's ELIGIBLE text only (docs/okf.md §9) —
@@ -495,46 +681,61 @@ class Distiller:
             item.evidence = [*verified, *unverified]
             item.verified = bool(item.evidence) and not unverified
 
+
+        service = self._get_service()
+        preparations: list[dict[str, Any] | None] = [None] * len(candidates)
+        concurrency = max(1, min(self._llm_calls_per_transcript(), len(candidates)))
+        executor = self._get_llm_executor()
+        for offset in range(0, len(candidates), concurrency):
+            batch = candidates[offset : offset + concurrency]
+            futures = [
+                (executor.submit(self._prepare_write_item, service, transcript, item, dry_run=dry_run), offset + index)
+                for index, item in enumerate(batch)
+            ]
+            preparation_error: Exception | None = None
+            for future, index in futures:
+                try:
+                    preparations[index] = future.result()
+                except Exception as exc:  # leave the transcript retryable; do not partially commit this batch
+                    preparation_error = preparation_error or exc
+            if preparation_error is not None:
+                raise preparation_error
+
         produced_ids: list[str] = []
         action_counts: dict[str, int] = {}
         detail: dict[str, Any] = {"transcript_id": transcript.id, "items": [], "segments": len(segments)}
-
-        service = self._get_service()
-        token = service.push_sampling_client(self._get_sampling_client())
-        try:
-            for item in candidates:
-                # Title rule (docs/okf.md §3): English titles so IDs stay
-                # meaningful. One repair call for CJK/degenerate titles; never
-                # drop the item — fallback ID + warning if repair fails.
-                if self._title_needs_repair(item.title):
-                    repaired = self._repair_title(item)
-                    if repaired:
-                        report.title_repairs += 1
-                        item.title = repaired
-                    else:
-                        report.title_repair_failures += 1
-                # The transcript id is always a server-verified source: merge it
-                # into frontmatter even when the model omitted it from the body.
-                item.sources = list(dict.fromkeys([*item.sources, transcript.id]))
-                # Hygiene (docs/okf.md §2): drop pseudo-sources the LLM invented.
-                resolve = self._get_store().get_node
-                kept, dropped = normalize_sources(item.sources, resolve_node=lambda nid: resolve(nid) is not None)
-                if dropped:
-                    report.items_sources_dropped += len(dropped)
-                    self._logger.info(
-                        "Dropped non-conforming sources",
-                        extra={"node_id": transcript.id, "item": item.title, "dropped": dropped},
-                    )
-                item.sources = kept
-                action_note = self._write_item(service, transcript, item, report, dry_run=dry_run, downgrade_supersede=downgrade_supersede)
-                produced_ids.extend(action_note.get("node_ids", []))
-                detail["items"].append(
-                    {"title": item.title, "okf_type": item.okf_type, "verified": item.verified, **action_note}
+        for item, preparation in zip(candidates, preparations):
+            assert preparation is not None
+            report.title_repairs += int(preparation["title_repaired"])
+            report.title_repair_failures += int(preparation["title_repair_failed"])
+            dropped = preparation["dropped_sources"]
+            if dropped:
+                report.items_sources_dropped += len(dropped)
+                self._logger.info(
+                    "Dropped non-conforming sources",
+                    extra={"node_id": transcript.id, "item": item.title, "dropped": dropped},
                 )
-                action_counts[action_note.get("action", "")] = action_counts.get(action_note.get("action", ""), 0) + 1
-        finally:
-            service.reset_sampling_client(token)
-
+            prepared = preparation["prepared"]
+            if prepared is not None:
+                item.title = prepared["title"]
+                item.sources = list(prepared["sources"] or [])
+            action_note = self._write_item(
+                service,
+                transcript,
+                item,
+                report,
+                prepared=prepared,
+                decision_endpoint=preparation["decision_endpoint"],
+                guard_fallback=preparation["guard_fallback"],
+                dry_run=dry_run,
+                downgrade_supersede=downgrade_supersede,
+            )
+            produced_ids.extend(action_note.get("node_ids", []))
+            detail["items"].append(
+                {"title": item.title, "okf_type": item.okf_type, "verified": item.verified, **action_note}
+            )
+            action = action_note.get("action", "")
+            action_counts[action] = action_counts.get(action, 0) + 1
         report.items_extracted += len(candidates)
         report.transcripts_distilled += 1
 
@@ -577,6 +778,8 @@ class Distiller:
                 # have appended turns while we distilled); late turns surface
                 # on the next sweep via the content-hash gate.
                 self._stamp_transcript(transcript, produced_ids, distilled_turn=parsed.last_turn_number)
+            client_metrics = getattr(self._get_sampling_client(), "call_metrics", None)
+            endpoint_calls = client_metrics(transcript_id=transcript.id) if callable(client_metrics) else {}
             self._logger.info(
                 "Distilled transcript",
                 extra={
@@ -592,6 +795,7 @@ class Distiller:
                     "knowledge_ids": produced_ids,
                     "distilled_turn": parsed.last_turn_number,
                     "segment_failures": extraction_failures,
+                    "endpoint_calls": endpoint_calls,
                 },
             )
         return detail
@@ -610,6 +814,12 @@ class Distiller:
     # Prompt-size guard: only the 200 most recently accessed persistent
     # titles go into the "already known" block (design A5).
     MAX_KNOWN_TITLES = 200
+    # Limit one reranker request to vector top-8, the 20 newest transcript-owned
+    # nodes, and the top 20 title-Jaccard matches (48 documents maximum).
+    NEAR_DUP_VECTOR_TOP_K = 8
+    NEAR_DUP_OWN_TOP_K = 20
+    NEAR_DUP_TITLE_JACCARD_TOP_K = 20
+    NEAR_DUP_RERANK_MAX_CANDIDATES = 48
 
     def _transcript_project(self, transcript: Node) -> str | None:
         """Derive the project for distilled nodes from the transcript.
@@ -859,18 +1069,15 @@ class Distiller:
     def _find_near_duplicate(
         self, item: OkfItem, transcript: Node, store: SQLiteNodeStore
     ) -> Node | None:
-        """Pre-write near-duplicate gate (owner rework 2026-10-13, gap 2).
+        """Find a near-duplicate using full-corpus Jaccard and bounded reranking.
 
-        Candidate finder: vector_search over the stored bge-m3 embeddings
-        (query = item title+takeaway, top 8) — the production signal, so a
-        node without a stored vector is not findable by this leg. Fallback
-        and secondary signal: title-token Jaccard over the transcript's own
-        distilled_node_ids plus ALL active persistent nodes.
+        The reranker sees vector top-8, up to 20 transcript-owned nodes, and
+        the 20 highest title-Jaccard matches (at most 48 documents total).
+        Jaccard still scans all active persistent nodes so unembedded knowledge
+        remains eligible for the existing fallback thresholds.
 
-        Merge decision on the best candidate (calibrated 2026-10-13 on the
-        judge's dup pairs + related-same-surface + clear non-dups; bge-reranker
-        -v2-m3 scores: dups/paraphrases 5.4-7.5, related-different-lesson
-        3.2 with jaccard 0.17, unrelated <1.3):
+        Merge thresholds are calibrated on the judge's dup pairs plus
+        related-same-surface and clear non-dups:
           rerank >= 3.0 AND jaccard >= 0.25, OR
           rerank >= 1.5 AND jaccard >= 0.5, OR
           (reranker unavailable) jaccard >= 0.5 alone.
@@ -878,7 +1085,18 @@ class Distiller:
 
         query_text = f"{item.title}\n{item.takeaway}".strip()
         candidates_nodes: list[Node] = []
-        seen: set[str] = set()
+        candidate_index_by_id: dict[str, int] = {}
+        vector_indices: list[int] = []
+        own_indices: list[int] = []
+
+        def add_candidate(node: Node) -> int:
+            existing = candidate_index_by_id.get(node.id)
+            if existing is not None:
+                return existing
+            index = len(candidates_nodes)
+            candidates_nodes.append(node)
+            candidate_index_by_id[node.id] = index
+            return index
 
         # Embedding leg: top-k over stored vectors (knowledge only; vector
         # search covers active+archived rows, filter to ACTIVE persistent).
@@ -892,51 +1110,77 @@ class Distiller:
         except (OSError, RuntimeError, ValueError):
             query_vector = None
         if query_vector:
-            for node_id, _distance in store.vector_search(query_vector, limit=8):
+            for node_id, _distance in store.vector_search(query_vector, limit=self.NEAR_DUP_VECTOR_TOP_K):
                 node = store.get_node(node_id)
                 if (
                     node is not None
                     and node.metadata.status is NodeStatus.ACTIVE
                     and node.metadata.type is NodeType.PERSISTENT
-                    and node.id not in seen
                 ):
-                    candidates_nodes.append(node)
-                    seen.add(node.id)
+                    index = add_candidate(node)
+                    if index not in vector_indices:
+                        vector_indices.append(index)
 
-        # Jaccard leg: own prior distilled nodes first, then all persistent.
-        for nid in transcript.metadata.distilled_node_ids:
-            n = store.get_node(nid)
-            if n is not None and n.id not in seen:
-                candidates_nodes.append(n)
-                seen.add(n.id)
-        for n in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}):
-            if n.id not in seen:
-                candidates_nodes.append(n)
-                seen.add(n.id)
+        # Own distilled nodes remain priority candidates, followed by the full
+        # active persistent corpus for the inexpensive title-Jaccard pass.
+        for node_id in transcript.metadata.distilled_node_ids[-self.NEAR_DUP_OWN_TOP_K:]: 
+            node = store.get_node(node_id)
+            if node is not None:
+                index = add_candidate(node)
+                if index not in own_indices:
+                    own_indices.append(index)
+        for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}):
+            add_candidate(node)
         if not candidates_nodes:
             return None
 
-        jaccards = [self._title_jaccard(item.title, cand.title) for cand in candidates_nodes]
-        best_jaccard = max(jaccards)
-        if best_jaccard <= 0.0:
+        jaccards = [self._title_jaccard(item.title, candidate.title) for candidate in candidates_nodes]
+        if max(jaccards) <= 0.0:
             return None
 
-        # Reranker signal over the candidate shortlist.
+        from heapq import nlargest
+
+        shortlist_indices: list[int] = []
+        shortlist_seen: set[int] = set()
+
+        def add_to_shortlist(index: int) -> None:
+            if (
+                index not in shortlist_seen
+                and len(shortlist_indices) < self.NEAR_DUP_RERANK_MAX_CANDIDATES
+            ):
+                shortlist_seen.add(index)
+                shortlist_indices.append(index)
+
+        for index in vector_indices[: self.NEAR_DUP_VECTOR_TOP_K]:
+            add_to_shortlist(index)
+        for index in own_indices[: self.NEAR_DUP_OWN_TOP_K]:
+            add_to_shortlist(index)
+        for index in nlargest(
+            self.NEAR_DUP_TITLE_JACCARD_TOP_K,
+            range(len(jaccards)),
+            key=jaccards.__getitem__,
+        ):
+            add_to_shortlist(index)
+
         rerank_scores: list[float | None] = [None] * len(candidates_nodes)
         try:
             from synapse.embedding import create_reranker_engine
             from synapse.utils.documents import render_node_document
 
             reranker = create_reranker_engine(self.config.reranker, providers=self.config.providers)
-            documents = [render_node_document(cand) for cand in candidates_nodes]
-            for index, score in reranker.rerank(query_text, documents):
-                rerank_scores[index] = float(score)
+            documents = [render_node_document(candidates_nodes[index]) for index in shortlist_indices]
+            for shortlist_index, score in reranker.rerank(query_text, documents):
+                if 0 <= shortlist_index < len(shortlist_indices):
+                    rerank_scores[shortlist_indices[shortlist_index]] = float(score)
         except (OSError, RuntimeError, ValueError):
             pass
 
         best_index = max(
             range(len(candidates_nodes)),
-            key=lambda i: (rerank_scores[i] if rerank_scores[i] is not None else -1e9, jaccards[i]),
+            key=lambda index: (
+                rerank_scores[index] if rerank_scores[index] is not None else -1e9,
+                jaccards[index],
+            ),
         )
         jaccard = jaccards[best_index]
         score = rerank_scores[best_index]
@@ -1022,6 +1266,78 @@ class Distiller:
         lines.append("")
         return "\n".join(lines)
 
+    @staticmethod
+    def _is_transcript_target_guard_error(exc: SynapseServiceError) -> bool:
+        return exc.code == "INVALID_SAMPLING_RESPONSE" and (
+            "never session transcripts" in exc.message
+            or "not present in the candidate set" in exc.message
+        )
+
+    def _prepare_write_item(
+        self,
+        service: SynapseServerService,
+        transcript: Node,
+        item: OkfItem,
+        *,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        token = service.push_sampling_client(self._get_sampling_client())
+        title_repaired = False
+        title_repair_failed = False
+        prepared: dict[str, Any] | None = None
+        decision_endpoint: str | None = None
+        guard_fallback = False
+        try:
+            if self._title_needs_repair(item.title):
+                with self._sampling_call_context(transcript, "title_repair"):
+                    repaired = self._repair_title(item)
+                if repaired:
+                    title_repaired = True
+                    item.title = repaired
+                else:
+                    title_repair_failed = True
+            item.sources = list(dict.fromkeys([*item.sources, transcript.id]))
+            store = self._get_store()
+            kept, dropped = normalize_sources(
+                item.sources,
+                resolve_node=lambda node_id: store.get_node(node_id) is not None,
+            )
+            item.sources = kept
+            if not dry_run:
+                try:
+                    with self._sampling_call_context(transcript, "write_decider") as call_context:
+                        prepared = service.prepare_distilled_write(
+                            title=item.title,
+                            content=item.render(),
+                            node_type=NodeType.PERSISTENT,
+                            sources=list(item.sources),
+                            okf_type=item.okf_type,
+                        )
+                except SynapseServiceError as exc:
+                    if not self._is_transcript_target_guard_error(exc):
+                        raise
+                    guard_fallback = True
+                if isinstance(call_context, dict):
+                    decision_endpoint = next(
+                        (
+                            endpoint
+                            for endpoint, stats in call_context["endpoints"].items()
+                            if stats.get("successes", 0)
+                        ),
+                        None,
+                    )
+            return {
+                "prepared": prepared,
+                "decision_endpoint": decision_endpoint,
+                "title_repaired": title_repaired,
+                "title_repair_failed": title_repair_failed,
+                "guard_fallback": guard_fallback,
+                "dropped_sources": dropped,
+            }
+        finally:
+            service.reset_sampling_client(token)
+            self._close_thread_store()
+
     def _write_item(
         self,
         service: SynapseServerService,
@@ -1029,60 +1345,56 @@ class Distiller:
         item: OkfItem,
         report: DistillerReport,
         *,
+        prepared: dict[str, Any] | None = None,
+        decision_endpoint: str | None = None,
+        guard_fallback: bool = False,
         dry_run: bool,
         downgrade_supersede: bool,
     ) -> dict[str, Any]:
         if dry_run:
             return {"action": "planned", "node_ids": []}
-        store = self._get_store()
-        near_dup = self._find_near_duplicate(item, transcript, store)
-        content = item.render()
-        if near_dup is not None and not dry_run:
-            merged = self._merge_item_into_node(item, near_dup)
-            if merged is not None:
-                content = merged
-            # Merge LLM failure falls through to the plain item body; the
-            # server's in-place update still preserves the existing node.
-        # item.sources already includes transcript.id (merged in _distill_transcript).
-        sources = list(item.sources)
-        # Degenerate-title fallback (docs/okf.md §7): if the slug is still
-        # meaningless after repair, use mem_<date>_<okf_type|node>_<8hex>.
-        forced_node_id: str | None = None
-        if not slugify_english_title(item.title):
-            date_part = datetime.now(UTC).strftime("%Y%m%d")
-            digest = hashlib.sha256(f"{item.title}{item.takeaway}".encode("utf-8")).hexdigest()[:8]
-            type_part = item.okf_type if item.okf_type in ("decision", "fact", "procedure", "pitfall") else "node"
-            forced_node_id = f"mem_{date_part}_{type_part}_{digest}"
-        try:
-            result = service.write_memory(
-                title=item.title,
-                content=content,
-                node_type=NodeType.PERSISTENT,
-                sources=sources,
-                okf_type=item.okf_type,
-                okf_version=1,
-                project=self._transcript_project(transcript),
-                downgrade_supersede=downgrade_supersede,
-                node_id=forced_node_id,
-                route="distiller",
-                verified=item.verified,
-                # Pre-write near-duplicate gate (owner rework 2026-10-13): a
-                # near-dup of an existing node is MERGED INTO that node (same
-                # id, in-place body update) instead of writing a new sibling.
-                merge_update_target=(near_dup.id if near_dup is not None else None),
-            )
-        except SynapseServiceError as exc:
-            guard_fired = (
-                exc.code == "INVALID_SAMPLING_RESPONSE"
-                and (
-                    "never session transcripts" in exc.message
-                    or "not present in the candidate set" in exc.message
+        if prepared is None and not guard_fallback:
+            try:
+                with self._sampling_call_context(transcript, "write_decider") as call_context:
+                    prepared = service.prepare_distilled_write(
+                        title=item.title,
+                        content=item.render(),
+                        node_type=NodeType.PERSISTENT,
+                        sources=list(item.sources),
+                        okf_type=item.okf_type,
+                    )
+            except SynapseServiceError as exc:
+                if not self._is_transcript_target_guard_error(exc):
+                    raise
+                guard_fallback = True
+            if isinstance(call_context, dict):
+                decision_endpoint = next(
+                    (
+                        endpoint
+                        for endpoint, stats in call_context["endpoints"].items()
+                        if stats.get("successes", 0)
+                    ),
+                    None,
                 )
-            )
-            if guard_fired:
-                # Backstop (should not happen: transcripts are excluded from
-                # write-path candidates). Fall back to a deterministic create
-                # so the item is NOT lost; log and count it.
+        with self._write_commit_lock:
+            store = self._get_store()
+            near_dup = self._find_near_duplicate(item, transcript, store)
+            if guard_fallback:
+                if near_dup is not None:
+                    with self._sampling_call_context(transcript, "near_duplicate_merge"):
+                        merged = self._merge_item_into_node(item, near_dup)
+                    updated = service._merge_update_node(
+                        target_id=near_dup.id,
+                        content=merged or item.render(),
+                        title=item.title,
+                        sources=list(item.sources),
+                        verified=item.verified,
+                        route="distiller",
+                    )
+                    updated_node = updated.get("node")
+                    node_id = updated_node.get("id") if isinstance(updated_node, dict) else None
+                    self._count_action(report, "updated")
+                    return {"action": "updated", "node_ids": [node_id] if node_id else []}
                 report.guard_fallback_creates += 1
                 self._logger.warning(
                     "Guard fired on distilled item; falling back to create",
@@ -1100,29 +1412,79 @@ class Distiller:
                 node_payload = fallback.get("node") if isinstance(fallback, dict) else None
                 node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
                 return {"action": "guard_fallback_create", "node_ids": [node_id] if node_id else []}
-            raise
-        decision = result.get("decision", {})
-        action = str(decision.get("action", ""))
-        node_payload = result.get("execution", {}).get("result", {}).get("node", {})
-        node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
-        if not action and result.get("action") == "updated":
-            # Near-duplicate merge-update payload (no decider decision shape).
-            action = "updated"
-            merged_node = result.get("node")
-            node_id = merged_node.get("id") if isinstance(merged_node, dict) else None
-        self._count_action(report, action)
-        downgrade = result.get("downgrade")
-        if isinstance(downgrade, dict):
-            report.decider_downgrades += 1
-            report.downgraded.append(
-                {
-                    "transcript_id": transcript.id,
-                    "item_title": item.title,
-                    "reason": downgrade.get("reason", "supersede downgraded to complement (backfill safety)"),
-                    "target_node_ids": downgrade.get("target_node_ids", []),
-                }
-            )
-        return {"action": action, "node_ids": [node_id] if node_id else []}
+            if prepared is None:
+                raise RuntimeError("distilled write has no prepared decision")
+            content = prepared["content"]
+            if near_dup is not None:
+                with self._sampling_call_context(transcript, "near_duplicate_merge"):
+                    merged = self._merge_item_into_node(item, near_dup)
+                if merged is not None:
+                    content = merged
+
+            forced_node_id: str | None = None
+            if not slugify_english_title(item.title):
+                date_part = datetime.now(UTC).strftime("%Y%m%d")
+                digest = hashlib.sha256(f"{item.title}{item.takeaway}".encode("utf-8")).hexdigest()[:8]
+                type_part = item.okf_type if item.okf_type in ("decision", "fact", "procedure", "pitfall") else "node"
+                forced_node_id = f"mem_{date_part}_{type_part}_{digest}"
+            prepared_write = dict(prepared)
+            prepared_write["content"] = content
+            try:
+                result = service.commit_distilled_write(
+                    prepared_write,
+                    okf_version=1,
+                    project=self._transcript_project(transcript),
+                    node_id=forced_node_id,
+                    downgrade_supersede=downgrade_supersede,
+                    route="distiller",
+                    verified=item.verified,
+                    merge_update_target=near_dup.id if near_dup is not None else None,
+                )
+            except SynapseServiceError as exc:
+                if not self._is_transcript_target_guard_error(exc):
+                    raise
+                report.guard_fallback_creates += 1
+                self._logger.warning(
+                    "Guard fired on distilled item; falling back to create",
+                    extra={"node_id": transcript.id, "item": item.title},
+                )
+                fallback = service.integrate_knowledge(
+                    title=item.title,
+                    content=item.render(),
+                    node_type=NodeType.PERSISTENT,
+                    sources=list(item.sources),
+                    okf_type=item.okf_type,
+                    okf_version=1,
+                    project=self._transcript_project(transcript),
+                )
+                node_payload = fallback.get("node") if isinstance(fallback, dict) else None
+                node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
+                return {"action": "guard_fallback_create", "node_ids": [node_id] if node_id else []}
+
+            decision = result.get("decision", {})
+            action = str(decision.get("action", ""))
+            node_payload = result.get("execution", {}).get("result", {}).get("node", {})
+            node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
+            if not action and result.get("action") in {"updated", "unchanged"}:
+                action = str(result["action"])
+                merged_node = result.get("node")
+                node_id = merged_node.get("id") if isinstance(merged_node, dict) else None
+            self._count_action(report, action)
+            if decision_endpoint is not None:
+                endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
+                endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
+            downgrade = result.get("downgrade")
+            if isinstance(downgrade, dict):
+                report.decider_downgrades += 1
+                report.downgraded.append(
+                    {
+                        "transcript_id": transcript.id,
+                        "item_title": item.title,
+                        "reason": downgrade.get("reason", "supersede downgraded to complement (backfill safety)"),
+                        "target_node_ids": downgrade.get("target_node_ids", []),
+                    }
+                )
+            return {"action": action, "node_ids": [node_id] if node_id else []}
 
     @staticmethod
     def _count_action(report: DistillerReport, action: str) -> None:

@@ -101,11 +101,9 @@ class StreamableRuntime:
             lifespan_context = dreamer_lifespan
 
         if self.config.distiller.enabled:
-            # The distiller's LLM calls run long (measured 115-326 s/segment on
-            # glm-5.3-flash): use [distiller].llm_timeout_seconds like the
-            # distiller's own _get_sampling_client override — NOT the raw
-            # [decider] timeout (120 s live), which aborts every segment on
-            # primary + fallback.
+            # The distiller shares this endpoint pool for both extraction and
+            # write decisions. Per-stage call contexts use the long distiller
+            # timeout for extraction and [decider].timeout_seconds for writes.
             distiller_settings = self.config.decider.model_copy(
                 update={"timeout_seconds": self.config.distiller.llm_timeout_seconds}
             )

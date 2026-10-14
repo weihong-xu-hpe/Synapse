@@ -342,9 +342,8 @@ def test_sweep_distills_transcript_and_stamps_state(tmp_path: Path) -> None:
         assert knowledge.metadata.okf_type == "pitfall"
         assert "mem_session_e2e1" in knowledge.metadata.sources
 
-        # Prompt carried the [decider] max_tokens budget (owner rule: no
-        # tight cap; defaults to 600 in test config).
-        assert client.calls and client.calls[0]["max_tokens"] == 600
+        # Prompt carries the owner-approved unlimited reasoning budget.
+        assert client.calls and client.calls[0]["max_tokens"] == 200_000
 
         # Second run with unchanged content is a no-op.
         report2 = distiller.run()
@@ -1059,7 +1058,12 @@ def test_distiller_normalizes_sources_and_counts_dropped(tmp_path: Path) -> None
 
 
 def test_distilled_project_from_keyed_and_legacy_transcripts(tmp_path: Path) -> None:
-    client = FakeDistillSamplingClient([dict(_PITFALL_ITEM)])
+    class ProjectClient(FakeDistillSamplingClient):
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            title = "Legacy authz boundary lesson" if "k k k" in prompt else "Keyed retrieval pipeline lesson"
+            return {"items": [dict(_PITFALL_ITEM, title=title)]}
+
+    client = ProjectClient([])
     distiller, paths = _make_distiller(tmp_path, client)
     try:
         import os
@@ -1513,7 +1517,7 @@ def test_distiller_llm_timeout_uses_distiller_setting_not_decider(tmp_path: Path
     try:
         client = distiller._get_sampling_client()
         assert client.settings.timeout_seconds == 300
-        assert client.settings.model == config.decider.model
+        assert client.settings.endpoints[0].model == config.decider.endpoints[0].model
     finally:
         distiller.close()
 
@@ -2201,29 +2205,35 @@ def test_concurrent_extraction_same_result_as_serial(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.calls = 0
             self.lock = threading.Lock()
-            self.write_calls = 0
             self.write_overlap = False
             self._in_write = False
 
         def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            import re
+
             with self.lock:
                 self.calls += 1
-                n = self.calls
-            time.sleep(0.05 + (0.03 * ((n * 7919) % 5)))  # pseudo-random delay
-            return {"items": [dict(_PITFALL_ITEM, title=f"Concurrent pitfall {n}")]}
+                call_number = self.calls
+            match = re.search(r"This segment starts at turn (T\d+)", prompt)
+            turn = match.group(1) if match else "T1"
+            time.sleep(0.05 + (0.03 * ((call_number * 7919) % 5)))
+            return {"items": [dict(_PITFALL_ITEM, title=f"Concurrent pitfall {turn}")]}
 
+        # Decisions overlap during preparation; Distiller's separate commit lock
+        # still serializes the near-duplicate check and write.
         def decide_memory_write(self, request):
-            # Detect overlapping write-phase calls (would mean the write path
-            # is running concurrently).
-            if self._in_write:
-                self.write_overlap = True
-            self._in_write = True
-            time.sleep(0.01)
-            from synapse.server.sampling import MemoryWriteSamplingDecision
+            with self.lock:
+                if self._in_write:
+                    self.write_overlap = True
+                self._in_write = True
+            try:
+                time.sleep(0.01)
+                from synapse.server.sampling import MemoryWriteSamplingDecision
 
-            decision = MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
-            self._in_write = False
-            return decision
+                return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+            finally:
+                with self.lock:
+                    self._in_write = False
 
     content = (
         "<!-- synapse-transcript v2 -->\n"
@@ -2239,16 +2249,7 @@ def test_concurrent_extraction_same_result_as_serial(tmp_path: Path) -> None:
         client = SlowRandomClient()
         d = Distiller(config, runtime_paths=runtime_paths, sampling_client=client)
         try:
-            try:
-                report = d.run(downgrade_supersede=False)
-                import sys as _sys
-                print("REPORT", concurrency, report.transcripts_distilled,
-                      report.items_extracted, report.llm_failures,
-                      [(dd.get('transcript_id'), len(dd.get('items', []))) for dd in report.details],
-                      file=_sys.stderr)
-            except Exception:
-                import traceback; traceback.print_exc()
-                raise
+            d.run(downgrade_supersede=False)
             from synapse.storage import read_node_file
 
             stamped = read_node_file(runtime_paths.active / "mem_session_conc1.md")
@@ -2256,10 +2257,6 @@ def test_concurrent_extraction_same_result_as_serial(tmp_path: Path) -> None:
                 read_node_file(runtime_paths.active / f"{kid}.md").title
                 for kid in stamped.metadata.distilled_node_ids
             )
-            import sys as _sys
-            print("DBG", concurrency, "turn:", stamped.metadata.distilled_turn,
-                  "hash:", bool(stamped.metadata.distilled_hash),
-                  "ntitles:", len(titles), file=_sys.stderr)
             return stamped.metadata.distilled_turn, titles, client
         finally:
             d.close()
@@ -2283,7 +2280,7 @@ def test_concurrent_extraction_same_result_as_serial(tmp_path: Path) -> None:
     _write_transcript_raw(conc_config, conc_paths, "mem_session_conc1", content, session_key="sess-conc")
     os.utime(conc_paths.active / "mem_session_conc1.md", (old_ts, old_ts))
     wm_conc, titles_conc, client_conc = run_once(4, conc_paths)
-    assert client_conc.write_overlap is False, "write phase must stay serialized"
+    assert client_conc.write_overlap is True, "write decisions should overlap while commits stay serialized"
 
     assert wm_serial == wm_conc == 6
     assert titles_serial == titles_conc
@@ -2355,17 +2352,11 @@ def test_partial_failure_out_of_order_holds_earliest_watermark(tmp_path: Path) -
 
 
 def test_max_concurrency_upper_bound_30(tmp_path: Path) -> None:
-    """Owner hard limit 30 (bench-driven); default stays 1."""
+    """Owner hard limit 30 (bench-driven); extraction default is 30."""
     config = _config(tmp_path)
-    assert config.distiller.max_concurrency == 1
+    assert config.distiller.max_concurrency == 30
     from pydantic import ValidationError
 
-    config = config.model_copy(update={
-        "distiller": config.distiller.model_validate(
-            {**config.distiller.model_dump(), "max_concurrency": 30}
-        )
-    })
-    assert config.distiller.max_concurrency == 30
     import pytest as _pytest
 
     with _pytest.raises(ValidationError):
@@ -2693,3 +2684,209 @@ def test_funnel_fields_in_distilled_log(tmp_path: Path) -> None:
     assert "reduce_groups_llm" in data
     assert "reduce_failure" in data and data["reduce_failure"] is False
     assert "written_by_action" in data and data["written_by_action"].get("create", 0) >= 1
+
+
+def test_failed_transcript_remains_retryable_without_distilled_hash(tmp_path: Path) -> None:
+    distiller, runtime_paths = _make_distiller(tmp_path, FakeDistillSamplingClient(RuntimeError("endpoint failure")))
+    transcript = _write_transcript(
+        runtime_paths,
+        "mem_session_retry1",
+        "## User\nA durable fact to retry.\n\n## Assistant\nRecorded.",
+        session_key="retry-1",
+    )
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(runtime_paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+
+    try:
+        report = distiller.run(downgrade_supersede=False)
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / f"{transcript.id}.md")
+        assert report.transcripts_distilled == 0
+        assert report.transcripts_skipped == 1
+        assert stamped.metadata.distilled_hash is None
+        assert stamped.metadata.distilled_node_ids == []
+
+        os.utime(runtime_paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+        assert [node.id for node in distiller.select_transcripts()] == [transcript.id]
+    finally:
+        distiller.close()
+
+
+def test_concurrent_transcripts_serialize_near_duplicate_gate_and_commit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class ConcurrentWriteClient:
+        name = "fake-concurrent-write"
+
+        def __init__(self) -> None:
+            self.decisions = threading.Barrier(2)
+            self.write_calls = 0
+            self.lock = threading.Lock()
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            if "You merge new knowledge INTO an existing OKF knowledge node" in prompt:
+                return {
+                    "takeaway": "The shared rollout check combines both safe lessons.",
+                    "sections": {
+                        "Symptom": "Health checks can fail during rollout.",
+                        "Cause": "The rollout uses a strict deadline.",
+                        "Fix": "Keep the probe deadline consistent across variants.",
+                    },
+                }
+            variant = "alpha" if "variant alpha" in prompt else "beta"
+            return {
+                "items": [
+                    dict(
+                        _PITFALL_ITEM,
+                        title="Shared rollout health-check deadline",
+                        takeaway=f"Use the shared probe deadline for variant {variant}.",
+                        sections={
+                            "Symptom": f"Variant {variant} health checks time out.",
+                            "Cause": "The probe deadline is too short.",
+                            "Fix": f"Raise the deadline for variant {variant}.",
+                        },
+                    )
+                ]
+            }
+
+        def decide_memory_write(self, request):
+            with self.lock:
+                self.write_calls += 1
+                synchronize = self.write_calls <= 2
+            if synchronize:
+                self.decisions.wait(timeout=10)
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    config = _config(tmp_path)
+    config.distiller.transcript_concurrency = 2
+    config.distiller.max_concurrency = 1
+    runtime_paths = bootstrap_runtime_directories(config)
+    client = ConcurrentWriteClient()
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=client)
+    transcripts = [
+        _write_transcript(
+            runtime_paths,
+            f"mem_session_dupe{suffix}",
+            f"## User\nThis is variant {variant} of the shared rollout.\n\n## Assistant\nNoted.",
+            session_key=f"dupe-{suffix}",
+        )
+        for suffix, variant in (("a1", "alpha"), ("b2", "beta"), ("c3", "gamma"))
+    ]
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    for transcript in transcripts:
+        os.utime(runtime_paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+
+    observed_existing: list[str] = []
+
+    def latest_title_match(item: OkfItem, transcript: Node, store: SQLiteNodeStore) -> Node | None:
+        del transcript
+        matches = [
+            node
+            for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+            if node.title == item.title
+        ]
+        if matches:
+            observed_existing.append(matches[0].id)
+            return matches[0]
+        return None
+
+    monkeypatch.setattr(distiller, "_find_near_duplicate", latest_title_match)
+    try:
+        report = distiller.run(downgrade_supersede=False)
+        persistent = distiller._get_store().list_nodes(
+            {"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}
+        )
+        assert client.write_calls == 3
+        assert report.transcripts_scanned == 3
+        assert report.transcripts_distilled == 3
+        assert report.llm_failures == 0
+        assert observed_existing
+        assert len([node for node in persistent if node.title == "Shared rollout health-check deadline"]) == 1
+        from synapse.storage import read_node_file
+
+        for transcript in transcripts:
+            stamped = read_node_file(runtime_paths.active / f"{transcript.id}.md")
+            assert stamped.metadata.distilled_hash == content_sha256(stamped.content)
+            assert len(stamped.metadata.distilled_node_ids) == 1
+    finally:
+        distiller.close()
+
+
+def test_near_duplicate_reranker_uses_bounded_shortlist_for_large_corpus(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _config(tmp_path)
+    distiller = Distiller(config, runtime_paths=_runtime(tmp_path), sampling_client=FakeDistillSamplingClient([]))
+    corpus = [
+        Node(
+            metadata=NodeMetadata(
+                id=f"mem_20261015_corpus_node_{index:04d}",
+                title=(
+                    "Unrelated vector candidate"
+                    if index == 100
+                    else "Shared project service implementation index"
+                ),
+                type=NodeType.PERSISTENT,
+            ),
+            content="",
+            file_path=Path(f"active/mem_20261015_corpus_node_{index:04d}.md"),
+        )
+        for index in range(2620)
+    ]
+
+    class FakeStore:
+        def vector_search(self, _vector, *, limit: int):
+            assert limit == distiller.NEAR_DUP_VECTOR_TOP_K
+            return [("mem_20261015_corpus_node_0100", 0.1)]
+
+        def get_node(self, node_id: str):
+            return corpus[100] if node_id == corpus[100].id else None
+        def list_nodes(self, _filters):
+            return corpus
+
+    class FakeEmbeddingEngine:
+        backend_name = "test"
+
+        def is_available(self) -> bool:
+            return True
+
+        def embed(self, _text: str) -> list[float]:
+            return [0.0]
+
+    class FakeReranker:
+        def __init__(self) -> None:
+            self.document_count = 0
+
+        def rerank(self, _query: str, documents: list[str]):
+            self.document_count = len(documents)
+            return [(1, 3.5)]
+
+    import synapse.embedding as embedding_module
+
+    reranker = FakeReranker()
+    monkeypatch.setattr(embedding_module, "create_embedding_engine", lambda *_args, **_kwargs: FakeEmbeddingEngine())
+    monkeypatch.setattr(embedding_module, "create_reranker_engine", lambda *_args, **_kwargs: reranker)
+    item = parse_okf_items(
+        {"items": [dict(_PITFALL_ITEM, title="Shared project service implementation index")]}
+    )[0]
+    transcript = Node(
+        metadata=NodeMetadata(
+            id="mem_session_shortlist",
+            title="Session summary — shortlist",
+            type=NodeType.TRANSIENT,
+        ),
+        content="## User\nNear-duplicate shortlist query.",
+        file_path=Path("active/mem_session_shortlist.md"),
+    )
+
+    try:
+        found = distiller._find_near_duplicate(item, transcript, FakeStore())
+        assert len(corpus) == 2620
+        assert reranker.document_count == distiller.NEAR_DUP_TITLE_JACCARD_TOP_K + 1
+        assert reranker.document_count <= distiller.NEAR_DUP_RERANK_MAX_CANDIDATES
+        assert found is corpus[0]
+    finally:
+        distiller.close()

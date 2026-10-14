@@ -315,8 +315,14 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
 - `[distiller].reasoning_effort` (optional; `low`/`medium`/`high`) is passed as
   the OpenAI `reasoning_effort` field on the distiller's OWN LLM calls only
   (never the write-path decider). Unset = field omitted.
-- Segment extraction calls run concurrently (`[distiller].max_concurrency`,
-  default 1, hard limit 30); the reduce → verify → write path stays serialized.
+- Segment extraction calls run concurrently up to `[distiller].max_concurrency` per transcript
+  (default 30); a sweep processes up to `[distiller].transcript_concurrency`
+  transcripts at once (default 4), refilling free slots from the pending idle
+  backlog up to `[distiller].max_transcripts_per_run` (default 500). Write
+  decisions are prepared concurrently, while each near-duplicate check and
+  store commit is serialized and checks the latest committed nodes. The endpoint
+  pool assigns calls least-busy across configured backends and independently
+  caps in-flight calls per endpoint.
 - Progress watermark: `distilled_turn` on the transcript frontmatter records the
   last turn covered; a re-distill after new turns arrive processes only later
   turns (one previous turn as context). `distilled_hash` semantics are unchanged.

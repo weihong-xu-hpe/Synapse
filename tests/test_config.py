@@ -35,11 +35,15 @@ archive_path = "./.synapse/.archive"
     assert config.decay.janitor_days == 30
     assert config.decay.archive_retention_days == 90
     assert config.decider.provider == "local_llm"
-    assert config.decider.base_url == "http://localhost:8000/v1"
-    assert config.decider.model == "deepseek-v4-pro"
+    assert config.decider.endpoints[0].base_url == "http://localhost:8000/v1"
+    assert config.decider.endpoints[0].model == "deepseek-v4-pro"
     assert config.decider.timeout_seconds == 30
-    assert config.decider.max_tokens == 600
-    assert config.decider.temperature == 0.1
+    assert config.decider.max_tokens == 200_000
+    assert config.decider.endpoint_max_concurrency == 30
+    assert config.decider.temperature == 0.0
+    assert config.distiller.max_concurrency == 30
+    assert config.distiller.transcript_concurrency == 4
+    assert config.distiller.max_transcripts_per_run == 500
     assert config.dreamer.enabled is True
     assert config.dreamer.interval_hours == 12
     assert config.dreamer.batch_size == 8
@@ -206,21 +210,26 @@ max_doc_tokens = 9000
         load_config(config_path)
 
 
-def test_load_config_parses_decider_block(tmp_path: Path) -> None:
+def test_load_config_parses_decider_endpoint_pool(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         """
 [decider]
 provider = "mcp_sampling"
-base_url = "http://primary.example/v1"
-model = "primary-model"
-api_key_env = "PRIMARY_KEY"
-fallback_base_url = "http://fallback.example/v1"
-fallback_model = "fallback-model"
-fallback_api_key_env = "FALLBACK_KEY"
 timeout_seconds = 17
 max_tokens = 321
 temperature = 0.25
+endpoint_max_concurrency = 4
+
+[[decider.endpoints]]
+base_url = "http://primary.example/v1"
+model = "primary-model"
+api_key_env = "PRIMARY_KEY"
+
+[[decider.endpoints]]
+base_url = "http://fallback.example/v1"
+model = "fallback-model"
+api_key_env = "FALLBACK_KEY"
 """.strip(),
         encoding="utf-8",
     )
@@ -228,15 +237,19 @@ temperature = 0.25
     config = load_config(config_path)
 
     assert config.decider.provider == "mcp_sampling"
-    assert config.decider.base_url == "http://primary.example/v1"
-    assert config.decider.model == "primary-model"
-    assert config.decider.api_key_env == "PRIMARY_KEY"
-    assert config.decider.fallback_base_url == "http://fallback.example/v1"
-    assert config.decider.fallback_model == "fallback-model"
-    assert config.decider.fallback_api_key_env == "FALLBACK_KEY"
+    assert [endpoint.base_url for endpoint in config.decider.endpoints] == [
+        "http://primary.example/v1", "http://fallback.example/v1"
+    ]
+    assert [endpoint.model for endpoint in config.decider.endpoints] == [
+        "primary-model", "fallback-model"
+    ]
+    assert [endpoint.api_key_env for endpoint in config.decider.endpoints] == [
+        "PRIMARY_KEY", "FALLBACK_KEY"
+    ]
     assert config.decider.timeout_seconds == 17
     assert config.decider.max_tokens == 321
     assert config.decider.temperature == 0.25
+    assert config.decider.endpoint_max_concurrency == 4
 
 
 def test_load_config_parses_dreamer_block(tmp_path: Path) -> None:

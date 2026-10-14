@@ -81,15 +81,15 @@ log_dir = "./.synapse/.logs"
 
 [decider]
 provider = "local_llm"
+timeout_seconds = 30
+max_tokens = 200000
+endpoint_max_concurrency = 30
+temperature = 0.0
+
+[[decider.endpoints]]
 base_url = "http://localhost:8000/v1"
 model = "deepseek-v4-pro"
 api_key_env = ""
-fallback_base_url = ""
-fallback_model = ""
-fallback_api_key_env = "OPENAI_COMPATIBLE_API_KEY"
-timeout_seconds = 30
-max_tokens = 600
-temperature = 0.1
 
 [dreamer]
 enabled = true
@@ -222,20 +222,16 @@ Controls local log rotation and file-size limits.
 
 ### `[decider]`
 
-Controls the local LLM used for sampling decisions (write-path triage, link weaving, conflict resolution). The Decider is an OpenAI-compatible chat-completions client with primary + fallback endpoints.
+Controls the local OpenAI-compatible LLM pool used for sampling decisions (write-path triage, link weaving, conflict resolution) and distillation.
 
 - `provider` — currently `local_llm` (OpenAI-compatible HTTP)
-- `base_url` — primary LLM endpoint base URL (e.g. `http://localhost:8000/v1`); Synapse POSTs to `{base_url}/chat/completions`
-- `model` — primary model name
-- `api_key_env` — env var name holding the bearer token for the primary endpoint; leave blank for no-auth local servers
-- `fallback_base_url` — fallback LLM endpoint base URL; used when the primary endpoint fails
-- `fallback_model` — fallback model name
-- `fallback_api_key_env` — env var name holding the bearer token for the fallback endpoint
-- `timeout_seconds` — HTTP request timeout per endpoint (raise this for reasoning models that emit `reasoning_content` before the final answer). Applies to the write-path decider only; the distiller has its own `[distiller] llm_timeout_seconds`.
-- `max_tokens` — generation token cap sent to the LLM; must be large enough for reasoning models (e.g. glm-5.2-fp8) whose `reasoning_content` consumes tokens before `content` is populated. Measured on glm-5.3-flash write-path decisions: max 542 completion tokens over 10 calls (median 465) — a cap of ~2500 gives ≥4× headroom; a runaway value like 200000 lets a wandering generation run for minutes.
-- `temperature` — sampling temperature. Use `0` for deterministic decisions; the decider's JSON contract degrades nondeterministically at higher values.
+- `endpoints` — one or more `[[decider.endpoints]]` entries, each with `base_url`, `model`, and optional `api_key_env`; requests are assigned least-busy with round-robin tie-breaking, and connection/DNS/timeout/5xx failures fail over to another endpoint
+- `endpoint_max_concurrency` (int, 1–64, default `30`) — maximum simultaneous HTTP requests to each endpoint; the cap is independent per endpoint
+- `timeout_seconds` — HTTP timeout per endpoint for write-path decisions. Distiller extraction/reduce/title-repair use `[distiller].llm_timeout_seconds`; each distiller write decision returns to this timeout.
+- `max_tokens` (default `200000`) — generation token budget; keep it high enough for reasoning plus the structured answer rather than imposing a tight cap
+- `temperature` (default `0.0`) — sampling temperature; zero is preferred for deterministic structured decisions
 
-> **Reasoning-model note:** some models (e.g. `glm-5.2-fp8`) return intermediate reasoning in a `reasoning_content` field and only populate `content` after reasoning completes. If `max_tokens` is too small, `content` stays empty and the Decider raises a parse error. Size `max_tokens` to leave headroom for both reasoning and the final structured answer.
+> Configure the serving model name exactly as advertised by the endpoint. Leave `api_key_env` blank for no-auth local endpoints.
 
 ### `[dreamer]`
 
@@ -276,12 +272,13 @@ Controls the session distiller — the server-side pipeline that converts sessio
 - `idle_minutes` (int, ≥1, default `30`) — a transcript must be untouched this long before it is distilled (avoids distilling mid-pause). The idle and retention clocks both use the transcript **file mtime**: stamping (distillation write-back) and failure backoff rewrite the file and thus reset the clock.
 - `retention_days` (int, ≥1, default `45`) — transcripts distilled at their **current** content revision are archived this many days after their last content update (file mtime); **undistilled or stale-distilled transcripts are never archived**. A transcript that yielded zero knowledge items counts as distilled-current (the LLM judged nothing durable) and is archived after retention like any other.
 - `max_transcript_chars` (int, default `16000`) — prompt cap per transcript (head + tail split)
-- `max_items_per_transcript` (int, 1–20, default `5`) — bound on extracted knowledge items per transcript
-- `downgrade_supersede` (bool, default `true`) — when true, a decider `supersede` targeting an existing non-distilled persistent node is downgraded to `complement` and recorded; the live sweep runs with downgrade OFF, backfill/CLI `--apply` with it ON
-- `enforce_okf` (bool, default `false`) — rejection timeline flag: when true, fatal `okf_*` validation codes reject persistent writes instead of warning (not active in the current transition period)
-- `llm_max_tokens` (int, default `16000`) — per-call completion budget; reasoning models (e.g. glm-5.3-flash) spend thinking tokens from the same budget, so this must exceed reasoning + JSON output
-- `llm_timeout_seconds` (int, ≥1, default `300`) — HTTP timeout for the distiller's own LLM client. Distillation prompts (long zh transcripts against reasoning models) routinely exceed the write-path `[decider] timeout_seconds`; live sweeps timed out at 120 s on 8.6k/16k-char transcripts while backfill succeeded at 300 s. The write-path decider timeout is unchanged.
-- `max_transcripts_per_run` (int, 1–50, default `5`) — sweep batch size
+- `max_concurrency` (int, 1–30, default `30`) — extraction-call concurrency within each transcript
+- `transcript_concurrency` (int, 1–16, default `4`) — transcripts processed concurrently in one sweep
+- `segment_chars` (int, default `16000`) — segment size at turn boundaries
+- `item_warn_threshold` (int, default `40`) — log threshold only; no extracted items are dropped
+- `reasoning_effort` (optional) — omitted by default; only sent when explicitly configured
+- `llm_timeout_seconds` (int, ≥1, default `300`) — HTTP timeout for the distiller's own LLM client; the write-path decider timeout is unchanged
+- `max_transcripts_per_run` (int, 1–5000, default `500`) — bounded per-sweep safety cap; freed transcript slots refill from the pending backlog until this cap or exhaustion
 - `backoff_sweeps` (int, default `3`) — sweeps a failing transcript is skipped before retry
 
 Maintenance commands: `python -m synapse distill status | run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`.

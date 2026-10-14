@@ -59,17 +59,15 @@ log_dir = "./.synapse/.logs"
 
 [decider]
 provider = "local_llm"
-# Override base_url / fallback_base_url with your local LLM endpoint.
-# Example: base_url = "http://<llm-host>:<port>/v1"
+timeout_seconds = 30
+max_tokens = 200000
+endpoint_max_concurrency = 30
+temperature = 0.0
+
+[[decider.endpoints]]
 base_url = "http://localhost:8000/v1"
 model = "deepseek-v4-pro"
 api_key_env = ""
-fallback_base_url = ""
-fallback_model = ""
-fallback_api_key_env = "OPENAI_COMPATIBLE_API_KEY"
-timeout_seconds = 30
-max_tokens = 600
-temperature = 0.1
 
 [dreamer]
 enabled = true

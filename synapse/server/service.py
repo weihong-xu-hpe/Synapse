@@ -531,6 +531,151 @@ class SynapseServerService:
         )
         return payload
 
+    def prepare_distilled_write(
+        self,
+        *,
+        title: str,
+        content: str,
+        node_type: NodeType | str,
+        links: list[str] | None = None,
+        sensitivity: SensitivityLevel | str = SensitivityLevel.INTERNAL,
+        query_hint: str | None = None,
+        similarity_threshold: float = 0.3,
+        okf_type: str | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Normalize and decide one distilled write without committing it.
+
+        The decision is a snapshot only. Distiller serializes its near-duplicate
+        recheck with this exact-duplicate check and final commit.
+        """
+
+        prepared = self._prepare_memory_write_payload(
+            title=title,
+            content=content,
+            node_type=node_type,
+            okf_type=okf_type,
+            sources=sources,
+        )
+        prepared["decision_result"] = self._decide_memory_write_payload(
+            title=prepared["title"],
+            content=prepared["content"],
+            node_type=prepared["node_type"],
+            links=links,
+            sensitivity=sensitivity,
+            query_hint=query_hint,
+            similarity_threshold=similarity_threshold,
+        )
+        prepared.update(
+            links=links,
+            sensitivity=sensitivity,
+            query_hint=query_hint,
+            similarity_threshold=similarity_threshold,
+        )
+        return prepared
+
+    def commit_distilled_write(
+        self,
+        prepared: dict[str, Any],
+        *,
+        okf_version: int = 1,
+        project: str | None = None,
+        node_id: str | None = None,
+        downgrade_supersede: bool = False,
+        route: str = "distiller",
+        verified: bool | None = None,
+        merge_update_target: str | None = None,
+    ) -> dict[str, Any]:
+        """Serialize the final dedupe check and commit for a prepared item."""
+
+        title = prepared["title"]
+        content = prepared["content"]
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        lock_key = f"{title}::{content_hash}"
+        lock = self._lock_for(self._content_write_locks, self._session_key_locks_guard, lock_key)
+        with lock:
+            guard = self._find_identical_active_node(title, content)
+            if guard is not None:
+                payload = {"node": self._serialize_node(guard), "action": "unchanged", "title": title}
+                self._record_route_write_event(
+                    node_id=guard.id,
+                    node_type=guard.metadata.type.value,
+                    action="unchanged",
+                    route=route,
+                )
+                self._log_tool_call(
+                    "write_memory_dedupe_guard",
+                    {"title": title, "content_hash": content_hash[:12]},
+                    payload,
+                )
+                return payload
+
+            return self._write_memory_locked(
+                title=title,
+                content=content,
+                node_type=prepared["node_type"],
+                links=prepared["links"],
+                sensitivity=prepared["sensitivity"],
+                query_hint=prepared["query_hint"],
+                similarity_threshold=prepared["similarity_threshold"],
+                okf_type=prepared["okf_type"],
+                okf_version=okf_version,
+                sources=prepared["sources"],
+                project=project,
+                node_id=node_id,
+                downgrade_supersede=downgrade_supersede,
+                route=route,
+                verified=verified,
+                merge_update_target=merge_update_target,
+                prepared_write=prepared,
+            )
+
+    def _prepare_memory_write_payload(
+        self,
+        *,
+        title: str,
+        content: str,
+        node_type: NodeType | str | None,
+        okf_type: str | None,
+        sources: list[str] | None,
+    ) -> dict[str, Any]:
+        clean_title = title.strip()
+        if not clean_title:
+            raise SynapseServiceError("INVALID_TITLE", _INVALID_TITLE_MESSAGE)
+        node_type_str = node_type.value if isinstance(node_type, NodeType) else (str(node_type) if node_type is not None else None)
+        from synapse.server.write_normalize import WritePathNormalizer
+
+        normalized = WritePathNormalizer(sampling_client=self._normalizer_sampling_client()).normalize(
+            title=clean_title,
+            content=content,
+            node_type=node_type_str,
+            okf_type=okf_type,
+            sources=sources,
+        )
+        clean_title = normalized.title
+        content = normalized.content
+        okf_type = normalized.okf_type
+        sources = normalized.sources if normalized.mode == "llm_normalized" else sources
+        warnings = list(normalized.warnings)
+        if normalized.type_override is not None:
+            node_type = normalized.type_override
+        elif node_type_str is not None:
+            node_type = node_type_str
+        else:
+            node_type = "persistent" if normalized.mode in {"template_inferred", "llm_normalized"} else "transient"
+        normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
+        if normalized_type is NodeType.PERSISTENT:
+            warnings.extend(self._okf_write_warnings(clean_title, content, okf_type=okf_type, sources=sources))
+        return {
+            "title": clean_title,
+            "content": content,
+            "node_type": node_type,
+            "normalized_type": normalized_type,
+            "okf_type": okf_type,
+            "sources": sources,
+            "warnings": warnings,
+        }
+
     def _find_identical_active_node(self, title: str, content: str) -> Node | None:
         """ACTIVE node with the same title and byte-identical content, if any."""
 
@@ -563,65 +708,33 @@ class SynapseServerService:
         route: str | None = None,
         verified: bool | None = None,
         merge_update_target: str | None = None,
+        prepared_write: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        clean_title = title.strip()
-        warnings: list[dict[str, str]] = []
-
-        # Write-path tightening (B1/B2): explicit type wins; omitted type
-        # defaults to persistent when the body carries OKF structure. A
-        # persistent write without okf_type is normalized (deterministic
-        # template inference first, then ONE LLM call with a fidelity guard).
-        node_type_str: str | None
-        if node_type is None:
-            node_type_str = None
-        elif isinstance(node_type, NodeType):
-            node_type_str = node_type.value
-        else:
-            node_type_str = str(node_type)
-
-        from synapse.server.write_normalize import WritePathNormalizer, title_needs_repair
-
-        normalizer = WritePathNormalizer(sampling_client=self._normalizer_sampling_client())
-        normalized = normalizer.normalize(
-            title=clean_title,
+        prepared_write = prepared_write or self._prepare_memory_write_payload(
+            title=title,
             content=content,
-            node_type=node_type_str,
+            node_type=node_type,
             okf_type=okf_type,
             sources=sources,
         )
-        clean_title = normalized.title
-        content = normalized.content
-        okf_type = normalized.okf_type
-        sources = normalized.sources if normalized.mode == "llm_normalized" else sources
-        warnings.extend(normalized.warnings)
-        if normalized.type_override is not None:
-            node_type = normalized.type_override
-        elif node_type_str is not None:
-            node_type = node_type_str
-        else:
-            node_type = "persistent" if normalized.mode in {"template_inferred", "llm_normalized"} else "transient"
-
-        normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
-        section_count = sum(1 for line in content.splitlines() if line.lstrip().startswith("##"))
-        if normalized_type is NodeType.PERSISTENT:
-            warnings.extend(
-                self._okf_write_warnings(
-                    clean_title,
-                    content,
-                    okf_type=okf_type,
-                    sources=sources,
-                )
+        clean_title = prepared_write["title"]
+        content = prepared_write["content"]
+        node_type = prepared_write["node_type"]
+        okf_type = prepared_write["okf_type"]
+        sources = prepared_write["sources"]
+        normalized_type = prepared_write["normalized_type"]
+        warnings = list(prepared_write["warnings"])
+        payload = prepared_write.get("decision_result")
+        if payload is None:
+            payload = self._decide_memory_write_payload(
+                title=clean_title,
+                content=content,
+                node_type=node_type,
+                links=links,
+                sensitivity=sensitivity,
+                query_hint=query_hint,
+                similarity_threshold=similarity_threshold,
             )
-
-        payload = self._decide_memory_write_payload(
-            title=clean_title,
-            content=content,
-            node_type=node_type,
-            links=links,
-            sensitivity=sensitivity,
-            query_hint=query_hint,
-            similarity_threshold=similarity_threshold,
-        )
 
         decision_payload = payload["decision"].copy()
         # Pre-write near-duplicate MERGE (owner rework 2026-10-13, gap 1):

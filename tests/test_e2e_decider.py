@@ -5,11 +5,10 @@ These tests are marked ``live`` and skipped by default (see pyproject.toml
 
     pytest -m live
 
-They probe the real OpenAI-compatible endpoints (deepseek-v4-pro primary,
-glm-5.2-fp8 fallback) to guard against protocol drift, JSON-shape regressions,
-and fallback-chain breakage. When an endpoint is unreachable the tests skip
-rather than fail, so CI flakiness from network blips is avoided. But when the
-endpoint *is* reachable, any protocol/parse error fails the gate.
+They probe real OpenAI-compatible endpoints to guard against protocol drift,
+JSON-shape regressions, and endpoint-pool failover. When an endpoint is
+unreachable the tests skip rather than fail, so CI flakiness from network blips
+is avoided. When reachable, protocol and parse errors fail the gate.
 """
 
 from __future__ import annotations
@@ -118,30 +117,31 @@ def test_live_decider_decide_memory_write_complement(live_decider, live_primary_
     assert decision.reasoning
 
 
-def test_live_decider_fallback_endpoint_works(live_fallback_reachable) -> None:
-    """Primary endpoint misconfigured -> fallback to glm-5.2-fp8 succeeds.
+def test_live_decider_second_endpoint_works(live_fallback_reachable) -> None:
+    """A broken first endpoint must fail over to the configured second endpoint.
 
-    Requires the OPENAI_COMPATIBLE_API_KEY env var (sk- prefixed) and a
-    reachable fallback endpoint. Skips otherwise.
+    Requires the OPENAI_COMPATIBLE_API_KEY env var and a reachable endpoint.
+    Skips otherwise.
     """
     api_key = os.environ.get("OPENAI_COMPATIBLE_API_KEY", "").strip()
     if not api_key:
-        pytest.skip("OPENAI_COMPATIBLE_API_KEY not set; cannot test fallback endpoint auth")
+        pytest.skip("OPENAI_COMPATIBLE_API_KEY not set; cannot test endpoint auth")
     if not live_fallback_reachable:
-        pytest.skip(f"fallback LLM endpoint unreachable: {LIVE_FALLBACK_URL}")
+        pytest.skip(f"second LLM endpoint unreachable: {LIVE_FALLBACK_URL}")
 
-    # Primary endpoint deliberately broken so the decider must fall back.
     settings = DeciderSettings(
         provider="local_llm",
-        base_url="http://127.0.0.1:9/invalid-path",
-        model="deepseek-v4-pro",
-        api_key_env="",
-        fallback_base_url=LIVE_FALLBACK_URL,
-        fallback_model="glm-5.2-fp8",
-        fallback_api_key_env="OPENAI_COMPATIBLE_API_KEY",
+        endpoints=[
+            {"base_url": "http://127.0.0.1:9/invalid-path", "model": "unavailable-model"},
+            {
+                "base_url": LIVE_FALLBACK_URL,
+                "model": "deepseek-ai/DeepSeek-V4-Pro-0813",
+                "api_key_env": "OPENAI_COMPATIBLE_API_KEY",
+            },
+        ],
         timeout_seconds=30,
-        max_tokens=600,
-        temperature=0.1,
+        max_tokens=200_000,
+        temperature=0.0,
     )
     decider = LocalLLMDecider(settings)
 
