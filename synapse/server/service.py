@@ -58,7 +58,15 @@ def _supersede_anchor_tokens(content: str) -> set[str]:
 
     import re
 
-    semantic = re.split(r"(?m)^## (?:Evidence|Sources|Related)\s*$", content, maxsplit=1)[0]
+    semantic_lines: list[str] = []
+    include_section = True
+    for line in content.splitlines():
+        heading = line.strip()
+        if heading.startswith("## "):
+            include_section = heading[3:].strip().casefold() not in {"sources", "related"}
+        if include_section:
+            semantic_lines.append(line)
+    semantic = "\n".join(semantic_lines)
     numeric_text = re.sub(r"`[^`]*`", " ", semantic)
     numeric_text = re.sub(
         r"\b[A-Za-z][A-Za-z0-9._:/-]*\d[A-Za-z0-9._:/-]*\b",

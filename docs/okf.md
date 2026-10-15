@@ -326,12 +326,14 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
   (default 30); a sweep processes up to `[distiller].transcript_concurrency`
   transcripts at once (default 4), refilling free slots from the pending idle
   backlog up to `[distiller].max_transcripts_per_run` (default 500). Write
-  decisions are prepared concurrently, while each near-duplicate check and
-  store commit is serialized and checks the latest nodes. Exact normalized
-  takeaway matches merge into the existing node; a supersede is downgraded to
-  complement when it would lose target anchors or create a second lineage pointer.
-  The endpoint pool assigns calls least-busy across configured backends and
-  independently caps in-flight requests per endpoint.
+  decisions are prepared concurrently, while each commit is serialized and
+  rechecks the latest corpus. After link embedding, merges, and typed-OKF repair,
+  the full normalized `## Takeaway` is checked again against active persistent
+  nodes; exact matches merge into the existing node (or remain unchanged if
+  identical), including complement/supersede decisions. Supersedes downgrade
+  when they omit factual anchors from any body section, including `## Evidence`
+  (but excluding `## Sources` and `## Related` link lists), or claim an existing
+  lineage pointer. The endpoint pool independently caps in-flight calls per endpoint.
 - Progress watermark: `distilled_turn` on the transcript frontmatter records the
   last turn covered; a re-distill after new turns arrive processes only later
   turns (one previous turn as context). `distilled_hash` semantics are unchanged.

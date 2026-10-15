@@ -3204,3 +3204,137 @@ def test_failed_final_okf_repair_leaves_target_and_transcript_unchanged(tmp_path
         assert [node.id for node in distiller.select_transcripts()] == [transcript.id]
     finally:
         distiller.close()
+
+
+@pytest.mark.parametrize("action", ["complement", "supersede"])
+def test_final_merged_takeaway_dedupes_across_complement_and_supersede(
+    tmp_path: Path, monkeypatch, action: str
+) -> None:
+    takeaway = "A high OKF re-author skip rate is not necessarily a failure."
+    merged_body = (
+        f"## Takeaway\n{takeaway}\n\n"
+        "## Details\nThe skipped method/path pairs must be checked against the endpoint map.\n\n"
+        "## Sources\n- mem_session_final_takeaway"
+    )
+    invalid_merged_body = (
+        f"## Takeaway\n{takeaway}\n\n## Sources\n- mem_session_final_takeaway"
+    )
+
+    class Client:
+        name = "fake-final-takeaway-dedupe"
+
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def sample_json(self, *, prompt: str, **_kwargs):
+            assert "Repair this persistent OKF body" in prompt
+            self.repairs += 1
+            return {"content": merged_body}
+    config = _config(tmp_path)
+    runtime_paths = _runtime(tmp_path)
+    client = Client()
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=client)
+    existing = service.integrate_knowledge(
+        title="Existing skip-rate fact",
+        content=(
+            f"## Takeaway\n{takeaway}\n\n"
+            "## Details\nCompare skipped method/path pairs with the endpoint map.\n\n"
+            "## Sources\n- mem_session_previous"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_previous"],
+    )
+    existing_id = existing["node"]["id"]
+    lineage_target = service.integrate_knowledge(
+        title="Old timeout-specific endpoint policy",
+        content=(
+            "## Takeaway\nKeep the timeout-specific endpoint policy.\n\n"
+            "## Details\nThe timeout is 120s and the model is `GLM-5.2-fp8`.\n\n"
+            "## Sources\n- mem_session_lineage"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_lineage"],
+    )
+    lineage_id = lineage_target["node"]["id"]
+    transcript = _write_transcript(
+        runtime_paths,
+        "mem_session_final_takeaway",
+        "## User\nThe endpoint map lists the skipped method/path pair.\n\n## Assistant\nRecorded.",
+        session_key="final-takeaway-dedupe",
+    )
+    item = OkfItem(
+        okf_type="fact",
+        title="New endpoint skip analysis",
+        takeaway="Draft takeaway before final merge.",
+        sections={"Details": "The draft content before near-duplicate merge."},
+        sources=[transcript.id],
+    )
+    monkeypatch.setattr(
+        service,
+        "_decide_memory_write_payload",
+        lambda **_kwargs: {
+            "decision": {
+                "action": action,
+                "target_node_ids": [lineage_id],
+                "reasoning": "replace the timeout-specific policy",
+            },
+            "evidence": {"candidate_count": 1, "sampling_provider": "fake"},
+        },
+    )
+    prepared = service.prepare_distilled_write(
+        title=item.title,
+        content=item.render(),
+        node_type=NodeType.PERSISTENT,
+        sources=list(item.sources),
+        okf_type=item.okf_type,
+    )
+    distiller = Distiller(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=client,
+        service=service,
+    )
+    monkeypatch.setattr(distiller, "_find_near_duplicate", lambda *_args: service._load_node(lineage_id))
+    def merge_body(_item: OkfItem, target: Node) -> str:
+        return invalid_merged_body if target.id == lineage_id else merged_body
+
+    monkeypatch.setattr(distiller, "_merge_item_into_node", merge_body)
+    from synapse.lifecycle.distiller import _extract_section
+
+    report = DistillerReport(started_at="", completed_at="")
+    try:
+        result = distiller._write_item(
+            service,
+            transcript,
+            item,
+            report,
+            prepared=prepared,
+            dry_run=False,
+            downgrade_supersede=False,
+        )
+        assert client.repairs == 1
+        assert result == {"action": "updated", "node_ids": [existing_id]}
+        assert service.get_node(lineage_id)["metadata"]["status"] == "active"
+        with SQLiteNodeStore(
+            runtime_paths.base / "synapse.db",
+            embedding_dimension=config.embedding.dimension or 0,
+        ) as store:
+            active = store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+            matching = [
+                node
+                for node in active
+                if Distiller._takeaway_key(_extract_section(node.content, "Takeaway") or "")
+                == Distiller._takeaway_key(takeaway)
+            ]
+            event = store.connection.execute(
+                "SELECT action FROM write_memory_events WHERE node_id = ? AND route = 'distiller' ORDER BY id DESC LIMIT 1",
+                (existing_id,),
+            ).fetchone()
+        assert [node.id for node in matching] == [existing_id]
+        assert event is not None and event["action"] == "updated"
+    finally:
+        distiller.close()

@@ -1407,6 +1407,98 @@ class Distiller:
             service.reset_sampling_client(token)
             self._close_thread_store()
 
+    def _final_takeaway_duplicate_update(
+        self,
+        service: SynapseServerService,
+        transcript: Node,
+        item: OkfItem,
+        report: DistillerReport,
+        store: SQLiteNodeStore,
+        content: str,
+        *,
+        sources: list[str],
+        links: list[str] | None = None,
+        preferred_target: Node | None = None,
+        decision_endpoint: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Validate and dedupe the exact post-merge body under the commit lock."""
+
+        final_content, _warnings = service._validate_distiller_final_body(
+            title=item.title,
+            content=content,
+            okf_type=item.okf_type,
+            sources=sources,
+            links=links or [],
+        )
+        takeaway_key = self._takeaway_key(_extract_section(final_content, "Takeaway") or "")
+        exact_target = None
+        if takeaway_key:
+            exact_target = next(
+                (
+                    candidate
+                    for candidate in store.list_nodes(
+                        {"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}
+                    )
+                    if self._takeaway_key(_extract_section(candidate.content, "Takeaway") or "")
+                    == takeaway_key
+                ),
+                None,
+            )
+        target = exact_target or preferred_target
+        if target is None:
+            return None, final_content
+
+        if exact_target is not None:
+            self._logger.info(
+                "Exact takeaway dedupe matched the final distiller body",
+                extra={"transcript_id": transcript.id, "target_node_id": target.id},
+            )
+        if (preferred_target is not None and target.id == preferred_target.id) or (
+            final_content.strip() == target.content.strip()
+        ):
+            merged_content = final_content
+        else:
+            final_item = OkfItem(
+                okf_type=item.okf_type,
+                title=item.title,
+                takeaway=_extract_section(final_content, "Takeaway") or item.takeaway,
+                sections={
+                    section: _extract_section(final_content, section) or ""
+                    for section in TYPE_REQUIRED_SECTIONS[item.okf_type]
+                },
+                sources=list(sources),
+                evidence=list(item.evidence),
+                verified=item.verified,
+            )
+            with self._sampling_call_context(transcript, "near_duplicate_merge"):
+                merged_content = self._merge_item_into_node(final_item, target)
+            if merged_content is None:
+                raise SynapseServiceError(
+                    "EXACT_TAKEAWAY_MERGE_FAILED",
+                    "Final-takeaway duplicate could not be safely merged",
+                    status_code=502,
+                    details={"target_node_id": target.id},
+                )
+
+        with self._sampling_call_context(transcript, "write_commit"):
+            updated = service._merge_update_node(
+                target_id=target.id,
+                content=merged_content,
+                title=item.title,
+                sources=sources,
+                verified=item.verified,
+                route="distiller",
+                okf_type=item.okf_type,
+            )
+        updated_node = updated.get("node")
+        node_id = updated_node.get("id") if isinstance(updated_node, dict) else None
+        action = str(updated.get("action", "updated"))
+        self._count_action(report, action)
+        if decision_endpoint is not None:
+            endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
+            endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
+        return {"action": action, "node_ids": [node_id] if node_id else []}, final_content
+
     def _write_item(
         self,
         service: SynapseServerService,
@@ -1454,10 +1546,6 @@ class Distiller:
                 == self._takeaway_key(_extract_section(near_dup.content, "Takeaway") or "")
             )
             if exact_takeaway_duplicate:
-                self._logger.info(
-                    "Exact takeaway dedupe matched an active persistent node",
-                    extra={"transcript_id": transcript.id, "target_node_id": near_dup.id},
-                )
                 candidate_content = prepared["content"] if prepared is not None else item.render()
                 if candidate_content.strip() == near_dup.content.strip():
                     merged_content = near_dup.content
@@ -1471,43 +1559,49 @@ class Distiller:
                             status_code=502,
                             details={"target_node_id": near_dup.id},
                         )
-                with self._sampling_call_context(transcript, "write_commit"):
-                    updated = service._merge_update_node(
-                        target_id=near_dup.id,
-                        content=merged_content,
-                        title=item.title,
-                        sources=list(item.sources),
-                        verified=item.verified,
-                        route="distiller",
-                        okf_type=item.okf_type,
-                    )
-                updated_node = updated.get("node")
-                node_id = updated_node.get("id") if isinstance(updated_node, dict) else None
-                action = str(updated.get("action", "updated"))
-                self._count_action(report, action)
-                if decision_endpoint is not None:
-                    endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
-                    endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
-                return {"action": action, "node_ids": [node_id] if node_id else []}
+                updated, _final_content = self._final_takeaway_duplicate_update(
+                    service,
+                    transcript,
+                    item,
+                    report,
+                    store,
+                    merged_content,
+                    sources=list(item.sources),
+                    preferred_target=near_dup,
+                    decision_endpoint=decision_endpoint,
+                )
+                assert updated is not None
+                return updated
             if guard_fallback:
                 if near_dup is not None:
                     with self._sampling_call_context(transcript, "near_duplicate_merge"):
                         merged = self._merge_item_into_node(item, near_dup)
-                    with self._sampling_call_context(transcript, "write_commit"):
-                        updated = service._merge_update_node(
-                            target_id=near_dup.id,
-                            content=merged or item.render(),
-                            title=item.title,
-                            sources=list(item.sources),
-                            verified=item.verified,
-                            route="distiller",
-                            okf_type=item.okf_type,
-                        )
-                    updated_node = updated.get("node")
-                    node_id = updated_node.get("id") if isinstance(updated_node, dict) else None
-                    action = str(updated.get("action", "updated"))
-                    self._count_action(report, action)
-                    return {"action": action, "node_ids": [node_id] if node_id else []}
+                    final_candidate = merged or item.render()
+                    updated, _final_content = self._final_takeaway_duplicate_update(
+                        service,
+                        transcript,
+                        item,
+                        report,
+                        store,
+                        final_candidate,
+                        sources=list(item.sources),
+                        preferred_target=near_dup,
+                    )
+                    assert updated is not None
+                    return updated
+                final_candidate = item.render()
+                updated, final_candidate = self._final_takeaway_duplicate_update(
+                    service,
+                    transcript,
+                    item,
+                    report,
+                    store,
+                    final_candidate,
+                    sources=list(item.sources),
+                    decision_endpoint=decision_endpoint,
+                )
+                if updated is not None:
+                    return updated
                 report.guard_fallback_creates += 1
                 self._logger.warning(
                     "Guard fired on distilled item; falling back to create",
@@ -1516,7 +1610,7 @@ class Distiller:
                 with self._sampling_call_context(transcript, "write_commit"):
                     fallback = service.integrate_knowledge(
                         title=item.title,
-                        content=item.render(),
+                        content=final_candidate,
                         node_type=NodeType.PERSISTENT,
                         sources=list(item.sources),
                         okf_type=item.okf_type,
@@ -1535,6 +1629,25 @@ class Distiller:
                     merged = self._merge_item_into_node(item, near_dup)
                 if merged is not None:
                     content = merged
+            decision_result = prepared.get("decision_result") or {}
+            decision = decision_result.get("decision") or {}
+            target_ids = list(decision.get("target_node_ids") or [])
+            candidate_links = list(prepared.get("links") or [])
+            if decision.get("action") != "create":
+                candidate_links.extend(target_ids)
+            duplicate_update, content = self._final_takeaway_duplicate_update(
+                service,
+                transcript,
+                item,
+                report,
+                store,
+                content,
+                sources=list(prepared.get("sources") or []),
+                links=candidate_links,
+                decision_endpoint=decision_endpoint,
+            )
+            if duplicate_update is not None:
+                return duplicate_update
 
             forced_node_id: str | None = None
             if not slugify_english_title(item.title):
@@ -1567,7 +1680,7 @@ class Distiller:
                 with self._sampling_call_context(transcript, "write_commit"):
                     fallback = service.integrate_knowledge(
                         title=item.title,
-                        content=item.render(),
+                        content=content,
                         node_type=NodeType.PERSISTENT,
                         sources=list(item.sources),
                         okf_type=item.okf_type,

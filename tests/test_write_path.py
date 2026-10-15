@@ -420,6 +420,60 @@ def test_distiller_supersede_downgrades_when_target_anchors_are_lost(
     assert old_after["superseded_by"] is None
 
 
+def test_distiller_supersede_preserves_evidence_section_anchors(tmp_path: Path, monkeypatch) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    old = service.integrate_knowledge(
+        title="Exported node and edge count",
+        content=(
+            "## Takeaway\nThe graph export size is a retained fact.\n\n"
+            "## Details\nThe snapshot report records the graph size.\n\n"
+            "## Sources\n- mem_session_old\n\n"
+            "## Evidence\n- T1: \"Exported 2272 nodes, 532 edges\""
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_old"],
+    )
+    old_id = old["node"]["id"]
+    monkeypatch.setattr(
+        service,
+        "_decide_memory_write_payload",
+        lambda **_kwargs: {
+            "decision": {
+                "action": "supersede",
+                "target_node_ids": [old_id],
+                "reasoning": "replace with a newer export summary",
+            },
+            "evidence": {"candidate_count": 1, "sampling_provider": "fake"},
+        },
+    )
+
+    result = service.write_memory(
+        title="Updated graph export size",
+        content=(
+            "## Takeaway\nThe graph export size is summarized by the new report.\n\n"
+            "## Details\nThe new report describes the current graph export.\n\n"
+            "## Sources\n- mem_session_new"
+        ),
+        node_type=NodeType.PERSISTENT,
+        okf_type="fact",
+        sources=["mem_session_new"],
+        route="distiller",
+        downgrade_supersede=False,
+    )
+
+    assert result["decision"]["action"] == "complement"
+    assert result["downgrade"]["reason"].startswith("supersede downgraded to complement")
+    assert "2272" in result["downgrade"]["reason"]
+    assert "532" in result["downgrade"]["reason"]
+    old_after = service.get_node(old_id)["metadata"]
+    assert old_after["status"] == "active"
+    assert old_after["superseded_by"] is None
+
+
 def test_concurrent_supersedes_preserve_one_lineage_pointer(tmp_path: Path, monkeypatch) -> None:
     config = load_config(write_config(tmp_path))
     runtime_paths = bootstrap_runtime_directories(config)
