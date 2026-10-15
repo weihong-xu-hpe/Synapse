@@ -219,9 +219,12 @@ never fire warnings — only headings are checked (fixed English strings `## Tak
 `## Sources`).
 
 Non-distiller writes retain warning-only transition behavior. Distiller writes validate the
-final persisted body after link/merge construction, attempt one structure repair, and skip
-the item (leaving its transcript retryable) if it still fails. Recorded warning codes are
-recomputed from the final body.
+final persisted body after link/merge construction and attempt one structure repair. If that
+repair returns an empty or still-invalid body, the item is skipped and appended with its final
+candidate, findings, action/targets, and sources to
+`~/synapse/.distiller-quarantine/YYYYMMDD.jsonl`; remaining items continue. The transcript is
+stamped after all non-quarantined items finish. Endpoint/transport failures are not quarantined
+and leave the transcript retryable. Recorded warning codes are recomputed from the final body.
 
 ## 7. Title rule & ID plan
 
@@ -334,6 +337,9 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
   when they omit factual anchors from any body section, including `## Evidence`
   (but excluding `## Sources` and `## Related` link lists), or claim an existing
   lineage pointer. The endpoint pool independently caps in-flight calls per endpoint.
+- A validation-quarantined item increments `items_quarantined` in the transcript
+  funnel, sweep summary, and `distiller_runs`; it is retained for the unified
+  quarantine repair pass rather than blocking other items in that transcript.
 - Progress watermark: `distilled_turn` on the transcript frontmatter records the
   last turn covered; a re-distill after new turns arrive processes only later
   turns (one previous turn as context). `distilled_hash` semantics are unchanged.

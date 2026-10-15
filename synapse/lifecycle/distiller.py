@@ -14,6 +14,7 @@ legacy session-summary groups with supersede-downgrade safety.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
@@ -54,6 +55,7 @@ _QUESTION_ONLY_PREFIX = re.compile(
     r"^(?:what|why|how|when|where|who|which|whose|whom|can|could|would|will|do|does|did|is|are|was|were|should|may|might|must|have|has|had)\b|^(?:请问|为什么|如何|怎么|是否|能否|是不是|什么|什么时候|哪里|谁)",
     re.IGNORECASE,
 )
+_QUARANTINE_WRITE_LOCK = threading.Lock()
 
 
 @dataclass(slots=True)
@@ -68,6 +70,7 @@ class DistillerReport:
     transcripts_skipped: int = 0
     items_extracted: int = 0
     items_invalid: int = 0
+    items_quarantined: int = 0
     items_sources_dropped: int = 0
     reduced_items: int = 0
     reduce_failures: int = 0
@@ -102,6 +105,7 @@ class DistillerReport:
             transcripts_skipped=self.transcripts_skipped,
             items_extracted=self.items_extracted,
             items_invalid=self.items_invalid,
+            items_quarantined=self.items_quarantined,
             decider_creates=self.decider_creates,
             decider_complements=self.decider_complements,
             decider_supersedes=self.decider_supersedes,
@@ -119,6 +123,7 @@ class DistillerReport:
             "transcripts_distilled": self.transcripts_distilled,
             "transcripts_skipped": self.transcripts_skipped,
             "items_extracted": self.items_extracted,
+            "items_quarantined": self.items_quarantined,
             "items_invalid": self.items_invalid,
             "items_sources_dropped": self.items_sources_dropped,
             "reduced_items": self.reduced_items,
@@ -444,6 +449,7 @@ class Distiller:
                 "transcripts_distilled": report.transcripts_distilled,
                 "transcripts_skipped": report.transcripts_skipped,
                 "segments": report.segments_total,
+                "items_quarantined": report.items_quarantined,
                 "items_extracted": report.items_extracted,
                 "decider_actions": {
                     "create": report.decider_creates,
@@ -460,13 +466,89 @@ class Distiller:
         return report
 
     @staticmethod
-    def _is_final_okf_validation_error(exc: Exception) -> bool:
+    def _final_okf_validation_details(exc: Exception) -> dict[str, Any] | None:
         if not isinstance(exc, SynapseServiceError):
-            return False
+            return None
         if exc.code == "INVALID_OKF_FINAL_BODY":
-            return True
-        execution_error = exc.details.get("execution_error")
-        return isinstance(execution_error, Mapping) and execution_error.get("code") == "INVALID_OKF_FINAL_BODY"
+            details = exc.details
+        else:
+            execution_error = exc.details.get("execution_error")
+            if not isinstance(execution_error, Mapping) or execution_error.get("code") != "INVALID_OKF_FINAL_BODY":
+                return None
+            details = execution_error.get("details")
+            if not isinstance(details, dict):
+                details = {}
+            original_decision = exc.details.get("decision")
+            if isinstance(original_decision, Mapping):
+                details = {**details, "decision": original_decision}
+        # A failed repair call is transport/model failure, not a rejected item;
+        # keep the existing retry/backoff path for that failure.
+        if details.get("repair_error"):
+            return None
+        return details
+
+    @classmethod
+    def _is_final_okf_validation_error(cls, exc: Exception) -> bool:
+        return cls._final_okf_validation_details(exc) is not None
+
+    def _quarantine_invalid_item(
+        self,
+        transcript: Node,
+        item: OkfItem,
+        prepared: dict[str, Any] | None,
+        exc: SynapseServiceError,
+        *,
+        context: Mapping[str, Any] | None = None,
+    ) -> Path:
+        details = self._final_okf_validation_details(exc) or {}
+        prepared = prepared or {}
+        context = context or {}
+        decision = details.get("decision") if isinstance(details.get("decision"), Mapping) else None
+        if decision is None:
+            decision = ((prepared.get("decision_result") or {}).get("decision") or {})
+        target_ids = list(decision.get("target_node_ids") or [])
+        for target_id in context.get("target_node_ids", []):
+            if target_id and target_id not in target_ids:
+                target_ids.append(str(target_id))
+        merge_target = context.get("merge_update_target")
+        if merge_target and merge_target not in target_ids:
+            target_ids.append(str(merge_target))
+        final_body = details.get("final_content")
+        if not isinstance(final_body, str):
+            final_body = context.get("candidate_content")
+        if not isinstance(final_body, str):
+            final_body = prepared.get("content")
+        if not isinstance(final_body, str):
+            final_body = item.render()
+        now = datetime.now(UTC)
+        record = {
+            "ts": now.isoformat().replace("+00:00", "Z"),
+            "transcript_id": transcript.id,
+            "title": item.title,
+            "okf_type": item.okf_type,
+            "intended_action": str(decision.get("action") or context.get("intended_action") or "create"),
+            "target_node_ids": target_ids,
+            "final_candidate_body": final_body,
+            "validator_findings": details.get("warnings") or [],
+            "sources": list(prepared.get("sources") or item.sources),
+        }
+        directory = self.runtime_paths.base / ".distiller-quarantine"
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = directory / f"{now.strftime('%Y%m%d')}.jsonl"
+        payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        with _QUARANTINE_WRITE_LOCK:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short write while appending distiller quarantine record")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return path
 
     def _run_transcript_task(
         self,
@@ -535,7 +617,7 @@ class Distiller:
     def _merge_transcript_report(target: DistillerReport, source: DistillerReport) -> None:
         for name in (
             "transcripts_distilled", "transcripts_skipped", "items_extracted", "items_invalid",
-            "items_sources_dropped", "reduced_items", "reduce_failures", "reduce_groups_llm",
+            "items_quarantined", "items_sources_dropped", "reduced_items", "reduce_failures", "reduce_groups_llm",
             "guard_fallback_creates", "title_repairs", "title_repair_failures", "decider_creates",
             "decider_complements", "decider_supersedes", "decider_downgrades", "merged_updates",
             "llm_failures", "segments_total",
@@ -755,17 +837,43 @@ class Distiller:
             if prepared is not None:
                 item.title = prepared["title"]
                 item.sources = list(prepared["sources"] or [])
-            action_note = self._write_item(
-                service,
-                transcript,
-                item,
-                report,
-                prepared=prepared,
-                decision_endpoint=preparation["decision_endpoint"],
-                guard_fallback=preparation["guard_fallback"],
-                dry_run=dry_run,
-                downgrade_supersede=downgrade_supersede,
-            )
+            quarantine_context: dict[str, Any] = {}
+            try:
+                action_note = self._write_item(
+                    service,
+                    transcript,
+                    item,
+                    report,
+                    prepared=prepared,
+                    decision_endpoint=preparation["decision_endpoint"],
+                    guard_fallback=preparation["guard_fallback"],
+                    dry_run=dry_run,
+                    downgrade_supersede=downgrade_supersede,
+                    quarantine_context=quarantine_context,
+                )
+            except SynapseServiceError as exc:
+                details = self._final_okf_validation_details(exc)
+                if details is None:
+                    raise
+                quarantine_path = self._quarantine_invalid_item(
+                    transcript,
+                    item,
+                    prepared,
+                    exc,
+                    context=quarantine_context,
+                )
+                report.items_quarantined += 1
+                self._logger.warning(
+                    "Distiller item quarantined after final OKF validation",
+                    extra={
+                        "node_id": transcript.id,
+                        "item": item.title,
+                        "okf_type": item.okf_type,
+                        "warning_codes": [warning.get("code") for warning in details.get("warnings", [])],
+                        "quarantine_file": quarantine_path.name,
+                    },
+                )
+                action_note = {"action": "quarantined", "node_ids": []}
             produced_ids.extend(action_note.get("node_ids", []))
             detail["items"].append(
                 {"title": item.title, "okf_type": item.okf_type, "verified": item.verified, **action_note}
@@ -779,7 +887,7 @@ class Distiller:
         # yields an unusual number of items.
         if len(candidates) > self.settings.item_warn_threshold:
             self._logger.warning(
-                "Transcript yielded more than item_warn_threshold items; all written",
+                "Transcript yielded more than item_warn_threshold items; each was committed or quarantined",
                 extra={"node_id": transcript.id, "items": len(candidates), "threshold": self.settings.item_warn_threshold},
             )
 
@@ -825,6 +933,7 @@ class Distiller:
                     "after_reduce": len(candidates) - report.reduced_items if report.reduced_items else len(candidates),
                     "reduce_groups_llm": report.reduce_groups_llm,
                     "reduce_failure": report.reduce_failures > 0,
+                    "items_quarantined": sum(1 for entry in detail["items"] if entry.get("action") == "quarantined"),
                     "items": len(candidates),
                     "written_by_action": action_counts,
                     "types": sorted({item.okf_type for item in candidates}),
@@ -1511,7 +1620,9 @@ class Distiller:
         guard_fallback: bool = False,
         dry_run: bool,
         downgrade_supersede: bool,
+        quarantine_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        quarantine_context = quarantine_context if quarantine_context is not None else {}
         if dry_run:
             return {"action": "planned", "node_ids": []}
         if prepared is None and not guard_fallback:
@@ -1537,9 +1648,15 @@ class Distiller:
                     ),
                     None,
                 )
+        decision = ((prepared or {}).get("decision_result") or {}).get("decision") or {}
+        quarantine_context.setdefault("intended_action", decision.get("action") or ("create" if guard_fallback else "create"))
+        quarantine_context.setdefault("target_node_ids", list(decision.get("target_node_ids") or []))
+        quarantine_context["candidate_content"] = prepared.get("content") if prepared else item.render()
         with self._write_commit_lock:
             store = self._get_store()
             near_dup = self._find_near_duplicate(item, transcript, store)
+            if near_dup is not None:
+                quarantine_context["merge_update_target"] = near_dup.id
             exact_takeaway_duplicate = (
                 near_dup is not None
                 and self._takeaway_key(item.takeaway)

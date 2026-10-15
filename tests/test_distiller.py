@@ -2944,7 +2944,7 @@ def test_near_duplicate_reranker_uses_bounded_shortlist_for_large_corpus(
         distiller.close()
 
 
-def test_invalid_final_distiller_body_is_skipped_and_retryable(tmp_path: Path, monkeypatch) -> None:
+def test_invalid_final_distiller_body_is_quarantined_and_transcript_stamped(tmp_path: Path, monkeypatch) -> None:
     class RepairFailureClient:
         name = "fake-final-okf-repair"
 
@@ -2998,13 +2998,16 @@ def test_invalid_final_distiller_body_is_skipped_and_retryable(tmp_path: Path, m
             {"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}
         )
         assert client.repair_calls == 1
-        assert report.transcripts_distilled == 0
-        assert report.transcripts_skipped == 1
-        assert stamped.metadata.distilled_hash is None
+        assert report.transcripts_distilled == 1
+        assert report.transcripts_skipped == 0
+        assert report.items_quarantined == 1
+        assert stamped.metadata.distilled_hash is not None
         assert not any(node.title == "Final OKF repair remains retryable" for node in persistent)
-
-        os.utime(runtime_paths.active / f"{transcript.id}.md", (old_ts, old_ts))
-        assert [node.id for node in distiller.select_transcripts()] == [transcript.id]
+        quarantine = next((runtime_paths.base / ".distiller-quarantine").glob("*.jsonl"))
+        record = json.loads(quarantine.read_text(encoding="utf-8").splitlines()[0])
+        assert record["transcript_id"] == transcript.id
+        assert "okf_missing_section:Symptom" in {warning["code"] for warning in record["validator_findings"]}
+        assert [node.id for node in distiller.select_transcripts()] == []
     finally:
         distiller.close()
 
@@ -3116,7 +3119,7 @@ def test_exact_takeaway_duplicate_merges_despite_complement_decision(
         distiller.close()
 
 
-def test_failed_final_okf_repair_leaves_target_and_transcript_unchanged(tmp_path: Path) -> None:
+def test_failed_final_okf_repair_quarantines_item_and_stamps_transcript(tmp_path: Path) -> None:
     takeaway = "Use one canonical probe deadline for every region."
     invalid_takeaway = "x" * 201
 
@@ -3196,12 +3199,21 @@ def test_failed_final_okf_repair_leaves_target_and_transcript_unchanged(tmp_path
             dry_run=False,
             downgrade_supersede=False,
         )
-        assert report.transcripts_skipped == 1
-        assert report.transcripts_distilled == 0
+        from synapse.storage import read_node_file
+        stamped = read_node_file(transcript_path)
+        assert report.transcripts_skipped == 0
+        assert report.transcripts_distilled == 1
+        assert report.items_quarantined == 1
         assert client.repairs == 1
         assert service.get_node(target_id) == target_before
-        assert transcript_path.read_text(encoding="utf-8") == transcript_before
-        assert [node.id for node in distiller.select_transcripts()] == [transcript.id]
+        assert transcript_path.read_text(encoding="utf-8") != transcript_before
+        assert stamped.metadata.distilled_hash is not None
+        assert stamped.metadata.distilled_node_ids == []
+        assert [node.id for node in distiller.select_transcripts()] == []
+        quarantine = next((runtime_paths.base / ".distiller-quarantine").glob("*.jsonl"))
+        record = json.loads(quarantine.read_text(encoding="utf-8").splitlines()[0])
+        assert record["transcript_id"] == transcript.id
+        assert record["title"] == "Regional probe deadline detail"
     finally:
         distiller.close()
 
@@ -3336,5 +3348,140 @@ def test_final_merged_takeaway_dedupes_across_complement_and_supersede(
             ).fetchone()
         assert [node.id for node in matching] == [existing_id]
         assert event is not None and event["action"] == "updated"
+    finally:
+        distiller.close()
+
+
+@pytest.mark.parametrize("repair_mode", ["still_invalid", "empty", "transport"])
+def test_invalid_item_is_quarantined_without_blocking_later_items(
+    tmp_path: Path, monkeypatch, repair_mode: str
+) -> None:
+    invalid_takeaway = "x" * 201
+    first_bad_body = (
+        f"## Takeaway\n{invalid_takeaway}\n\n"
+        "## Details\nThe first candidate has an overlong takeaway.\n\n"
+        "## Sources\n- mem_session_quarantine"
+    )
+
+    first_item = {
+        "okf_type": "fact",
+        "title": "First candidate with invalid merged takeaway",
+        "takeaway": "A concise draft takeaway.",
+        "sections": {"Details": "The first candidate has supported details."},
+        "sources": [],
+        "evidence": [],
+    }
+    later_item = {
+        "okf_type": "fact",
+        "title": "Later candidate still commits",
+        "takeaway": "The later candidate remains processable.",
+        "sections": {"Details": "This item follows a quarantined candidate."},
+        "sources": [],
+        "evidence": [],
+    }
+
+    class QuarantineClient:
+        name = f"fake-quarantine-{repair_mode}"
+
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def sample_json(self, *, prompt: str, **_kwargs):
+            if "Repair this persistent OKF body" in prompt:
+                self.repairs += 1
+                if repair_mode == "transport":
+                    raise RuntimeError("repair endpoint unavailable")
+                return {"content": "" if repair_mode == "empty" else first_bad_body}
+            return {"items": [first_item, later_item]}
+
+    config = _config(tmp_path)
+    runtime_paths = _runtime(tmp_path)
+    client = QuarantineClient()
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=client)
+    old = service.integrate_knowledge(
+        title="Existing node for the first candidate",
+        content=(
+            "## Takeaway\nThe first candidate already has a canonical node.\n\n"
+            "## Details\nKeep the existing fact until a valid merge.\n\n"
+            "## Sources\n- mem_session_prior"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_prior"],
+    )
+    old_id = old["node"]["id"]
+    original_old_body = service.get_node(old_id)["content"]
+
+    def decide(**_kwargs):
+        return {
+            "decision": {"action": "create", "target_node_ids": [], "reasoning": "new item"},
+            "evidence": {"candidate_count": 0, "sampling_provider": "fake-quarantine"},
+        }
+
+    monkeypatch.setattr(service, "_decide_memory_write_payload", decide)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=client, service=service)
+    transcript = _write_transcript(
+        runtime_paths,
+        "mem_session_quarantine",
+        "## User\nThe session contains two independent durable facts.\n\n## Assistant\nRecorded.",
+        session_key="quarantine-test",
+    )
+    monkeypatch.setattr(
+        distiller,
+        "_find_near_duplicate",
+        lambda item, _transcript, _store: service._load_node(old_id)
+        if item.title == first_item["title"]
+        else None,
+    )
+
+    def merge_item(item: OkfItem, _target: Node) -> str:
+        return first_bad_body
+
+    monkeypatch.setattr(distiller, "_merge_item_into_node", merge_item)
+    try:
+        report = distiller._run_one_transcript(transcript, downgrade_supersede=False)
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / f"{transcript.id}.md")
+        assert report.transcripts_scanned == 1
+        if repair_mode == "transport":
+            assert report.transcripts_distilled == 0
+            assert report.transcripts_skipped == 1
+            assert report.items_quarantined == 0
+            assert stamped.metadata.distilled_hash is None
+            assert stamped.metadata.distilled_node_ids == []
+            assert not list((runtime_paths.base / ".distiller-quarantine").glob("*.jsonl"))
+        else:
+            assert report.transcripts_distilled == 1
+            assert report.transcripts_skipped == 0
+            assert report.items_quarantined == 1
+            assert stamped.metadata.distilled_hash is not None
+            assert len(stamped.metadata.distilled_node_ids) == 1
+            committed = distiller._get_store().get_node(stamped.metadata.distilled_node_ids[0])
+            assert committed is not None and committed.title == later_item["title"]
+            assert service.get_node(old_id)["content"] == original_old_body
+            quarantine_files = list((runtime_paths.base / ".distiller-quarantine").glob("*.jsonl"))
+            assert len(quarantine_files) == 1
+            record = json.loads(quarantine_files[0].read_text(encoding="utf-8").splitlines()[0])
+            assert record["transcript_id"] == transcript.id
+            assert record["title"] == first_item["title"]
+            assert record["okf_type"] == "fact"
+            assert record["intended_action"] == "create"
+            assert record["target_node_ids"] == [old_id]
+            assert record["final_candidate_body"] == first_bad_body
+            assert record["sources"] == [transcript.id]
+            assert record["validator_findings"]
+            assert report.details[0]["items"][0]["action"] == "quarantined"
+            assert report.details[0]["items"][1]["action"] in {"create", "unchanged"}
+            with SQLiteNodeStore(
+                runtime_paths.base / "synapse.db",
+                embedding_dimension=config.embedding.dimension or 0,
+            ) as store:
+                run_row = store.connection.execute(
+                    "SELECT items_quarantined FROM distiller_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            assert run_row is not None and run_row["items_quarantined"] == 1
+        assert client.repairs == 1
     finally:
         distiller.close()

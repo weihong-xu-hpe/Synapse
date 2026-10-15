@@ -212,7 +212,10 @@ def test_distiller_write_repairs_final_body_and_records_final_warnings(tmp_path:
             self.repairs = 0
 
         def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, **_kwargs):
-            assert "Repair this persistent OKF body" in prompt
+            assert "Return the FULL corrected body" in prompt
+            assert "exactly one non-empty `## Takeaway` line of at most 200 characters" in prompt
+            assert "Each required heading must occur exactly once and have a non-empty body" in prompt
+            assert "Required headings: ## Takeaway, ## Details, ## Sources" in prompt
             self.repairs += 1
             return {
                 "content": (

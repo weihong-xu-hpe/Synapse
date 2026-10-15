@@ -1581,7 +1581,7 @@ class SynapseServerService:
     ) -> tuple[str, list[dict[str, str]]]:
         """Validate the exact body about to persist; repair structural defects once."""
 
-        from synapse.okf import validate_okf_node
+        from synapse.okf import TYPE_REQUIRED_SECTIONS, validate_okf_node
 
         linked_content = self._embed_links(content, links)
         findings = validate_okf_node(
@@ -1603,10 +1603,16 @@ class SynapseServerService:
 
         errors = structural_errors(findings)
         if errors:
+            required_headings = ["Takeaway", *TYPE_REQUIRED_SECTIONS.get(okf_type, ()), "Sources"]
             prompt = (
                 "Repair this persistent OKF body so it satisfies the supplied validation findings. "
+                "Return the FULL corrected body in one JSON object's `content` string, not a patch or excerpt. "
+                "There must be exactly one non-empty `## Takeaway` line of at most 200 characters. "
+                "Each required heading must occur exactly once and have a non-empty body. "
                 "Preserve every supported fact, number, path, model identifier, source, and evidence quote; "
-                "do not add claims. Return one JSON object with a single `content` string.\n\n"
+                "do not add claims. Required headings: "
+                + ", ".join(f"## {heading}" for heading in required_headings)
+                + ".\n\n"
                 + json.dumps(
                     {
                         "title": title,
@@ -1637,7 +1643,7 @@ class SynapseServerService:
                     "INVALID_OKF_FINAL_BODY",
                     "Final distilled OKF body failed validation and its single repair attempt failed",
                     status_code=422,
-                    details={"warnings": [finding.as_dict() for finding in errors], "repair_error": str(exc)},
+                    details={"warnings": [finding.as_dict() for finding in errors], "repair_error": str(exc), "final_content": linked_content},
                 ) from exc
             repaired_content = repaired.get("content") if isinstance(repaired, dict) else None
             if not isinstance(repaired_content, str) or not repaired_content.strip():
@@ -1645,7 +1651,7 @@ class SynapseServerService:
                     "INVALID_OKF_FINAL_BODY",
                     "Final distilled OKF body repair did not return content",
                     status_code=422,
-                    details={"warnings": [finding.as_dict() for finding in errors]},
+                    details={"warnings": [finding.as_dict() for finding in errors], "final_content": linked_content},
                 )
             self.logger.info(
                 "Distiller final OKF validation repair returned a candidate",
@@ -1669,7 +1675,7 @@ class SynapseServerService:
                     "INVALID_OKF_FINAL_BODY",
                     "Final distilled OKF body remains invalid after one repair attempt",
                     status_code=422,
-                    details={"warnings": [finding.as_dict() for finding in errors]},
+                    details={"warnings": [finding.as_dict() for finding in errors], "final_content": linked_content}
                 )
         return linked_content, [
             {"code": finding.code, "message": finding.message}

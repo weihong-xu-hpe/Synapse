@@ -155,6 +155,7 @@ class DistillerRunMetrics:
     decider_downgrades: int
     llm_failures: int
     archived_transcripts: int
+    items_quarantined: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -345,6 +346,12 @@ class SQLiteNodeStore:
             return True
         if "schema_meta" not in tables:
             return True
+        distiller_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(distiller_runs)").fetchall()
+        }
+        if "items_quarantined" not in distiller_columns:
+            return True
         stored_version = self.get_meta("schema_version")
         stored_dimension = self.get_meta("embedding_dimension")
         stored_backend = self.get_meta("vector_backend")
@@ -486,6 +493,7 @@ class SQLiteNodeStore:
                 transcripts_skipped INTEGER NOT NULL,
                 items_extracted INTEGER NOT NULL,
                 items_invalid INTEGER NOT NULL,
+                items_quarantined INTEGER NOT NULL DEFAULT 0,
                 decider_creates INTEGER NOT NULL,
                 decider_complements INTEGER NOT NULL,
                 decider_supersedes INTEGER NOT NULL,
@@ -536,6 +544,14 @@ class SQLiteNodeStore:
         if "route" not in columns:
             # Existing rows predate route attribution; NULL = legacy/unknown.
             connection.execute("ALTER TABLE write_memory_events ADD COLUMN route TEXT")
+        distiller_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(distiller_runs)").fetchall()
+        }
+        if "items_quarantined" not in distiller_columns:
+            connection.execute(
+                "ALTER TABLE distiller_runs ADD COLUMN items_quarantined INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _ensure_node_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -1423,10 +1439,10 @@ class SQLiteNodeStore:
                 INSERT INTO distiller_runs (
                     started_at, completed_at, duration_ms,
                     transcripts_scanned, transcripts_distilled, transcripts_skipped,
-                    items_extracted, items_invalid,
+                    items_extracted, items_invalid, items_quarantined,
                     decider_creates, decider_complements, decider_supersedes, decider_downgrades,
                     llm_failures, archived_transcripts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metrics.started_at,
@@ -1437,6 +1453,7 @@ class SQLiteNodeStore:
                     metrics.transcripts_skipped,
                     metrics.items_extracted,
                     metrics.items_invalid,
+                    metrics.items_quarantined,
                     metrics.decider_creates,
                     metrics.decider_complements,
                     metrics.decider_supersedes,
