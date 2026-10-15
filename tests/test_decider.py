@@ -76,6 +76,43 @@ def test_decide_memory_write_uses_openai_compatible_completion_payload() -> None
     assert "authorization" not in captured["headers"]
 
 
+def test_endpoint_extra_bodies_are_isolated_to_selected_endpoint() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((str(request.url), json.loads(request.content)))
+        return _completion_response('{"ok":true}')
+
+    settings = DeciderSettings(
+        endpoints=[
+            {
+                "base_url": "http://primary.example/v1",
+                "model": "primary-model",
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            },
+            {
+                "base_url": "http://fallback.example/v1",
+                "model": "fallback-model",
+                "extra_body": {"top_p": 0.5},
+            },
+        ]
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        decider = LocalLLMDecider(settings, client=client)
+        decider.sample_json(prompt="{}", system_prompt="")
+        decider.sample_json(prompt="{}", system_prompt="")
+
+    assert [call[0] for call in calls] == [
+        "http://primary.example/v1/chat/completions",
+        "http://fallback.example/v1/chat/completions",
+    ]
+    assert calls[0][1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "top_p" not in calls[0][1]
+    assert calls[1][1]["top_p"] == 0.5
+    assert "chat_template_kwargs" not in calls[1][1]
+
+
+
 def test_decider_fails_over_to_second_endpoint_and_api_key(monkeypatch) -> None:
     calls: list[tuple[str, dict[str, Any], str | None]] = []
 
@@ -89,7 +126,7 @@ def test_decider_fails_over_to_second_endpoint_and_api_key(monkeypatch) -> None:
     monkeypatch.setenv("FALLBACK_KEY", "secret-key")
     settings = DeciderSettings(
         endpoints=[
-            {"base_url": "http://primary.example/v1", "model": "primary-model"},
+            {"base_url": "http://primary.example/v1", "model": "primary-model", "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
             {
                 "base_url": "http://fallback.example/v1",
                 "model": "fallback-model",
@@ -109,6 +146,8 @@ def test_decider_fails_over_to_second_endpoint_and_api_key(monkeypatch) -> None:
     ]
     assert calls[0][1]["model"] == "primary-model"
     assert calls[1][1]["model"] == "fallback-model"
+    assert calls[0][1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in calls[1][1]
     assert calls[0][2] is None
     assert calls[1][2] == "Bearer secret-key"
     primary = metrics["primary-model@http://primary.example/v1"]

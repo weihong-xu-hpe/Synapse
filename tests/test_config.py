@@ -225,6 +225,7 @@ endpoint_max_concurrency = 4
 base_url = "http://primary.example/v1"
 model = "primary-model"
 api_key_env = "PRIMARY_KEY"
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
 
 [[decider.endpoints]]
 base_url = "http://fallback.example/v1"
@@ -246,10 +247,30 @@ api_key_env = "FALLBACK_KEY"
     assert [endpoint.api_key_env for endpoint in config.decider.endpoints] == [
         "PRIMARY_KEY", "FALLBACK_KEY"
     ]
+    assert config.decider.endpoints[0].extra_body == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert config.decider.endpoints[1].extra_body == {}
     assert config.decider.timeout_seconds == 17
     assert config.decider.max_tokens == 321
     assert config.decider.temperature == 0.25
     assert config.decider.endpoint_max_concurrency == 4
+
+
+def test_endpoint_extra_body_rejects_completion_field_overrides(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '''
+[[decider.endpoints]]
+base_url = "http://primary.example/v1"
+model = "primary-model"
+extra_body = { model = "wrong-model" }
+'''.strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="extra_body cannot override completion fields: model"):
+        load_config(config_path)
 
 
 def test_load_config_parses_dreamer_block(tmp_path: Path) -> None:

@@ -36,12 +36,12 @@ class LocalLLMDecider:
     def __init__(self, settings: DeciderSettings, *, client: httpx.Client | None = None) -> None:
         self.settings = settings
         self._client = client or httpx.Client(timeout=settings.timeout_seconds)
-        self._endpoints = tuple(
-            dict.fromkeys(
-                (endpoint.base_url.rstrip("/"), endpoint.model, endpoint.api_key_env)
-                for endpoint in settings.endpoints
-            )
-        )
+        endpoints: dict[tuple[str, str, str, str], tuple[str, str, str, dict[str, Any]]] = {}
+        for endpoint in settings.endpoints:
+            base_url = endpoint.base_url.rstrip("/")
+            key = (base_url, endpoint.model, endpoint.api_key_env, json.dumps(endpoint.extra_body, sort_keys=True))
+            endpoints.setdefault(key, (base_url, endpoint.model, endpoint.api_key_env, endpoint.extra_body))
+        self._endpoints = tuple(endpoints.values())
         self._endpoint_limit = settings.endpoint_max_concurrency
         self._routing = threading.Condition()
         self._active = [0] * len(self._endpoints)
@@ -169,7 +169,7 @@ class LocalLLMDecider:
             self._routing.notify_all()
 
     def _record_endpoint_call(self, index: int, *, elapsed_ms: float, succeeded: bool) -> None:
-        base_url, model, _api_key_env = self._endpoints[index]
+        base_url, model, _api_key_env, _extra_body = self._endpoints[index]
         key = f"{model}@{base_url}"
         context = self._call_context.get()
         with self._metrics_lock:
@@ -224,7 +224,7 @@ class LocalLLMDecider:
         while len(attempted) < len(self._endpoints):
             index = self._acquire_endpoint(attempted)
             attempted.add(index)
-            base_url, model, api_key_env = self._endpoints[index]
+            base_url, model, api_key_env, extra_body = self._endpoints[index]
             started = perf_counter()
             call_context = self._call_context.get()
             timeout_seconds = (
@@ -241,6 +241,7 @@ class LocalLLMDecider:
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
                     timeout_seconds=timeout_seconds,
+                    extra_body=extra_body,
                 )
                 result = parser(response_payload)
             except Exception as exc:  # count every endpoint attempt, then fail over only on transport/5xx
@@ -271,6 +272,7 @@ class LocalLLMDecider:
         max_tokens: int,
         timeout_seconds: int,
         reasoning_effort: str | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Accept": "application/json",
@@ -292,6 +294,13 @@ class LocalLLMDecider:
         # when explicitly configured ([distiller].reasoning_effort).
         if reasoning_effort is not None:
             body["reasoning_effort"] = reasoning_effort
+        if extra_body:
+            protected = {"model", "messages", "max_tokens", "response_format"}
+            conflicts = protected.intersection(extra_body)
+            if conflicts:
+                names = ", ".join(sorted(conflicts))
+                raise ValueError(f"extra_body cannot override completion fields: {names}")
+            body.update(extra_body)
         response = self._client.post(
             f"{base_url.rstrip('/')}{_CHAT_COMPLETIONS_PATH}",
             headers=headers,

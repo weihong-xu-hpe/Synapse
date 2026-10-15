@@ -90,6 +90,8 @@ temperature = 0.0
 base_url = "http://localhost:8000/v1"
 model = "deepseek-v4-pro"
 api_key_env = ""
+# Optional per-endpoint JSON request fields; applied only when this endpoint is called.
+# extra_body = { chat_template_kwargs = { enable_thinking = false } }
 
 [dreamer]
 enabled = true
@@ -225,7 +227,7 @@ Controls local log rotation and file-size limits.
 Controls the local OpenAI-compatible LLM pool used for sampling decisions (write-path triage, link weaving, conflict resolution) and distillation.
 
 - `provider` — currently `local_llm` (OpenAI-compatible HTTP)
-- `endpoints` — one or more `[[decider.endpoints]]` entries, each with `base_url`, `model`, and optional `api_key_env`; requests are assigned least-busy with round-robin tie-breaking, and connection/DNS/timeout/5xx failures fail over to another endpoint
+- `endpoints` — one or more `[[decider.endpoints]]` entries, each with `base_url`, `model`, optional `api_key_env`, and optional `extra_body`; `extra_body` is merged into only that endpoint's completion request, including after failover. It cannot override `model`, `messages`, `max_tokens`, or `response_format`.
 - `endpoint_max_concurrency` (int, 1–64, default `30`) — maximum simultaneous HTTP requests to each endpoint; the cap is independent per endpoint
 - `timeout_seconds` — HTTP timeout per endpoint for write-path decisions. Distiller extraction/reduce/title-repair use `[distiller].llm_timeout_seconds`; each distiller write decision returns to this timeout.
 - `max_tokens` (default `200000`) — generation token budget; keep it high enough for reasoning plus the structured answer rather than imposing a tight cap

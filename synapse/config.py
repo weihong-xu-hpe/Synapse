@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
@@ -199,6 +199,16 @@ class DeciderEndpointSettings(BaseModel):
     base_url: str
     model: str
     api_key_env: str = ""
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def reject_completion_field_overrides(self) -> "DeciderEndpointSettings":
+        protected = {"model", "messages", "max_tokens", "response_format"}
+        conflicts = protected.intersection(self.extra_body)
+        if conflicts:
+            names = ", ".join(sorted(conflicts))
+            raise ValueError(f"extra_body cannot override completion fields: {names}")
+        return self
 
 
 class DeciderSettings(BaseModel):
