@@ -204,6 +204,7 @@ warnings; later: codes marked ⛔ reject):
 | `okf_missing_sources` ⛔ | frontmatter `sources` empty/absent |
 | `okf_unresolvable_source` | a `sources` entry is neither a resolvable node id nor a URI/session key/`skill://<name>` |
 | `okf_missing_section:<Name>` ⛔ | a required section for the type (§3) absent or empty |
+| `okf_duplicate_section:<Name>` ⛔ | a `## <Name>` heading occurs more than once (case-insensitive) |
 | `okf_takeaway_invalid` | `## Takeaway` missing, multi-line, or first line > 200 chars |
 | `okf_takeaway_missing` ⛔ | `## Takeaway` section absent |
 | `okf_heading_case` | required heading present but case/format deviates (auto-fixable) |
@@ -216,6 +217,11 @@ Rules are checked in order; a node conforming for its type produces zero warning
 never fire warnings — only headings are checked (fixed English strings `## Takeaway`, `## Context`,
 `## Decision`, `## Consequences`, `## Details`, `## Steps`, `## Symptom`, `## Cause`, `## Fix`,
 `## Sources`).
+
+Non-distiller writes retain warning-only transition behavior. Distiller writes validate the
+final persisted body after link/merge construction, attempt one structure repair, and skip
+the item (leaving its transcript retryable) if it still fails. Recorded warning codes are
+recomputed from the final body.
 
 ## 7. Title rule & ID plan
 
@@ -280,6 +286,7 @@ Owner decision C — **annotate, never auto-inject**. Distilled items carry an
   `12-18:`) stripped, so a quote that drops the numbering still verifies.
   Assistant prose never counts for any type; in v1 transcripts (no tool blocks)
   only User turns are eligible. Quotes from any other text stay unverified.
+- A User turn containing only an interrogative cannot verify an answer/hypothesis by itself; its quote is retained as unverified unless another assertive eligible source supports the claim.
 - Verified items get frontmatter `verified: true` and a `## Evidence` section
   (`- T12: "quote"`). Unverifiable items are still written with `verified: false`
   and their (unverifiable) evidence listed.
@@ -320,9 +327,11 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
   transcripts at once (default 4), refilling free slots from the pending idle
   backlog up to `[distiller].max_transcripts_per_run` (default 500). Write
   decisions are prepared concurrently, while each near-duplicate check and
-  store commit is serialized and checks the latest committed nodes. The endpoint
-  pool assigns calls least-busy across configured backends and independently
-  caps in-flight calls per endpoint.
+  store commit is serialized and checks the latest nodes. Exact normalized
+  takeaway matches merge into the existing node; a supersede is downgraded to
+  complement when it would lose target anchors or create a second lineage pointer.
+  The endpoint pool assigns calls least-busy across configured backends and
+  independently caps in-flight requests per endpoint.
 - Progress watermark: `distilled_turn` on the transcript frontmatter records the
   last turn covered; a re-distill after new turns arrive processes only later
   turns (one previous turn as context). `distilled_hash` semantics are unchanged.

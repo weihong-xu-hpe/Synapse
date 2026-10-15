@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from contextlib import nullcontext
 
 from synapse.embedding import create_embedding_engine
 from synapse.indexing import collect_health_status
@@ -44,6 +45,60 @@ _REDACTED_FIELDS = {"auth_token", "authorization", "content"}
 _SUPERSEDES_REASON_PATTERN = re.compile(r"^> \*\*Supersedes\*\*: \[\[[^\]]+\]\](?: — (?P<reason>.+))?$")
 _INVALID_TITLE_MESSAGE = "Node title must not be blank"
 _ACTIVE_ARCHITECTURE_DOC = "docs/design/streamable-mcp-single-path-architecture.md"
+
+_SUPERSEDE_LOCK = threading.RLock()
+
+
+def _normalize_supersede_anchor(value: str) -> str:
+    return " ".join(value.split()).casefold().replace("–", "-").replace("—", "-").replace("×", "x")
+
+
+def _supersede_anchor_tokens(content: str) -> set[str]:
+    """Extract non-provenance literals that must survive a supersede."""
+
+    import re
+
+    semantic = re.split(r"(?m)^## (?:Evidence|Sources|Related)\s*$", content, maxsplit=1)[0]
+    numeric_text = re.sub(r"`[^`]*`", " ", semantic)
+    numeric_text = re.sub(
+        r"\b[A-Za-z][A-Za-z0-9._:/-]*\d[A-Za-z0-9._:/-]*\b",
+        " ",
+        numeric_text,
+    )
+    anchors = {
+        str(number)
+        for number in re.findall(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?%?(?![A-Za-z0-9])", numeric_text)
+    }
+    anchors.update(
+        re.findall(
+            r"(?<![A-Za-z0-9])-?\d+(?:\.\d+)?(?:\s*[–—-]\s*\d+(?:\.\d+)?)?\s*(?:ms|milliseconds?|seconds?|secs?|sec|s|minutes?|mins?|min|m|hours?|h|days?|d)\b",
+            semantic,
+            flags=re.IGNORECASE,
+        )
+    )
+    anchors.update(
+        re.findall(
+            r"(?<![A-Za-z0-9:/])(?:/)?(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?",
+            semantic,
+        )
+    )
+    for code_span in re.findall(r"`([^`]+)`", semantic):
+        anchors.update(re.findall(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", code_span))
+    anchors.update(
+        re.findall(r"\b(?:[A-Za-z][A-Za-z0-9._:/-]*\d[A-Za-z0-9._:/-]*|[a-z]+[A-Z][A-Za-z0-9]*)\b", semantic)
+    )
+    return {_normalize_supersede_anchor(anchor) for anchor in anchors if anchor}
+
+
+def _missing_supersede_anchors(old_content: str, new_content: str) -> list[str]:
+    candidate = _normalize_supersede_anchor(new_content)
+    missing: list[str] = []
+    for anchor in sorted(_supersede_anchor_tokens(old_content)):
+        # Token boundaries prevent a short numeric anchor from matching a larger value.
+        pattern = rf"(?<![a-z0-9]){re.escape(anchor)}(?![a-z0-9])"
+        if re.search(pattern, candidate) is None:
+            missing.append(anchor)
+    return missing
 
 
 def _query_cjk_ratio(text: str) -> float:
@@ -280,6 +335,7 @@ class SynapseServerService:
         project: str | None = None,
         node_id: str | None = None,
         verified: bool | None = None,
+        validate_okf: bool = False,
     ) -> dict[str, Any]:
         """Execute an explicit memory write action decided by the higher-level orchestration layer.
 
@@ -309,6 +365,15 @@ class SynapseServerService:
         else:  # SUPERSEDE or COMPLEMENT — reference targets in the body too
             all_links = self._normalize_links([*normalized_links, *resolved_target_ids])
         linked_content = self._embed_links(content, all_links)
+        okf_warnings: list[dict[str, str]] = []
+        if validate_okf and normalized_type is NodeType.PERSISTENT:
+            linked_content, okf_warnings = self._validate_distiller_final_body(
+                title=clean_title,
+                content=linked_content,
+                okf_type=okf_type,
+                sources=list(sources or []),
+                links=all_links,
+            )
 
         # Validate that all referenced targets exist before writing anything.
         target_nodes = self._load_nodes(resolved_target_ids) if resolved_target_ids else []
@@ -351,38 +416,52 @@ class SynapseServerService:
         supersession_reasons: dict[str, str | None] = {}
 
         if normalized_action is IntegrateAction.SUPERSEDE:
-            # Key by the NEW node's ID so write_node_file emits the annotation.
-            supersession_reasons = {node_id: normalized_reasoning}
-            updated_existing = [
-                existing.model_copy(
-                    update={
-                        "metadata": existing.metadata.model_copy(
-                            update={
-                                "status": NodeStatus.SUPERSEDED,
-                                "superseded_by": node_id,
-                            }
-                        )
-                    }
+            with _SUPERSEDE_LOCK:
+                # Re-read and validate every target while holding the same lock as
+                # the lineage updates; competing supersedes cannot claim a target.
+                target_nodes = self._load_nodes(resolved_target_ids)
+                conflicts = [
+                    target.id
+                    for target in target_nodes
+                    if target.metadata.status is not NodeStatus.ACTIVE or target.metadata.superseded_by
+                ]
+                if conflicts:
+                    raise SynapseServiceError(
+                        "INVALID_TARGET",
+                        "supersede targets must be ACTIVE and not already superseded",
+                        status_code=409,
+                        details={"conflicting_target_node_ids": conflicts},
+                    )
+                supersession_reasons = {node_id: normalized_reasoning}
+                updated_existing = [
+                    existing.model_copy(
+                        update={
+                            "metadata": existing.metadata.model_copy(
+                                update={
+                                    "status": NodeStatus.SUPERSEDED,
+                                    "superseded_by": node_id,
+                                }
+                            )
+                        }
+                    )
+                    for existing in target_nodes
+                ]
+                sync_result = self._persist_nodes(
+                    [new_node, *updated_existing],
+                    supersession_reasons=supersession_reasons,
                 )
-                for existing in target_nodes
-            ]
+        else:
+            if normalized_action is IntegrateAction.COMPLEMENT:
+                updated_existing = [
+                    existing.model_copy(update={"content": updated_content})
+                    for existing in target_nodes
+                    for updated_content in [self._embed_links(existing.content, [node_id])]
+                    if updated_content != existing.content
+                ]
+            sync_result = self._persist_nodes([new_node, *updated_existing])
 
-        elif normalized_action is IntegrateAction.COMPLEMENT:
-            updated_existing = [
-                existing.model_copy(update={"content": updated_content})
-                for existing in target_nodes
-                for updated_content in [self._embed_links(existing.content, [node_id])]
-                if updated_content != existing.content
-            ]
-
-        sync_result = self._persist_nodes(
-            [new_node, *updated_existing],
-            supersession_reasons=supersession_reasons,
-        )
         stored_node = self._load_node(node_id)
-        refreshed_updated = (
-            self._load_nodes([node.id for node in updated_existing]) if updated_existing else []
-        )
+        refreshed_updated = self._load_nodes([node.id for node in updated_existing]) if updated_existing else []
 
         payload = {
             "node": self._serialize_node(stored_node),
@@ -391,6 +470,7 @@ class SynapseServerService:
             "target_node_ids": resolved_target_ids,
             "reasoning": normalized_reasoning,
             "sync": self._serialize_sync_result(sync_result),
+            "okf_warnings": okf_warnings,
         }
         self._log_tool_call(
             "integrate_knowledge",
@@ -485,6 +565,7 @@ class SynapseServerService:
         sources: list[str],
         verified: bool | None,
         route: str | None,
+        okf_type: str | None = None,
     ) -> dict[str, Any]:
         """Merge-update an existing node IN PLACE (near-duplicate gate).
 
@@ -503,10 +584,52 @@ class SynapseServerService:
                 details={"merge_update_target": target_id},
             )
         merged_sources = list(dict.fromkeys([*existing.metadata.sources, *sources]))
+        effective_okf_type = existing.metadata.okf_type or okf_type
+        if route == "distiller":
+            content, okf_warnings = self._validate_distiller_final_body(
+                title=existing.title,
+                content=content,
+                okf_type=effective_okf_type,
+                sources=merged_sources,
+                links=[],
+            )
+        else:
+            okf_warnings = self._okf_write_warnings(
+                existing.title,
+                content,
+                okf_type=effective_okf_type,
+                sources=merged_sources,
+            )
         merged_metadata = existing.metadata.model_copy(
-            update={"sources": merged_sources, "verified": verified if verified is not None else existing.metadata.verified}
+            update={
+                "sources": merged_sources,
+                "okf_type": effective_okf_type,
+                "okf_version": existing.metadata.okf_version or (1 if okf_type else None),
+                "verified": verified if verified is not None else existing.metadata.verified,
+            }
         )
         node = existing.model_copy(update={"content": content, "metadata": merged_metadata})
+        if node.content == existing.content and node.metadata == existing.metadata:
+            self._record_route_write_event(
+                node_id=target_id,
+                node_type=existing.metadata.type.value,
+                action="unchanged",
+                route=route,
+                warning_codes=[warning["code"] for warning in okf_warnings],
+            )
+            payload = {
+                "node": self._serialize_node(existing),
+                "action": "unchanged",
+                "merged_into": target_id,
+                "okf_warnings": okf_warnings,
+            }
+            self._log_tool_call(
+                "write_memory_merge_update",
+                {"merge_update_target": target_id, "title": title.strip()},
+                payload,
+            )
+            return payload
+
         absolute_path = write_node_file(node, base_path=self.runtime_paths.base)
         sync_result = self._sync_paths([absolute_path])
         stored_node = self._load_node(target_id)
@@ -516,11 +639,13 @@ class SynapseServerService:
             node_type=stored_node.metadata.type.value,
             action="updated",
             route=route,
+            warning_codes=[warning["code"] for warning in okf_warnings],
         )
         payload = {
             "node": self._serialize_node(stored_node),
             "action": "updated",
             "merged_into": target_id,
+            "okf_warnings": okf_warnings,
         }
         if sync_result is not None:
             payload["sync"] = self._serialize_sync_result(sync_result)
@@ -751,6 +876,7 @@ class SynapseServerService:
                 title=title,
                 sources=sources or [],
                 verified=verified,
+                okf_type=okf_type,
                 route=route,
             )
         downgrade_note: dict[str, Any] | None = None
@@ -783,24 +909,72 @@ class SynapseServerService:
                     "message": f"Supersede of curated nodes {curated_targets} downgraded to complement.",
                 }
             )
-
-        try:
-            integrate_result = self.integrate_knowledge(
-                title=clean_title,
-                content=content,
-                node_type=node_type,
-                links=links,
-                sensitivity=sensitivity,
-                action=decision_payload["action"],
-                target_node_ids=decision_payload["target_node_ids"],
-                reasoning=decision_payload["reasoning"],
-                okf_type=okf_type,
-                okf_version=okf_version,
-                sources=sources,
-                project=project,
-                node_id=node_id,
-                verified=verified,
+            self.logger.warning(
+                "Supersede downgraded to complement",
+                extra={"target_node_ids": list(decision_payload["target_node_ids"]), "reason": downgrade_note["reason"]},
             )
+
+
+        integrate_kwargs = {
+            "title": clean_title,
+            "content": content,
+            "node_type": node_type,
+            "links": links,
+            "sensitivity": sensitivity,
+            "action": decision_payload["action"],
+            "target_node_ids": decision_payload["target_node_ids"],
+            "reasoning": decision_payload["reasoning"],
+            "okf_type": okf_type,
+            "okf_version": okf_version,
+            "sources": sources,
+            "project": project,
+            "node_id": node_id,
+            "verified": verified,
+            "validate_okf": route == "distiller",
+        }
+        lineage_lock = _SUPERSEDE_LOCK if decision_payload.get("action") == "supersede" else nullcontext()
+        try:
+            with lineage_lock:
+                if decision_payload.get("action") == "supersede":
+                    target_nodes = self._load_nodes(list(decision_payload["target_node_ids"]))
+                    conflicts = [
+                        target.id
+                        for target in target_nodes
+                        if target.metadata.status is not NodeStatus.ACTIVE or target.metadata.superseded_by
+                    ]
+                    missing_anchors = {
+                        target.id: _missing_supersede_anchors(target.content, content)
+                        for target in target_nodes
+                    }
+                    missing_anchors = {node_id: anchors for node_id, anchors in missing_anchors.items() if anchors}
+                    if conflicts or missing_anchors:
+                        decision_payload["action"] = "complement"
+                        integrate_kwargs["action"] = "complement"
+                        reason = (
+                            f"supersede downgraded to complement; target lineage already claimed: {conflicts}"
+                            if conflicts
+                            else f"supersede downgraded to complement; unique target anchors omitted: {missing_anchors}"
+                        )
+                        downgrade_note = {
+                            "original_action": "supersede",
+                            "target_node_ids": list(decision_payload["target_node_ids"]),
+                            "reason": reason,
+                        }
+                        warnings.append({
+                            "code": "okf_supersede_downgraded_lineage" if conflicts else "okf_supersede_downgraded_lossy",
+                            "message": reason,
+                        })
+                        self.logger.warning(
+                            "Supersede downgraded to complement",
+                            extra={"target_node_ids": list(decision_payload["target_node_ids"]), "reason": reason},
+                        )
+
+                    else:
+                        integrate_kwargs["sources"] = list(dict.fromkeys([
+                            *(sources or []),
+                            *(source for target in target_nodes for source in target.metadata.sources),
+                        ]))
+                integrate_result = self.integrate_knowledge(**integrate_kwargs)
         except SynapseServiceError as exc:
             self._record_write_memory_metrics(
                 node_id=None,
@@ -823,6 +997,19 @@ class SynapseServerService:
                 },
             ) from exc
 
+        if route == "distiller" and isinstance(integrate_result, dict):
+            supersede_warnings = [
+                warning
+                for warning in warnings
+                if warning.get("code") in {
+                    "okf_supersede_downgraded",
+                    "okf_supersede_downgraded_lineage",
+                    "okf_supersede_downgraded_lossy",
+                }
+            ]
+            warnings = [warning for warning in warnings if not warning.get("code", "").startswith("okf_")]
+            warnings.extend(integrate_result.get("okf_warnings", []))
+            warnings.extend(supersede_warnings)
         node_payload = integrate_result.get("node") if isinstance(integrate_result, dict) else None
         written_node_id = str(node_payload.get("id")) if isinstance(node_payload, dict) else None
         self._record_write_memory_metrics(
@@ -1026,6 +1213,7 @@ class SynapseServerService:
         node_type: str,
         action: str,
         route: str | None,
+        warning_codes: list[str] | tuple[str, ...] = (),
     ) -> None:
         """Record a lightweight write event with route attribution (no decider evidence)."""
 
@@ -1039,7 +1227,7 @@ class SynapseServerService:
                         action=action,
                         candidate_count=0,
                         similarity_threshold=0.0,
-                        warning_codes=(),
+                        warning_codes=tuple(warning_codes),
                         sampling_provider="",
                         execution_succeeded=True,
                         route=route,
@@ -1374,6 +1562,111 @@ class SynapseServerService:
         findings = validate_okf_node(node_type="persistent", content=content, okf_type=okf_type, sources=sources, title=title)
         return [{"code": w.code, "message": w.message} for w in findings]
 
+    def _validate_distiller_final_body(
+        self,
+        *,
+        title: str,
+        content: str,
+        okf_type: str | None,
+        sources: list[str] | None,
+        links: list[str],
+    ) -> tuple[str, list[dict[str, str]]]:
+        """Validate the exact body about to persist; repair structural defects once."""
+
+        from synapse.okf import validate_okf_node
+
+        linked_content = self._embed_links(content, links)
+        findings = validate_okf_node(
+            node_type="persistent",
+            content=linked_content,
+            okf_type=okf_type,
+            sources=sources,
+            title=title,
+        )
+
+        def structural_errors(items):
+            return [
+                finding
+                for finding in items
+                if finding.code == "okf_takeaway_invalid"
+                or finding.code.startswith("okf_missing_section:")
+                or finding.code.startswith("okf_duplicate_section:")
+            ]
+
+        errors = structural_errors(findings)
+        if errors:
+            prompt = (
+                "Repair this persistent OKF body so it satisfies the supplied validation findings. "
+                "Preserve every supported fact, number, path, model identifier, source, and evidence quote; "
+                "do not add claims. Return one JSON object with a single `content` string.\n\n"
+                + json.dumps(
+                    {
+                        "title": title,
+                        "okf_type": okf_type,
+                        "sources": sources or [],
+                        "content": linked_content,
+                        "findings": [finding.as_dict() for finding in errors],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            self.logger.info(
+                "Distiller final OKF validation repair attempted",
+                extra={"title": title, "okf_type": okf_type, "warning_codes": [finding.code for finding in errors]},
+            )
+            try:
+                repaired = self._normalizer_sampling_client().sample_json(
+                    prompt=prompt,
+                    system_prompt="",
+                    max_tokens=self.config.decider.max_tokens,
+                )
+            except Exception as exc:  # noqa: BLE001 — one repair attempt, then caller leaves transcript retryable
+                self.logger.warning(
+                    "Distiller final OKF validation repair call failed",
+                    extra={"title": title, "okf_type": okf_type, "error": str(exc)},
+                )
+                raise SynapseServiceError(
+                    "INVALID_OKF_FINAL_BODY",
+                    "Final distilled OKF body failed validation and its single repair attempt failed",
+                    status_code=422,
+                    details={"warnings": [finding.as_dict() for finding in errors], "repair_error": str(exc)},
+                ) from exc
+            repaired_content = repaired.get("content") if isinstance(repaired, dict) else None
+            if not isinstance(repaired_content, str) or not repaired_content.strip():
+                raise SynapseServiceError(
+                    "INVALID_OKF_FINAL_BODY",
+                    "Final distilled OKF body repair did not return content",
+                    status_code=422,
+                    details={"warnings": [finding.as_dict() for finding in errors]},
+                )
+            self.logger.info(
+                "Distiller final OKF validation repair returned a candidate",
+                extra={"title": title, "okf_type": okf_type},
+            )
+            linked_content = self._embed_links(repaired_content, links)
+            findings = validate_okf_node(
+                node_type="persistent",
+                content=linked_content,
+                okf_type=okf_type,
+                sources=sources,
+                title=title,
+            )
+            errors = structural_errors(findings)
+            if errors:
+                self.logger.warning(
+                    "Distiller final OKF validation failed after repair",
+                    extra={"title": title, "okf_type": okf_type, "warning_codes": [finding.code for finding in errors]},
+                )
+                raise SynapseServiceError(
+                    "INVALID_OKF_FINAL_BODY",
+                    "Final distilled OKF body remains invalid after one repair attempt",
+                    status_code=422,
+                    details={"warnings": [finding.as_dict() for finding in errors]},
+                )
+        return linked_content, [
+            {"code": finding.code, "message": finding.message}
+            for finding in findings
+        ]
     def _decide_memory_write_payload(
         self,
         *,

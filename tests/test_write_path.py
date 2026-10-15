@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 from synapse.config import SynapseConfig, load_config
-from synapse.server.service import SynapseServerService
+from synapse.models import NodeStatus, NodeType
+from synapse.server.sampling import MemoryWriteSamplingDecision
+from synapse.okf import validate_okf_node
+from synapse.server.service import SynapseServiceError, SynapseServerService
 from synapse.storage import SQLiteNodeStore
 from synapse.utils.runtime import RuntimePaths, bootstrap_runtime_directories
 
@@ -192,3 +199,324 @@ def test_integrate_knowledge_supports_chain_supersession_without_losing_history(
     assert f"> **Supersedes**: [[{alpha_id}]] — Version 2 replaced version 1." in beta_markdown
     assert f"> ⚠️ **SUPERSEDED** by [[{gamma_id}]]" in beta_markdown
 
+
+
+def test_distiller_write_repairs_final_body_and_records_final_warnings(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    class RepairClient:
+        name = "repair-test"
+
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, **_kwargs):
+            assert "Repair this persistent OKF body" in prompt
+            self.repairs += 1
+            return {
+                "content": (
+                    "## Takeaway\nKeep the final persisted body valid.\n\n"
+                    "## Details\nThe repaired body retains the complete fact.\n\n"
+                    "## Sources\n- mem_session_repair"
+                )
+            }
+
+        def decide_memory_write(self, _request):
+            return MemoryWriteSamplingDecision(
+                action="create", target_node_ids=(), reasoning="new fact", confidence=0.9
+            )
+
+    client = RepairClient()
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=client)
+    result = service.write_memory(
+        title="Final OKF validation repairs incomplete facts",
+        content="## Takeaway\nKeep the final persisted body valid.\n\n## Sources\n- mem_session_repair",
+        node_type=NodeType.PERSISTENT,
+        okf_type="fact",
+        sources=["mem_session_repair"],
+        route="distiller",
+    )
+    node_payload = result["execution"]["result"]["node"]
+    assert client.repairs == 1
+    assert result["warnings"] == []
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+        node = store.get_node(node_payload["id"])
+        event = store.connection.execute(
+            "SELECT warning_codes FROM write_memory_events WHERE node_id = ? AND route = 'distiller' ORDER BY id DESC LIMIT 1",
+            (node_payload["id"],),
+        ).fetchone()
+    assert node is not None and event is not None
+    assert not validate_okf_node(
+        node_type="persistent",
+        content=node.content,
+        okf_type=node.metadata.okf_type,
+        sources=node.metadata.sources,
+        title=node.title,
+    )
+    assert json.loads(event["warning_codes"]) == []
+
+
+@pytest.mark.parametrize(
+    ("okf_type", "action", "draft", "repaired"),
+    [
+        (
+            "fact",
+            "complement",
+            "## Takeaway\nKeep the final fact complete.\n\n## Sources\n- mem_session_gate",
+            "## Takeaway\nKeep the final fact complete.\n\n## Details\nThe final fact retains its supported detail.\n\n## Sources\n- mem_session_gate",
+        ),
+        (
+            "procedure",
+            "supersede",
+            "## Takeaway\nKeep the final procedure complete.\n\n## Sources\n- mem_session_gate",
+            "## Takeaway\nKeep the final procedure complete.\n\n## Steps\n1. Apply the supported procedure.\n\n## Sources\n- mem_session_gate",
+        ),
+        (
+            "decision",
+            "complement",
+            "## Takeaway\nPreserve the decision consequences.\n\n## Context\nThe system needs a stable policy.\n\n## Decision\nUse the approved policy.\n\n## Consequences\n\n## Consequences\nDuplicate heading.\n\n## Sources\n- mem_session_gate",
+            "## Takeaway\nPreserve the decision consequences.\n\n## Context\nThe system needs a stable policy.\n\n## Decision\nUse the approved policy.\n\n## Consequences\nThe policy remains stable.\n\n## Sources\n- mem_session_gate",
+        ),
+        (
+            "fact",
+            "supersede",
+            f"## Takeaway\n{'x' * 201}\n\n## Details\nKeep the complete fact.\n\n## Sources\n- mem_session_gate",
+            "## Takeaway\nKeep the final fact under the character limit.\n\n## Details\nKeep the complete fact.\n\n## Sources\n- mem_session_gate",
+        ),
+    ],
+)
+def test_distiller_repairs_final_complement_and_supersede_bodies(
+    tmp_path: Path, okf_type: str, action: str, draft: str, repaired: str
+) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    target_type = "fact"
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    target = service.integrate_knowledge(
+        title="Existing knowledge retained by gate",
+        content="## Takeaway\nExisting knowledge remains available.\n\n## Details\nKeep the old node active until a valid write.\n\n## Sources\n- mem_session_old",
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type=target_type,
+        sources=["mem_session_old"],
+    )
+    target_id = target["node"]["id"]
+
+    class RepairClient:
+        name = "final-body-repair-test"
+
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def sample_json(self, *, prompt: str, **_kwargs):
+            assert "Repair this persistent OKF body" in prompt
+            self.repairs += 1
+            return {"content": repaired}
+
+        def decide_memory_write(self, _request):
+            return MemoryWriteSamplingDecision(
+                action=action,
+                target_node_ids=(target_id,),
+                reasoning="retain complete lineage",
+                confidence=0.9,
+            )
+
+    client = RepairClient()
+    service.sampling_client = client
+    result = service.write_memory(
+        title=f"Final {okf_type} body repair",
+        content=draft,
+        node_type=NodeType.PERSISTENT,
+        okf_type=okf_type,
+        sources=["mem_session_gate"],
+        route="distiller",
+    )
+    node_payload = result["execution"]["result"]["node"]
+    assert client.repairs == 1
+    assert result["decision"]["action"] == action
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+        node = store.get_node(node_payload["id"])
+        event = store.connection.execute(
+            "SELECT warning_codes FROM write_memory_events WHERE node_id = ? AND route = 'distiller' ORDER BY id DESC LIMIT 1",
+            (node_payload["id"],),
+        ).fetchone()
+    assert node is not None and event is not None
+    findings = validate_okf_node(
+        node_type="persistent",
+        content=node.content,
+        okf_type=node.metadata.okf_type,
+        sources=node.metadata.sources,
+        title=node.title,
+    )
+    assert not findings
+    assert json.loads(event["warning_codes"]) == [finding.code for finding in findings]
+    assert service.get_node(target_id)["metadata"]["status"] == (
+        "superseded" if action == "supersede" else "active"
+    )
+
+
+@pytest.mark.parametrize("omitted_anchor", ["0.5–2s", "GLM-5.2-fp8", "120s", "/etc/authz/probe.yaml"])
+def test_distiller_supersede_downgrades_when_target_anchors_are_lost(
+    tmp_path: Path, monkeypatch, omitted_anchor: str
+) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    old = service.integrate_knowledge(
+        title="Gateway probe timeout contract",
+        content=(
+            "## Takeaway\nKeep the explicit gateway timeout and model.\n\n"
+            "## Details\nThe probe window is 0.5–2s, timeout is 120s, model is `GLM-5.2-fp8`, "
+            "and the file is `/etc/authz/probe.yaml`.\n\n## Sources\n- mem_session_old"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_old"],
+    )
+    old_id = old["node"]["id"]
+
+    anchors = {
+        "0.5–2s": "The probe window is 0.5–2s.",
+        "GLM-5.2-fp8": "The model is `GLM-5.2-fp8`.",
+        "120s": "The timeout is 120s.",
+        "/etc/authz/probe.yaml": "The file is `/etc/authz/probe.yaml`.",
+    }
+    retained_details = " ".join(
+        description for anchor, description in anchors.items() if anchor != omitted_anchor
+    )
+    monkeypatch.setattr(
+        service,
+        "_decide_memory_write_payload",
+        lambda **_kwargs: {
+            "decision": {
+                "action": "supersede",
+                "target_node_ids": [old_id],
+                "reasoning": "replace with the updated policy",
+            },
+            "evidence": {"candidate_count": 1, "sampling_provider": "fake"},
+        },
+    )
+    result = service.write_memory(
+        title="Updated gateway probe timeout policy",
+        content=(
+            "## Takeaway\nUse the shared gateway probe policy.\n\n"
+            f"## Details\n{retained_details}\n\n## Sources\n- mem_session_new"
+        ),
+        node_type=NodeType.PERSISTENT,
+        okf_type="fact",
+        sources=["mem_session_new"],
+        route="distiller",
+        downgrade_supersede=False,
+    )
+
+    assert result["decision"]["action"] == "complement"
+    assert result["downgrade"]["reason"].startswith("supersede downgraded to complement")
+    old_after = service.get_node(old_id)["metadata"]
+    assert old_after["status"] == "active"
+    assert old_after["superseded_by"] is None
+
+
+def test_concurrent_supersedes_preserve_one_lineage_pointer(tmp_path: Path, monkeypatch) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths)
+    old = service.integrate_knowledge(
+        title="Gateway probe timeout contract",
+        content=(
+            "## Takeaway\nKeep the explicit gateway timeout and model.\n\n"
+            "## Details\nThe probe timeout is 120 seconds, the model is `GLM-5.2-fp8`, "
+            "and the file is `/etc/authz/probe.yaml`.\n\n## Sources\n- mem_session_old"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_old"],
+    )
+    old_id = old["node"]["id"]
+    barrier = threading.Barrier(2)
+
+    def decide(**_kwargs):
+        barrier.wait(timeout=10)
+        return {
+            "decision": {
+                "action": "supersede",
+                "target_node_ids": [old_id],
+                "reasoning": "replace with the updated policy",
+            },
+            "evidence": {"candidate_count": 1, "sampling_provider": "fake"},
+        }
+
+    monkeypatch.setattr(service, "_decide_memory_write_payload", decide)
+
+    def write_variant(variant: str):
+        return service.write_memory(
+            title=f"Updated gateway probe timeout policy {variant}",
+            content=(
+                "## Takeaway\nUse the shared gateway probe policy.\n\n"
+                "## Details\nThe probe timeout is 120 seconds, the model is `GLM-5.2-fp8`, "
+                "and the file is `/etc/authz/probe.yaml`.\n\n"
+                f"Variant: {variant}.\n\n## Sources\n- mem_session_{variant}"
+            ),
+            node_type=NodeType.PERSISTENT,
+            okf_type="fact",
+            sources=[f"mem_session_{variant}"],
+            route="distiller",
+            downgrade_supersede=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write_variant, ("alpha", "beta")))
+
+    decisions = [result["decision"]["action"] for result in results]
+    assert sorted(decisions) == ["complement", "supersede"]
+    superseding = [
+        result["execution"]["result"]["node"]["id"]
+        for result in results
+        if result["decision"]["action"] == "supersede"
+    ]
+    old_metadata = service.get_node(old_id)["metadata"]
+    assert old_metadata["status"] == "superseded"
+    assert old_metadata["superseded_by"] == superseding[0]
+    assert len(superseding) == 1
+
+
+def test_distiller_final_body_is_not_persisted_after_failed_repair(tmp_path: Path) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+
+    class InvalidRepairClient:
+        name = "invalid-repair-test"
+
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, **_kwargs):
+            assert "Repair this persistent OKF body" in prompt
+            self.repairs += 1
+            return {"content": "## Takeaway\nStill invalid.\n\n## Sources\n- mem_session_invalid"}
+
+        def decide_memory_write(self, _request):
+            return MemoryWriteSamplingDecision(
+                action="create", target_node_ids=(), reasoning="new fact", confidence=0.9
+            )
+
+    client = InvalidRepairClient()
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=client)
+    with pytest.raises(SynapseServiceError) as exc_info:
+        service.write_memory(
+            title="Invalid final OKF body is rejected",
+            content="## Takeaway\nInvalid final OKF body is rejected.\n\n## Sources\n- mem_session_invalid",
+            node_type=NodeType.PERSISTENT,
+            okf_type="fact",
+            sources=["mem_session_invalid"],
+            route="distiller",
+        )
+    assert client.repairs == 1
+    assert exc_info.value.code == "EXECUTION_FAILED_AFTER_DECISION"
+    assert exc_info.value.details["execution_error"]["code"] == "INVALID_OKF_FINAL_BODY"
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+        assert not store.list_nodes({"status": NodeStatus.ACTIVE, "title": "Invalid final OKF body is rejected"})

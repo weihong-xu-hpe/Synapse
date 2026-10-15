@@ -369,6 +369,9 @@ def test_incremental_growth_complements_existing_knowledge(tmp_path: Path) -> No
             item = dict(_PITFALL_ITEM)
             if type(self).calls == 1:
                 item["title"] = "Incremental pitfall title"
+                item["takeaway"] = "The first incremental write establishes the baseline."
+            else:
+                item["takeaway"] = "The follow-up incremental write adds a distinct detail."
             return {"items": [item]}
 
         def decide_memory_write(self, request):
@@ -835,9 +838,17 @@ def test_distilled_vs_distilled_supersede_not_downgraded(tmp_path: Path) -> None
     class AlwaysSupersedeClient:
         name = "fake-supersede2"
 
+        calls = 0
+
         def sample_json(self, *, prompt, system_prompt, max_tokens=600, model_hints=(), reasoning_effort=None):
+            type(self).calls += 1
             item = dict(_PITFALL_ITEM)
             item["title"] = "Distilled pitfall v1"  # matches the earlier distilled node
+            item["takeaway"] = (
+                "The first distillation records this pitfall."
+                if type(self).calls == 1
+                else "The updated distillation adds a newer pitfall detail."
+            )
             return {"items": [item]}
 
         def decide_memory_write(self, request):
@@ -982,6 +993,17 @@ def test_validator_fires_unresolvable_source() -> None:
     assert any(w.code == "okf_unresolvable_source" for w in bad)
 
 
+def test_validator_flags_duplicate_required_headings() -> None:
+    warnings = validate_okf_node(
+        node_type="persistent",
+        content="## Takeaway\nt\n\n## Details\nfirst\n\n## Details\nsecond\n\n## Sources\n- mem_session_source",
+        okf_type="fact",
+        sources=["mem_session_source"],
+        title="Duplicate details test",
+    )
+    assert any(warning.code == "okf_duplicate_section:Details" for warning in warnings)
+
+
 def test_write_memory_warns_on_pseudo_sources(tmp_path: Path) -> None:
     runtime_paths = _runtime(tmp_path)
     from tests.test_server_api import FakeSamplingClient
@@ -1061,7 +1083,7 @@ def test_distilled_project_from_keyed_and_legacy_transcripts(tmp_path: Path) -> 
     class ProjectClient(FakeDistillSamplingClient):
         def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
             title = "Legacy authz boundary lesson" if "k k k" in prompt else "Keyed retrieval pipeline lesson"
-            return {"items": [dict(_PITFALL_ITEM, title=title)]}
+            return {"items": [dict(_PITFALL_ITEM, title=title, takeaway=f"{title} is retained as project-specific guidance.")]}
 
     client = ProjectClient([])
     distiller, paths = _make_distiller(tmp_path, client)
@@ -1329,6 +1351,11 @@ def test_distiller_title_repair_success_and_failure(tmp_path: Path) -> None:
                 return {"title": "仍然中文"}
             item = dict(_PITFALL_ITEM)
             item["title"] = "设计库 DRC 审查意见的分诊流程"
+            item["takeaway"] = (
+                "The repaired title preserves durable title guidance."
+                if type(self).repair_works
+                else "The fallback title preserves the durable lesson."
+            )
             return {"items": [item]}
 
         def decide_memory_write(self, request):
@@ -1729,6 +1756,7 @@ def test_verify_evidence_accepts_verbatim_and_rejects_paraphrase() -> None:
     turns = {
         "T1": "We decided to use kafka offsets for resume.",
         "T2": "call: grep -rn offsets\nresult [ok]: src/main.py:1 uses offsets",
+        "T3": "Could this be the cause?",
     }
     verified, unverified = verify_evidence(
         [
@@ -1737,11 +1765,17 @@ def test_verify_evidence_accepts_verbatim_and_rejects_paraphrase() -> None:
             EvidenceEntry(turn="T2", quote="result [ok]: src/main.py:1 uses offsets"),
             EvidenceEntry(turn="T1", quote="paraphrased claim not present"),
             EvidenceEntry(turn="T9", quote="kafka"),
+            EvidenceEntry(turn="T3", quote="this be the cause"),
         ],
         turns=turns,
+        question_only_turns={"T3"},
     )
     assert [e.turn for e in verified] == ["T1", "T1", "T2"]
-    assert [(e.turn, e.quote[:20]) for e in unverified] == [("T1", "paraphrased claim no"), ("T9", "kafka")]
+    assert [(e.turn, e.quote[:20]) for e in unverified] == [
+        ("T1", "paraphrased claim no"),
+        ("T9", "kafka"),
+        ("T3", "this be the cause"),
+    ]
 
 
 def test_distiller_stamps_verified_frontmatter_and_evidence_section(tmp_path: Path) -> None:
@@ -1764,14 +1798,20 @@ def test_distiller_stamps_verified_frontmatter_and_evidence_section(tmp_path: Pa
         "sources": [],
         "evidence": [{"turn": "T1", "quote": "this quote does not exist anywhere"}],
     }
+    question_item = {
+        "okf_type": "fact",
+        "title": "Question-only hypothesis",
+        "takeaway": "The question itself does not establish a cause.",
+        "sections": {"Details": "No answer or supporting tool result appears."},
+        "sources": [],
+        "evidence": [{"turn": "T2", "quote": "Could this be the cause?"}],
+    }
 
     class EvidenceClient:
         name = "fake-evidence"
 
         def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
-            if "merge" in prompt.lower():
-                return {"items": [good_item, bad_item]}
-            return {"items": [good_item, bad_item]}
+            return {"items": [good_item, bad_item, question_item]}
 
         def decide_memory_write(self, request):
             from synapse.server.sampling import MemoryWriteSamplingDecision
@@ -1784,7 +1824,11 @@ def test_distiller_stamps_verified_frontmatter_and_evidence_section(tmp_path: Pa
     try:
         import os
 
-        content = "<!-- synapse-transcript v2 -->\n## T1 User\nthe offsets gate controls resume behavior\n"
+        content = (
+            "<!-- synapse-transcript v2 -->\n"
+            "## T1 User\nthe offsets gate controls resume behavior\n\n"
+            "## T2 User\nCould this be the cause?\n"
+        )
         _write_transcript(runtime_paths, "mem_session_ev1", content, session_key="sess-ev")
         old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
         os.utime(runtime_paths.active / "mem_session_ev1.md", (old_ts, old_ts))
@@ -1805,6 +1849,9 @@ def test_distiller_stamps_verified_frontmatter_and_evidence_section(tmp_path: Pa
         bad = by_title["Unverifiable claim"]
         assert bad.metadata.verified is False
         assert "## Evidence" in bad.content
+        question = by_title["Question-only hypothesis"]
+        assert question.metadata.verified is False
+        assert 'T2: "Could this be the cause?"' in question.content
     finally:
         distiller.close()
 
@@ -2465,7 +2512,7 @@ def test_reduce_failure_retries_then_dedupes_never_truncates(tmp_path: Path) -> 
                 6: "Nginx worker connections pitfall",
             }
             title = titles[n]
-            return {"items": [dict(_PITFALL_ITEM, title=title)]}
+            return {"items": [dict(_PITFALL_ITEM, title=title, takeaway=f"Durable lesson for {title}.")]}
 
         def decide_memory_write(self, request):
             from synapse.server.sampling import MemoryWriteSamplingDecision
@@ -2531,7 +2578,12 @@ def test_item_warn_threshold_logs_but_writes_everything(tmp_path: Path, caplog) 
                 "Homebrew link conflict pitfall",
                 "Pytest fixture scope pitfall",
             ]
-            return {"items": [dict(_PITFALL_ITEM, title=title) for title in titles[(n - 1) * 3 : n * 3]]}
+            return {
+                "items": [
+                    dict(_PITFALL_ITEM, title=title, takeaway=f"Durable lesson for {title}.")
+                    for title in titles[(n - 1) * 3 : n * 3]
+                ]
+            }
 
         def decide_memory_write(self, request):
             from synapse.server.sampling import MemoryWriteSamplingDecision
@@ -2888,5 +2940,267 @@ def test_near_duplicate_reranker_uses_bounded_shortlist_for_large_corpus(
         assert reranker.document_count == distiller.NEAR_DUP_TITLE_JACCARD_TOP_K + 1
         assert reranker.document_count <= distiller.NEAR_DUP_RERANK_MAX_CANDIDATES
         assert found is corpus[0]
+    finally:
+        distiller.close()
+
+
+def test_invalid_final_distiller_body_is_skipped_and_retryable(tmp_path: Path, monkeypatch) -> None:
+    class RepairFailureClient:
+        name = "fake-final-okf-repair"
+
+        def __init__(self) -> None:
+            self.repair_calls = 0
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            if "Repair this persistent OKF body" in prompt:
+                self.repair_calls += 1
+                return {"content": "## Takeaway\nStill missing the required section.\n\n## Sources\n- mem_session_finalv1"}
+            return {"items": [dict(_PITFALL_ITEM, title="Final OKF repair remains retryable")]}
+
+        def decide_memory_write(self, _request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(
+                action="create", target_node_ids=(), reasoning="new", confidence=0.9
+            )
+
+    config = _config(tmp_path)
+    runtime_paths = _runtime(tmp_path)
+    client = RepairFailureClient()
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=client)
+    original_prepare = service.prepare_distilled_write
+
+    def invalidate_prepared_body(**kwargs):
+        prepared = original_prepare(**kwargs)
+        prepared["content"] = (
+            "## Takeaway\nFinal OKF repair remains retryable.\n\n"
+            f"## Sources\n- {kwargs['sources'][0]}"
+        )
+        return prepared
+
+    monkeypatch.setattr(service, "prepare_distilled_write", invalidate_prepared_body)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=client, service=service)
+    transcript = _write_transcript(
+        runtime_paths,
+        "mem_session_finalv1",
+        "## User\nA durable fact for final-body validation.\n\n## Assistant\nRecorded.",
+        session_key="final-validation-1",
+    )
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(runtime_paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+
+    try:
+        report = distiller.run(downgrade_supersede=False)
+        from synapse.storage import read_node_file
+
+        stamped = read_node_file(runtime_paths.active / f"{transcript.id}.md")
+        persistent = distiller._get_store().list_nodes(
+            {"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}
+        )
+        assert client.repair_calls == 1
+        assert report.transcripts_distilled == 0
+        assert report.transcripts_skipped == 1
+        assert stamped.metadata.distilled_hash is None
+        assert not any(node.title == "Final OKF repair remains retryable" for node in persistent)
+
+        os.utime(runtime_paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+        assert [node.id for node in distiller.select_transcripts()] == [transcript.id]
+    finally:
+        distiller.close()
+
+
+def test_exact_takeaway_duplicate_merges_despite_complement_decision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    takeaway = "Use one canonical probe deadline for every region."
+
+    class ExactTakeawayClient:
+        name = "fake-exact-takeaway"
+
+        def __init__(self) -> None:
+            self.repair_calls = 0
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=(), reasoning_effort=None):
+            if "Repair this persistent OKF body" in prompt:
+                self.repair_calls += 1
+                return {
+                    "content": (
+                        f"## Takeaway\n{takeaway}\n\n"
+                        "## Details\nKeep the prior probe guidance and the new regional rollout detail.\n\n"
+                        "## Sources\n- mem_session_prior"
+                    )
+                }
+            if "You merge new knowledge INTO an existing OKF knowledge node" in prompt:
+                return {
+                    "takeaway": "x" * 201,
+                    "sections": {"Details": "Keep the prior probe guidance and the new regional rollout detail."},
+                }
+            return {
+                "items": [
+                    {
+                        "okf_type": "fact",
+                        "title": "Unrelated-looking regional rollout note",
+                        "takeaway": "use one canonical probe deadline for every region.",
+                        "sections": {"Details": "The regional rollout uses the canonical probe deadline."},
+                        "sources": [],
+                        "evidence": [],
+                    }
+                ]
+            }
+
+    config = _config(tmp_path)
+    runtime_paths = _runtime(tmp_path)
+    client = ExactTakeawayClient()
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=client)
+    existing = service.integrate_knowledge(
+        title="Existing probe contract with unrelated tokens",
+        content=(
+            f"## Takeaway\n{takeaway}\n\n## Details\nKeep the original timeout guidance.\n\n"
+            "## Sources\n- mem_session_prior"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_prior"],
+    )
+    existing_id = existing["node"]["id"]
+    monkeypatch.setattr(
+        service,
+        "_decide_memory_write_payload",
+        lambda **_kwargs: {
+            "decision": {
+                "action": "complement",
+                "target_node_ids": [existing_id],
+                "reasoning": "related rollout detail",
+            },
+            "evidence": {"candidate_count": 1, "sampling_provider": "fake"},
+        },
+    )
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=client, service=service)
+    transcript = _write_transcript(
+        runtime_paths,
+        "mem_session_exact_takeaway",
+        "## User\nA regional rollout uses the canonical probe deadline.\n\n## Assistant\nNoted.",
+        session_key="exact-takeaway",
+    )
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(runtime_paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+
+    try:
+        report = distiller.run(downgrade_supersede=False)
+        stored = distiller._get_store().get_node(existing_id)
+        persistent = distiller._get_store().list_nodes(
+            {"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}
+        )
+        assert report.transcripts_distilled == 1
+        assert report.decider_complements == 0
+        assert report.merged_updates == 1
+        assert report.details[0]["items"][0]["action"] == "updated"
+        assert report.details[0]["items"][0]["node_ids"] == [existing_id]
+        assert client.repair_calls == 1
+        assert stored is not None and transcript.id in stored.metadata.sources
+        from synapse.lifecycle.distiller import _first_section_line
+        assert sum(
+            1
+            for node in persistent
+            if Distiller._takeaway_key(_first_section_line(node.content, "Takeaway"))
+            == Distiller._takeaway_key(takeaway)
+        ) == 1
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            event = store.connection.execute(
+                "SELECT warning_codes FROM write_memory_events WHERE node_id = ? AND route = 'distiller' ORDER BY id DESC LIMIT 1",
+                (existing_id,),
+            ).fetchone()
+        assert event is not None and json.loads(event["warning_codes"]) == []
+    finally:
+        distiller.close()
+
+
+def test_failed_final_okf_repair_leaves_target_and_transcript_unchanged(tmp_path: Path) -> None:
+    takeaway = "Use one canonical probe deadline for every region."
+    invalid_takeaway = "x" * 201
+
+    class InvalidMergeRepairClient:
+        name = "fake-invalid-merge-repair"
+
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def sample_json(self, *, prompt: str, **_kwargs):
+            if "Repair this persistent OKF body" in prompt:
+                self.repairs += 1
+                return {
+                    "content": (
+                        f"## Takeaway\n{invalid_takeaway}\n\n"
+                        "## Details\nThe repaired content is still invalid.\n\n"
+                        "## Sources\n- mem_session_prior"
+                    )
+                }
+            if "You merge new knowledge INTO an existing OKF knowledge node" in prompt:
+                return {
+                    "takeaway": invalid_takeaway,
+                    "sections": {"Details": "The merged content has an overlong takeaway."},
+                }
+            return {
+                "items": [
+                    {
+                        "okf_type": "fact",
+                        "title": "Regional probe deadline detail",
+                        "takeaway": takeaway,
+                        "sections": {"Details": "A new region uses the canonical probe deadline."},
+                        "sources": [],
+                        "evidence": [],
+                    }
+                ]
+            }
+
+        def decide_memory_write(self, _request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+
+            return MemoryWriteSamplingDecision(
+                action="create", target_node_ids=(), reasoning="new regional detail", confidence=0.9
+            )
+
+    config = _config(tmp_path)
+    runtime_paths = _runtime(tmp_path)
+    client = InvalidMergeRepairClient()
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=client)
+    target = service.integrate_knowledge(
+        title="Existing canonical probe deadline",
+        content=(
+            f"## Takeaway\n{takeaway}\n\n## Details\nKeep the existing probe deadline guidance.\n\n"
+            "## Sources\n- mem_session_prior"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        sources=["mem_session_prior"],
+    )
+    target_id = target["node"]["id"]
+    target_before = service.get_node(target_id)
+    distiller = Distiller(config, runtime_paths=runtime_paths, sampling_client=client, service=service)
+    transcript = _write_transcript(
+        runtime_paths,
+        "mem_session_failed_repair",
+        "## User\nA new region uses the canonical probe deadline.\n\n## Assistant\nNoted.",
+        session_key="failed-repair",
+    )
+    transcript_path = runtime_paths.active / f"{transcript.id}.md"
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(transcript_path, (old_ts, old_ts))
+    transcript_before = transcript_path.read_text(encoding="utf-8")
+
+    try:
+        report = distiller._run_transcript_task(
+            transcript,
+            dry_run=False,
+            downgrade_supersede=False,
+        )
+        assert report.transcripts_skipped == 1
+        assert report.transcripts_distilled == 0
+        assert client.repairs == 1
+        assert service.get_node(target_id) == target_before
+        assert transcript_path.read_text(encoding="utf-8") == transcript_before
+        assert [node.id for node in distiller.select_transcripts()] == [transcript.id]
     finally:
         distiller.close()

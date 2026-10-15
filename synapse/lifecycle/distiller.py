@@ -50,6 +50,10 @@ from synapse.storage.markdown import write_node_file
 from synapse.utils.runtime import RuntimePaths
 
 LOGGER = logging.getLogger("synapse.distiller")
+_QUESTION_ONLY_PREFIX = re.compile(
+    r"^(?:what|why|how|when|where|who|which|whose|whom|can|could|would|will|do|does|did|is|are|was|were|should|may|might|must|have|has|had)\b|^(?:请问|为什么|如何|怎么|是否|能否|是不是|什么|什么时候|哪里|谁)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -304,7 +308,7 @@ class Distiller:
             return nullcontext()
         timeout_seconds = (
             self.config.decider.timeout_seconds
-            if stage == "write_decider"
+            if stage in {"write_decider", "write_commit"}
             else self.settings.llm_timeout_seconds
         )
         try:
@@ -455,6 +459,15 @@ class Distiller:
         )
         return report
 
+    @staticmethod
+    def _is_final_okf_validation_error(exc: Exception) -> bool:
+        if not isinstance(exc, SynapseServiceError):
+            return False
+        if exc.code == "INVALID_OKF_FINAL_BODY":
+            return True
+        execution_error = exc.details.get("execution_error")
+        return isinstance(execution_error, Mapping) and execution_error.get("code") == "INVALID_OKF_FINAL_BODY"
+
     def _run_transcript_task(
         self,
         transcript: Node,
@@ -475,17 +488,21 @@ class Distiller:
         except Exception as exc:  # noqa: BLE001 — one bad transcript must not stop the sweep
             report.llm_failures += 1
             report.transcripts_skipped += 1
+            validation_skip = self._is_final_okf_validation_error(exc)
+            call_metrics = getattr(self._get_sampling_client(), "call_metrics", None)
             self._logger.warning(
-                "Distill failed for transcript; backing off",
+                "Distiller final OKF validation skipped write; transcript remains unstamped and retryable"
+                if validation_skip
+                else "Distill failed for transcript; backing off",
                 extra={
                     "node_id": transcript.id,
                     "error": str(exc),
-                    "endpoint_calls": self._get_sampling_client().call_metrics(transcript_id=transcript.id)
-                    if callable(getattr(self._get_sampling_client(), "call_metrics", None))
+                    "endpoint_calls": call_metrics(transcript_id=transcript.id)
+                    if callable(call_metrics)
                     else {},
                 },
             )
-            if not dry_run:
+            if not dry_run and not validation_skip:
                 try:
                     self._mark_backoff(transcript)
                 except Exception as backoff_exc:  # noqa: BLE001 — retry eligibility is retained without the touch
@@ -576,8 +593,14 @@ class Distiller:
         except Exception as exc:  # noqa: BLE001
             report.llm_failures += 1
             report.transcripts_skipped += 1
-            self._logger.warning("Distill failed for transcript", extra={"node_id": transcript.id, "error": str(exc)})
-            if not dry_run:
+            validation_skip = self._is_final_okf_validation_error(exc)
+            self._logger.warning(
+                "Distiller final OKF validation skipped write; transcript remains unstamped and retryable"
+                if validation_skip
+                else "Distill failed for transcript",
+                extra={"node_id": transcript.id, "error": str(exc)},
+            )
+            if not dry_run and not validation_skip:
                 self._mark_backoff(transcript)
         completed = datetime.now(UTC)
         report.completed_at = completed.isoformat().replace("+00:00", "Z")
@@ -674,12 +697,25 @@ class Distiller:
         # user-turn bodies and tool result lines (call lines only for
         # procedure with an ok result). Assistant prose never verifies.
         for item in candidates:
+            evidence_turns: dict[str, str] = {}
+            question_only_turns: set[str] = set()
+            for turn in parsed.turns:
+                if turn.role == "User":
+                    evidence_text, question_only = self._user_turn_evidence(turn.body)
+                    if question_only:
+                        question_only_turns.add(turn.id)
+                else:
+                    evidence_text = turn.eligible_evidence_text(okf_type=item.okf_type)
+                evidence_turns[turn.id] = evidence_text
             verified, unverified = verify_evidence(
                 item.evidence,
-                turns={turn.id: turn.eligible_evidence_text(okf_type=item.okf_type) for turn in parsed.turns},
+                turns=evidence_turns,
+                question_only_turns=question_only_turns,
             )
             item.evidence = [*verified, *unverified]
-            item.verified = bool(item.evidence) and not unverified
+            item.verified = bool(verified)
+
+
 
 
         service = self._get_service()
@@ -799,6 +835,25 @@ class Distiller:
                 },
             )
         return detail
+
+    @staticmethod
+    def _user_turn_evidence(text: str) -> tuple[str, bool]:
+        fragments = [
+            fragment.strip()
+            for fragment in re.split(r"(?<=[?？])\s*|\n+", text)
+            if fragment.strip()
+        ]
+        if not fragments:
+            return text, False
+        assertive = [
+            fragment
+            for fragment in fragments
+            if not (
+                fragment.endswith(("?", "？"))
+                or (_QUESTION_ONLY_PREFIX.match(fragment) is not None and not fragment.endswith((".", "。")))
+            )
+        ]
+        return "\n".join(assertive), not assertive
 
     @staticmethod
     def _build_segments(parsed: ParsedTranscript, *, watermark: int, max_chars: int) -> list[tuple[str, str]]:
@@ -1066,6 +1121,10 @@ class Distiller:
             return 0.0
         return len(ta & tb) / len(ta | tb)
 
+    @staticmethod
+    def _takeaway_key(text: str) -> str:
+        return " ".join(text.split()).casefold()
+
     def _find_near_duplicate(
         self, item: OkfItem, transcript: Node, store: SQLiteNodeStore
     ) -> Node | None:
@@ -1134,6 +1193,16 @@ class Distiller:
         if not candidates_nodes:
             return None
 
+        takeaway_key = self._takeaway_key(item.takeaway)
+        if takeaway_key:
+            for candidate in candidates_nodes:
+                existing_takeaway = self._takeaway_key(_extract_section(candidate.content, "Takeaway") or "")
+                if (
+                    candidate.metadata.status is NodeStatus.ACTIVE
+                    and candidate.metadata.type is NodeType.PERSISTENT
+                    and existing_takeaway == takeaway_key
+                ):
+                    return candidate
         jaccards = [self._title_jaccard(item.title, candidate.title) for candidate in candidates_nodes]
         if max(jaccards) <= 0.0:
             return None
@@ -1379,36 +1448,82 @@ class Distiller:
         with self._write_commit_lock:
             store = self._get_store()
             near_dup = self._find_near_duplicate(item, transcript, store)
-            if guard_fallback:
-                if near_dup is not None:
+            exact_takeaway_duplicate = (
+                near_dup is not None
+                and self._takeaway_key(item.takeaway)
+                == self._takeaway_key(_extract_section(near_dup.content, "Takeaway") or "")
+            )
+            if exact_takeaway_duplicate:
+                self._logger.info(
+                    "Exact takeaway dedupe matched an active persistent node",
+                    extra={"transcript_id": transcript.id, "target_node_id": near_dup.id},
+                )
+                candidate_content = prepared["content"] if prepared is not None else item.render()
+                if candidate_content.strip() == near_dup.content.strip():
+                    merged_content = near_dup.content
+                else:
                     with self._sampling_call_context(transcript, "near_duplicate_merge"):
-                        merged = self._merge_item_into_node(item, near_dup)
+                        merged_content = self._merge_item_into_node(item, near_dup)
+                    if merged_content is None:
+                        raise SynapseServiceError(
+                            "EXACT_TAKEAWAY_MERGE_FAILED",
+                            "Exact-takeaway duplicate could not be safely merged",
+                            status_code=502,
+                            details={"target_node_id": near_dup.id},
+                        )
+                with self._sampling_call_context(transcript, "write_commit"):
                     updated = service._merge_update_node(
                         target_id=near_dup.id,
-                        content=merged or item.render(),
+                        content=merged_content,
                         title=item.title,
                         sources=list(item.sources),
                         verified=item.verified,
                         route="distiller",
+                        okf_type=item.okf_type,
                     )
+                updated_node = updated.get("node")
+                node_id = updated_node.get("id") if isinstance(updated_node, dict) else None
+                action = str(updated.get("action", "updated"))
+                self._count_action(report, action)
+                if decision_endpoint is not None:
+                    endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
+                    endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
+                return {"action": action, "node_ids": [node_id] if node_id else []}
+            if guard_fallback:
+                if near_dup is not None:
+                    with self._sampling_call_context(transcript, "near_duplicate_merge"):
+                        merged = self._merge_item_into_node(item, near_dup)
+                    with self._sampling_call_context(transcript, "write_commit"):
+                        updated = service._merge_update_node(
+                            target_id=near_dup.id,
+                            content=merged or item.render(),
+                            title=item.title,
+                            sources=list(item.sources),
+                            verified=item.verified,
+                            route="distiller",
+                            okf_type=item.okf_type,
+                        )
                     updated_node = updated.get("node")
                     node_id = updated_node.get("id") if isinstance(updated_node, dict) else None
-                    self._count_action(report, "updated")
-                    return {"action": "updated", "node_ids": [node_id] if node_id else []}
+                    action = str(updated.get("action", "updated"))
+                    self._count_action(report, action)
+                    return {"action": action, "node_ids": [node_id] if node_id else []}
                 report.guard_fallback_creates += 1
                 self._logger.warning(
                     "Guard fired on distilled item; falling back to create",
                     extra={"node_id": transcript.id, "item": item.title},
                 )
-                fallback = service.integrate_knowledge(
-                    title=item.title,
-                    content=item.render(),
-                    node_type=NodeType.PERSISTENT,
-                    sources=list(item.sources),
-                    okf_type=item.okf_type,
-                    okf_version=1,
-                    project=self._transcript_project(transcript),
-                )
+                with self._sampling_call_context(transcript, "write_commit"):
+                    fallback = service.integrate_knowledge(
+                        title=item.title,
+                        content=item.render(),
+                        node_type=NodeType.PERSISTENT,
+                        sources=list(item.sources),
+                        okf_type=item.okf_type,
+                        okf_version=1,
+                        project=self._transcript_project(transcript),
+                        validate_okf=True,
+                    )
                 node_payload = fallback.get("node") if isinstance(fallback, dict) else None
                 node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
                 return {"action": "guard_fallback_create", "node_ids": [node_id] if node_id else []}
@@ -1430,16 +1545,17 @@ class Distiller:
             prepared_write = dict(prepared)
             prepared_write["content"] = content
             try:
-                result = service.commit_distilled_write(
-                    prepared_write,
-                    okf_version=1,
-                    project=self._transcript_project(transcript),
-                    node_id=forced_node_id,
-                    downgrade_supersede=downgrade_supersede,
-                    route="distiller",
-                    verified=item.verified,
-                    merge_update_target=near_dup.id if near_dup is not None else None,
-                )
+                with self._sampling_call_context(transcript, "write_commit"):
+                    result = service.commit_distilled_write(
+                        prepared_write,
+                        okf_version=1,
+                        project=self._transcript_project(transcript),
+                        node_id=forced_node_id,
+                        downgrade_supersede=downgrade_supersede,
+                        route="distiller",
+                        verified=item.verified,
+                        merge_update_target=near_dup.id if near_dup is not None else None,
+                    )
             except SynapseServiceError as exc:
                 if not self._is_transcript_target_guard_error(exc):
                     raise
@@ -1448,15 +1564,17 @@ class Distiller:
                     "Guard fired on distilled item; falling back to create",
                     extra={"node_id": transcript.id, "item": item.title},
                 )
-                fallback = service.integrate_knowledge(
-                    title=item.title,
-                    content=item.render(),
-                    node_type=NodeType.PERSISTENT,
-                    sources=list(item.sources),
-                    okf_type=item.okf_type,
-                    okf_version=1,
-                    project=self._transcript_project(transcript),
-                )
+                with self._sampling_call_context(transcript, "write_commit"):
+                    fallback = service.integrate_knowledge(
+                        title=item.title,
+                        content=item.render(),
+                        node_type=NodeType.PERSISTENT,
+                        sources=list(item.sources),
+                        okf_type=item.okf_type,
+                        okf_version=1,
+                        project=self._transcript_project(transcript),
+                        validate_okf=True,
+                    )
                 node_payload = fallback.get("node") if isinstance(fallback, dict) else None
                 node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
                 return {"action": "guard_fallback_create", "node_ids": [node_id] if node_id else []}

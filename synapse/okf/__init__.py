@@ -71,19 +71,24 @@ def verify_evidence(
     evidence: list[EvidenceEntry],
     *,
     turns: Mapping[str, str],
+    question_only_turns: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[EvidenceEntry], list[EvidenceEntry]]:
-    """Deterministically verify evidence quotes against turn texts (NO LLM).
+    """Verify quotes against eligible turn text (NO LLM).
 
-    A quote verifies when, whitespace-collapsed and case-insensitive, it
-    appears in the named turn's body or attached tool-result lines. Returns
-    ``(verified, unverified)`` in input order.
+    Question-only user turns are excluded even when their wording matches a
+    quote; an interrogative is not evidence for the answer it asks about.
+    Returns ``(verified, unverified)`` in input order.
     """
 
     verified: list[EvidenceEntry] = []
     unverified: list[EvidenceEntry] = []
     for entry in evidence:
         turn_text = turns.get(entry.turn)
-        if turn_text is not None and _collapse_whitespace(entry.quote) in _collapse_whitespace(turn_text):
+        if (
+            entry.turn not in question_only_turns
+            and turn_text is not None
+            and _collapse_whitespace(entry.quote) in _collapse_whitespace(turn_text)
+        ):
             verified.append(entry)
         else:
             unverified.append(entry)
@@ -281,6 +286,18 @@ def validate_okf_node(
     """
 
     warnings: list[OkfWarning] = []
+    seen_headings: set[str] = set()
+    duplicate_headings: set[str] = set()
+    for line in content.splitlines():
+        heading = line.strip()
+        if not heading.startswith("## "):
+            continue
+        name = heading[3:].strip()
+        normalized = name.casefold()
+        if normalized in seen_headings and normalized not in duplicate_headings:
+            warnings.append(OkfWarning(f"okf_duplicate_section:{name}", f"Duplicate section heading '## {name}'.", name))
+            duplicate_headings.add(normalized)
+        seen_headings.add(normalized)
     warnings.extend(_validate_title(title))
     if okf_type is None or not okf_type.strip():
         warnings.append(OkfWarning("okf_missing_type", "Persistent node has no okf_type frontmatter."))
