@@ -375,7 +375,7 @@ class SynapseServerService:
         linked_content = self._embed_links(content, all_links)
         okf_warnings: list[dict[str, str]] = []
         if validate_okf and normalized_type is NodeType.PERSISTENT:
-            linked_content, okf_warnings = self._validate_distiller_final_body(
+            clean_title, linked_content, okf_type, okf_warnings = self._validate_distiller_final_body(
                 title=clean_title,
                 content=linked_content,
                 okf_type=okf_type,
@@ -574,6 +574,7 @@ class SynapseServerService:
         verified: bool | None,
         route: str | None,
         okf_type: str | None = None,
+        validated_title: str | None = None,
     ) -> dict[str, Any]:
         """Merge-update an existing node IN PLACE (near-duplicate gate).
 
@@ -592,18 +593,19 @@ class SynapseServerService:
                 details={"merge_update_target": target_id},
             )
         merged_sources = list(dict.fromkeys([*existing.metadata.sources, *sources]))
-        effective_okf_type = existing.metadata.okf_type or okf_type
+        effective_okf_type = okf_type or existing.metadata.okf_type
         if route == "distiller":
-            content, okf_warnings = self._validate_distiller_final_body(
-                title=existing.title,
+            existing_title, content, effective_okf_type, okf_warnings = self._validate_distiller_final_body(
+                title=validated_title or existing.title,
                 content=content,
                 okf_type=effective_okf_type,
                 sources=merged_sources,
                 links=[],
             )
         else:
+            existing_title = existing.title
             okf_warnings = self._okf_write_warnings(
-                existing.title,
+                existing_title,
                 content,
                 okf_type=effective_okf_type,
                 sources=merged_sources,
@@ -611,6 +613,7 @@ class SynapseServerService:
         merged_metadata = existing.metadata.model_copy(
             update={
                 "sources": merged_sources,
+                "title": existing_title,
                 "okf_type": effective_okf_type,
                 "okf_version": existing.metadata.okf_version or (1 if okf_type else None),
                 "verified": verified if verified is not None else existing.metadata.verified,
@@ -1578,7 +1581,7 @@ class SynapseServerService:
         okf_type: str | None,
         sources: list[str] | None,
         links: list[str],
-    ) -> tuple[str, list[dict[str, str]]]:
+    ) -> tuple[str, str, str | None, list[dict[str, str]]]:
         """Validate the exact body about to persist; repair structural defects once."""
 
         from synapse.okf import TYPE_REQUIRED_SECTIONS, validate_okf_node
@@ -1597,6 +1600,7 @@ class SynapseServerService:
                 finding
                 for finding in items
                 if finding.code == "okf_takeaway_invalid"
+                or finding.code == "okf_title_too_long"
                 or finding.code.startswith("okf_missing_section:")
                 or finding.code.startswith("okf_duplicate_section:")
             ]
@@ -1605,12 +1609,13 @@ class SynapseServerService:
         if errors:
             required_headings = ["Takeaway", *TYPE_REQUIRED_SECTIONS.get(okf_type, ()), "Sources"]
             prompt = (
-                "Repair this persistent OKF body so it satisfies the supplied validation findings. "
-                "Return the FULL corrected body in one JSON object's `content` string, not a patch or excerpt. "
+                "Repair this persistent OKF body and title so it satisfies the supplied validation findings. "
+                "Return JSON fields `title` and `content`. Return the FULL corrected body in `content`; when title repair is not requested, preserve the supplied title. "
+                "You may also correct `okf_type` to one of `decision`, `fact`, `procedure`, or `pitfall`; if changed, make the body conform to that type. "
                 "There must be exactly one non-empty `## Takeaway` line of at most 200 characters. "
                 "Each required heading must occur exactly once and have a non-empty body. "
                 "Preserve every supported fact, number, path, model identifier, source, and evidence quote; "
-                "do not add claims. Required headings: "
+                "shorten any title over 90 characters without changing its meaning; do not add claims. Required headings: "
                 + ", ".join(f"## {heading}" for heading in required_headings)
                 + ".\n\n"
                 + json.dumps(
@@ -1645,7 +1650,17 @@ class SynapseServerService:
                     status_code=422,
                     details={"warnings": [finding.as_dict() for finding in errors], "repair_error": str(exc), "final_content": linked_content},
                 ) from exc
+            repaired_title = repaired.get("title") if isinstance(repaired, dict) else None
+            if not isinstance(repaired_title, str) or not repaired_title.strip():
+                repaired_title = title
             repaired_content = repaired.get("content") if isinstance(repaired, dict) else None
+            if any(f.code == "okf_title_too_long" for f in errors) and repaired_title == title:
+                raise SynapseServiceError(
+                    "INVALID_OKF_FINAL_BODY",
+                    "Final distilled OKF title remained too long after repair",
+                    status_code=422,
+                    details={"warnings": [finding.as_dict() for finding in errors], "final_content": linked_content},
+                )
             if not isinstance(repaired_content, str) or not repaired_content.strip():
                 raise SynapseServiceError(
                     "INVALID_OKF_FINAL_BODY",
@@ -1655,8 +1670,12 @@ class SynapseServerService:
                 )
             self.logger.info(
                 "Distiller final OKF validation repair returned a candidate",
-                extra={"title": title, "okf_type": okf_type},
+                extra={"title": repaired_title, "okf_type": okf_type},
             )
+            title = repaired_title.strip()
+            repaired_okf_type = repaired.get("okf_type") if isinstance(repaired, dict) else None
+            if isinstance(repaired_okf_type, str) and repaired_okf_type in TYPE_REQUIRED_SECTIONS:
+                okf_type = repaired_okf_type
             linked_content = self._embed_links(repaired_content, links)
             findings = validate_okf_node(
                 node_type="persistent",
@@ -1677,7 +1696,7 @@ class SynapseServerService:
                     status_code=422,
                     details={"warnings": [finding.as_dict() for finding in errors], "final_content": linked_content}
                 )
-        return linked_content, [
+        return title, linked_content, okf_type, [
             {"code": finding.code, "message": finding.message}
             for finding in findings
         ]

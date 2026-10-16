@@ -219,8 +219,11 @@ never fire warnings — only headings are checked (fixed English strings `## Tak
 `## Sources`).
 
 Non-distiller writes retain warning-only transition behavior. Distiller writes validate the
-final persisted body after link/merge construction and attempt one structure repair. If that
-repair returns an empty or still-invalid body, the item is skipped and appended with its final
+final persisted body after link/merge construction and attempt one repair for structural errors
+or a title longer than 90 characters. The repair may return a shortened title, corrected body,
+and an optional valid `okf_type` change; the corrected body is revalidated against the final type
+before persistence.
+If it returns an empty or still-invalid body/title, the item is skipped and appended with its final
 candidate, findings, action/targets, and sources to
 `~/synapse/.distiller-quarantine/YYYYMMDD.jsonl`; remaining items continue. The transcript is
 stamped after all non-quarantined items finish. Endpoint/transport failures are not quarantined
@@ -238,10 +241,10 @@ and leave the transcript retryable. Recorded warning codes are recomputed from t
 - Validator warnings: `okf_title_non_english` (any CJK), `okf_title_too_long` (> 90),
   `okf_title_type_prefix`.
 - Agent writes (MCP/REST): warnings only — no auto-translation, no rejection.
-- Distiller: the prompt requires English titles; if an item still returns a CJK/invalid title,
-  ONE short repair LLM call asks only for an English title (given takeaway + body excerpt).
-  If that also fails, the node is written with the fallback ID below plus the title warnings —
-  the item is never dropped. Counters: `title_repairs` / `title_repair_failures` in the run report.
+- Distiller: the prompt requires English titles; a CJK/degenerate title gets one short English-title
+  repair before decision sampling. The final persistence gate independently repairs a title over 90
+  chars together with any structural body error; if that repair still fails, the item is quarantined.
+  Counters: `title_repairs` / `title_repair_failures` track the initial English-title repair.
 
 ### ID plan (knowledge nodes)
 

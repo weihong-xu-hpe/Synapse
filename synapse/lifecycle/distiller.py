@@ -87,6 +87,7 @@ class DistillerReport:
     merged_updates: int = 0
     llm_failures: int = 0
     segments_total: int = 0
+    retryable: bool = False
     endpoint_calls: dict[str, dict[str, Any]] = field(default_factory=dict)
     actions_by_endpoint: dict[str, dict[str, int]] = field(default_factory=dict)
     archived_transcripts: int = 0
@@ -242,6 +243,9 @@ def _first_section_line(content: str, name: str) -> str:
 
 class Distiller:
     """Executes one distillation sweep over the node store."""
+    MAX_TRANSCRIPT_ATTEMPTS_PER_RUN = 2
+    TRANSCRIPT_RETRY_COOLDOWN = timedelta(minutes=10)
+    MAX_COMMIT_STALE_RECHECKS = 6
 
     def __init__(
         self,
@@ -264,6 +268,12 @@ class Distiller:
         self._llm_executor: ThreadPoolExecutor | None = None
         self._llm_executor_lock = threading.Lock()
         self._write_commit_lock = threading.RLock()
+        self._candidate_index_lock = threading.RLock()
+        self._candidate_index_ready = False
+        self._indexed_active_nodes: dict[str, Node] = {}
+        self._takeaway_index: dict[str, set[str]] = {}
+        self._title_token_index: dict[str, set[str]] = {}
+        self._title_token_generations: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Store / service access
@@ -288,6 +298,82 @@ class Distiller:
             self._store_local.store = None
             if threading.get_ident() == self._owner_thread_id:
                 self._store = None
+
+    @staticmethod
+    def _title_tokens(title: str) -> set[str]:
+        stop = {'the', 'a', 'an', 'for', 'and', 'or', 'of', 'to', 'in', 'on', 'with', 'is', 'are', 'not', 'from', 'by', 'at', 'as'}
+        return {word for word in re.split(r'[^a-z0-9]+', title.lower()) if len(word) > 3 and word not in stop}
+
+    def _index_node_locked(self, node_id: str, node: Node | None) -> None:
+        previous = self._indexed_active_nodes.pop(node_id, None)
+        if previous is not None:
+            old_takeaway = self._takeaway_key(_extract_section(previous.content, "Takeaway") or "")
+            if old_takeaway:
+                ids = self._takeaway_index.get(old_takeaway)
+                if ids is not None:
+                    ids.discard(node_id)
+                    if not ids:
+                        self._takeaway_index.pop(old_takeaway, None)
+            for token in self._title_tokens(previous.title):
+                ids = self._title_token_index.get(token)
+                if ids is not None:
+                    ids.discard(node_id)
+                    if not ids:
+                        self._title_token_index.pop(token, None)
+                self._title_token_generations[token] = self._title_token_generations.get(token, 0) + 1
+        if node is None or node.metadata.status is not NodeStatus.ACTIVE or node.metadata.type is not NodeType.PERSISTENT:
+            return
+        self._indexed_active_nodes[node_id] = node
+        takeaway = self._takeaway_key(_extract_section(node.content, "Takeaway") or "")
+        if takeaway:
+            self._takeaway_index.setdefault(takeaway, set()).add(node_id)
+        for token in self._title_tokens(node.title):
+            self._title_token_generations[token] = self._title_token_generations.get(token, 0) + 1
+            self._title_token_index.setdefault(token, set()).add(node_id)
+
+    def _ensure_candidate_index(self, store: SQLiteNodeStore | None = None) -> None:
+        with self._candidate_index_lock:
+            if self._candidate_index_ready:
+                return
+        index_store = store or self._get_store()
+        nodes = index_store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+        with self._candidate_index_lock:
+            if not self._candidate_index_ready:
+                self._indexed_active_nodes.clear()
+                self._takeaway_index.clear()
+                self._title_token_index.clear()
+                for node in nodes:
+                    self._index_node_locked(node.id, node)
+                self._candidate_index_ready = True
+
+    def _title_candidates(self, tokens: set[str]) -> list[Node]:
+        with self._candidate_index_lock:
+            ids = set().union(*(self._title_token_index.get(token, set()) for token in tokens)) if tokens else set()
+            return [self._indexed_active_nodes[node_id] for node_id in sorted(ids) if node_id in self._indexed_active_nodes]
+
+    def _title_index_signature(self, title: str) -> tuple[tuple[str, int], ...]:
+        self._ensure_candidate_index()
+        tokens = self._title_tokens(title)
+        with self._candidate_index_lock:
+            return tuple((token, self._title_token_generations.get(token, 0)) for token in sorted(tokens))
+
+    def _lookup_takeaway(self, takeaway: str) -> Node | None:
+        key = self._takeaway_key(takeaway)
+        if not key:
+            return None
+        self._ensure_candidate_index()
+        with self._candidate_index_lock:
+            ids = sorted(self._takeaway_index.get(key, ()))
+            return self._indexed_active_nodes.get(ids[0]) if ids else None
+
+    def _refresh_candidate_index(self, node_ids: set[str]) -> None:
+        if not node_ids:
+            return
+        store = self._get_store()
+        current = {node_id: store.get_node(node_id) for node_id in node_ids}
+        with self._candidate_index_lock:
+            for node_id, node in current.items():
+                self._index_node_locked(node_id, node)
 
     def close(self) -> None:
         if self._llm_executor is not None:
@@ -391,6 +477,10 @@ class Distiller:
     # ------------------------------------------------------------------
     # Sweep
     # ------------------------------------------------------------------
+    @staticmethod
+    def _retry_clock() -> datetime:
+        return datetime.now(UTC)
+
 
     def run(self, *, limit: int | None = None, dry_run: bool = False, downgrade_supersede: bool | None = None) -> DistillerReport:
         started = datetime.now(UTC)
@@ -399,34 +489,79 @@ class Distiller:
         max_transcripts = self.settings.max_transcripts_per_run if limit is None else max(0, limit)
         self._get_service()
         self._get_llm_executor()
+        self._ensure_candidate_index()
 
-        seen: set[str] = set()
-        in_flight: dict[Future[DistillerReport], Node] = {}
+        # A failed or partially failed transcript may be retried once in this
+        # sweep. Backoff is per transcript; the worker pool keeps processing
+        # other work and wakes when the earliest retry becomes eligible.
+        max_attempts = self.MAX_TRANSCRIPT_ATTEMPTS_PER_RUN
+        retry_cooldown = self.TRANSCRIPT_RETRY_COOLDOWN
+        admitted: set[str] = set()
+        attempts: dict[str, int] = {}
+        retry_at: dict[str, datetime] = {}
+        in_flight: dict[Future[DistillerReport], tuple[Node, int]] = {}
         with ThreadPoolExecutor(
             max_workers=self.settings.transcript_concurrency,
             thread_name_prefix="synapse-distiller-transcript",
         ) as pool:
-            while in_flight or len(seen) < max_transcripts:
+            while True:
+                now = self._retry_clock()
                 free_slots = self.settings.transcript_concurrency - len(in_flight)
-                if free_slots and len(seen) < max_transcripts:
-                    candidates = [node for node in self.select_transcripts() if node.id not in seen]
-                    for transcript in candidates[: min(free_slots, max_transcripts - len(seen))]:
-                        seen.add(transcript.id)
-                        report.transcripts_scanned += 1
-                        future = pool.submit(
-                            self._run_transcript_task,
-                            transcript,
-                            dry_run=dry_run,
-                            downgrade_supersede=downgrade,
-                        )
-                        in_flight[future] = transcript
-                if not in_flight:
-                    break
-                completed, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    in_flight.pop(future)
-                    self._merge_transcript_report(report, future.result())
+                while free_slots > 0:
+                    due_ids = sorted(
+                        (node_id for node_id, ready_at in retry_at.items() if ready_at <= now and attempts[node_id] < max_attempts),
+                        key=lambda node_id: retry_at[node_id],
+                    )
+                    if due_ids:
+                        transcript = self._load_transcript_from_disk(due_ids[0])
+                        retry_at.pop(due_ids[0], None)
+                        if transcript is None:
+                            continue
+                        node_id = transcript.id
+                        attempts[node_id] += 1
+                        attempt = attempts[node_id]
+                    else:
+                        if len(admitted) >= max_transcripts:
+                            break
+                        candidates = [node for node in self.select_transcripts() if node.id not in admitted]
+                        if not candidates:
+                            break
+                        transcript = candidates[0]
+                        node_id = transcript.id
+                        admitted.add(node_id)
+                        attempts[node_id] = 1
+                        attempt = 1
+                    report.transcripts_scanned += 1
+                    future = pool.submit(
+                        self._run_transcript_task,
+                        transcript,
+                        dry_run=dry_run,
+                        downgrade_supersede=downgrade,
+                    )
+                    in_flight[future] = (transcript, attempt)
+                    free_slots -= 1
 
+                if not in_flight:
+                    if not retry_at:
+                        break
+                    next_retry = min(retry_at.values())
+                    time.sleep(max(0.0, (next_retry - self._retry_clock()).total_seconds()))
+                    continue
+
+                timeout = None
+                if len(in_flight) < self.settings.transcript_concurrency and retry_at:
+                    timeout = max(0.0, (min(retry_at.values()) - self._retry_clock()).total_seconds())
+                completed, _pending = wait(in_flight, timeout=timeout, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    transcript, attempt = in_flight.pop(future)
+                    task_report = future.result()
+                    self._merge_transcript_report(report, task_report)
+                    if task_report.retryable and attempt < max_attempts and not dry_run:
+                        retry_at[transcript.id] = self._retry_clock() + retry_cooldown
+                        self._logger.info(
+                            "Distiller transcript retry scheduled",
+                            extra={"node_id": transcript.id, "attempt": attempt + 1, "max_attempts": max_attempts, "cooldown_seconds": int(retry_cooldown.total_seconds())},
+                        )
         if not dry_run:
             report.archived_transcripts = self._archive_expired(report)
 
@@ -566,8 +701,10 @@ class Distiller:
                 dry_run=dry_run,
                 downgrade_supersede=downgrade_supersede,
             )
+            report.retryable = bool(detail.get("retryable"))
             report.details.append(detail)
         except Exception as exc:  # noqa: BLE001 — one bad transcript must not stop the sweep
+            report.retryable = True
             report.llm_failures += 1
             report.transcripts_skipped += 1
             validation_skip = self._is_final_okf_validation_error(exc)
@@ -611,6 +748,10 @@ class Distiller:
         completed_at = datetime.now(UTC)
         report.completed_at = completed_at.isoformat().replace("+00:00", "Z")
         report.duration_ms = int((completed_at - started).total_seconds() * 1000)
+        self._logger.info(
+            "Distiller transcript task complete",
+            extra={"node_id": transcript.id, "duration_ms": report.duration_ms, "retryable": report.retryable, "transcripts_distilled": report.transcripts_distilled, "llm_failures": report.llm_failures},
+        )
         return report
 
     @staticmethod
@@ -943,6 +1084,7 @@ class Distiller:
                     "endpoint_calls": endpoint_calls,
                 },
             )
+        detail["retryable"] = extraction_failures > 0
         return detail
 
     @staticmethod
@@ -1237,19 +1379,21 @@ class Distiller:
     def _find_near_duplicate(
         self, item: OkfItem, transcript: Node, store: SQLiteNodeStore
     ) -> Node | None:
-        """Find a near-duplicate using full-corpus Jaccard and bounded reranking.
+        """Find exact Takeaway duplicates by index and rerank bounded candidates.
 
-        The reranker sees vector top-8, up to 20 transcript-owned nodes, and
-        the 20 highest title-Jaccard matches (at most 48 documents total).
-        Jaccard still scans all active persistent nodes so unembedded knowledge
-        remains eligible for the existing fallback thresholds.
+        The title-token index supplies active persistent nodes with non-zero
+        title overlap; the reranker sees vector top-8, owned nodes, and up to
+        20 Jaccard matches.
 
-        Merge thresholds are calibrated on the judge's dup pairs plus
-        related-same-surface and clear non-dups:
+        Merge thresholds:
           rerank >= 3.0 AND jaccard >= 0.25, OR
           rerank >= 1.5 AND jaccard >= 0.5, OR
           (reranker unavailable) jaccard >= 0.5 alone.
         """
+        self._ensure_candidate_index(store)
+        exact_takeaway = self._lookup_takeaway(item.takeaway)
+        if exact_takeaway is not None:
+            return exact_takeaway
 
         query_text = f"{item.title}\n{item.takeaway}".strip()
         candidates_nodes: list[Node] = []
@@ -1289,29 +1433,18 @@ class Distiller:
                     if index not in vector_indices:
                         vector_indices.append(index)
 
-        # Own distilled nodes remain priority candidates, followed by the full
-        # active persistent corpus for the inexpensive title-Jaccard pass.
-        for node_id in transcript.metadata.distilled_node_ids[-self.NEAR_DUP_OWN_TOP_K:]: 
+        # Retain owned nodes and candidates sharing indexed title tokens; this
+        # is a lossless shortlist for the positive-Jaccard match thresholds.
+        for node_id in transcript.metadata.distilled_node_ids[-self.NEAR_DUP_OWN_TOP_K:]:
             node = store.get_node(node_id)
-            if node is not None:
+            if node is not None and node.metadata.status is NodeStatus.ACTIVE and node.metadata.type is NodeType.PERSISTENT:
                 index = add_candidate(node)
                 if index not in own_indices:
                     own_indices.append(index)
-        for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}):
+        for node in self._title_candidates(self._title_tokens(item.title)):
             add_candidate(node)
         if not candidates_nodes:
             return None
-
-        takeaway_key = self._takeaway_key(item.takeaway)
-        if takeaway_key:
-            for candidate in candidates_nodes:
-                existing_takeaway = self._takeaway_key(_extract_section(candidate.content, "Takeaway") or "")
-                if (
-                    candidate.metadata.status is NodeStatus.ACTIVE
-                    and candidate.metadata.type is NodeType.PERSISTENT
-                    and existing_takeaway == takeaway_key
-                ):
-                    return candidate
         jaccards = [self._title_jaccard(item.title, candidate.title) for candidate in candidates_nodes]
         if max(jaccards) <= 0.0:
             return None
@@ -1516,64 +1649,73 @@ class Distiller:
             service.reset_sampling_client(token)
             self._close_thread_store()
 
-    def _final_takeaway_duplicate_update(
+    @staticmethod
+    def _node_commit_signature(node: Node | None) -> tuple[Any, ...] | None:
+        if node is None:
+            return None
+        return (
+            node.metadata.status.value,
+            hashlib.sha256(node.content.encode("utf-8")).hexdigest(),
+            node.metadata.okf_type,
+            node.metadata.okf_version,
+            node.metadata.superseded_by,
+            node.title,
+            tuple(node.metadata.sources),
+        )
+
+    def _prepare_final_takeaway_duplicate(
         self,
         service: SynapseServerService,
         transcript: Node,
         item: OkfItem,
-        report: DistillerReport,
-        store: SQLiteNodeStore,
         content: str,
+        store: SQLiteNodeStore,
         *,
         sources: list[str],
-        links: list[str] | None = None,
-        preferred_target: Node | None = None,
-        decision_endpoint: str | None = None,
-    ) -> tuple[dict[str, Any] | None, str]:
-        """Validate and dedupe the exact post-merge body under the commit lock."""
+        links: list[str],
+        preferred_target: Node | None,
+    ) -> tuple[Node | None, str, str, str]:
+        """Validate and prepare any exact-takeaway merge without the commit lock."""
 
-        final_content, _warnings = service._validate_distiller_final_body(
-            title=item.title,
-            content=content,
-            okf_type=item.okf_type,
-            sources=sources,
-            links=links or [],
-        )
-        takeaway_key = self._takeaway_key(_extract_section(final_content, "Takeaway") or "")
-        exact_target = None
-        if takeaway_key:
-            exact_target = next(
-                (
-                    candidate
-                    for candidate in store.list_nodes(
-                        {"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}
-                    )
-                    if self._takeaway_key(_extract_section(candidate.content, "Takeaway") or "")
-                    == takeaway_key
-                ),
-                None,
+        with self._sampling_call_context(transcript, "final_okf_repair"):
+            final_title, final_content, final_okf_type, _warnings = service._validate_distiller_final_body(
+                title=item.title,
+                content=content,
+                okf_type=item.okf_type,
+                sources=sources,
+                links=links,
             )
+        if final_okf_type is not None:
+            item.okf_type = final_okf_type
+        takeaway_key = self._takeaway_key(_extract_section(final_content, "Takeaway") or "")
+        indexed_exact = self._lookup_takeaway(takeaway_key)
+        exact_target = store.get_node(indexed_exact.id) if indexed_exact is not None else None
+        if indexed_exact is not None and self._node_commit_signature(exact_target) != self._node_commit_signature(indexed_exact):
+            self._refresh_candidate_index({indexed_exact.id})
+            indexed_exact = self._lookup_takeaway(takeaway_key)
+            exact_target = store.get_node(indexed_exact.id) if indexed_exact is not None else None
+        if exact_target is not None and (exact_target.metadata.status is not NodeStatus.ACTIVE or exact_target.metadata.type is not NodeType.PERSISTENT):
+            self._refresh_candidate_index({exact_target.id})
+            exact_target = None
         target = exact_target or preferred_target
         if target is None:
-            return None, final_content
-
+            return None, final_title, final_content, takeaway_key
         if exact_target is not None:
             self._logger.info(
                 "Exact takeaway dedupe matched the final distiller body",
                 extra={"transcript_id": transcript.id, "target_node_id": target.id},
             )
-        if (preferred_target is not None and target.id == preferred_target.id) or (
-            final_content.strip() == target.content.strip()
-        ):
+        if (exact_target is None and target.id == (preferred_target.id if preferred_target is not None else None)) or final_content.strip() == target.content.strip():
             merged_content = final_content
         else:
+            effective_type = item.okf_type
             final_item = OkfItem(
-                okf_type=item.okf_type,
-                title=item.title,
+                okf_type=effective_type,
+                title=final_title,
                 takeaway=_extract_section(final_content, "Takeaway") or item.takeaway,
                 sections={
                     section: _extract_section(final_content, section) or ""
-                    for section in TYPE_REQUIRED_SECTIONS[item.okf_type]
+                    for section in TYPE_REQUIRED_SECTIONS[effective_type]
                 },
                 sources=list(sources),
                 evidence=list(item.evidence),
@@ -1588,25 +1730,20 @@ class Distiller:
                     status_code=502,
                     details={"target_node_id": target.id},
                 )
-
-        with self._sampling_call_context(transcript, "write_commit"):
-            updated = service._merge_update_node(
-                target_id=target.id,
+        merged_sources = list(dict.fromkeys([*target.metadata.sources, *sources]))
+        effective_type = item.okf_type
+        with self._sampling_call_context(transcript, "final_okf_repair"):
+            final_title, final_content, final_okf_type, _warnings = service._validate_distiller_final_body(
+                title=target.title,
                 content=merged_content,
-                title=item.title,
-                sources=sources,
-                verified=item.verified,
-                route="distiller",
-                okf_type=item.okf_type,
+                okf_type=effective_type,
+                sources=merged_sources,
+                links=[],
             )
-        updated_node = updated.get("node")
-        node_id = updated_node.get("id") if isinstance(updated_node, dict) else None
-        action = str(updated.get("action", "updated"))
-        self._count_action(report, action)
-        if decision_endpoint is not None:
-            endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
-            endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
-        return {"action": action, "node_ids": [node_id] if node_id else []}, final_content
+        if final_okf_type is not None:
+            item.okf_type = final_okf_type
+        takeaway_key = self._takeaway_key(_extract_section(final_content, "Takeaway") or "")
+        return target, final_title, final_content, takeaway_key
 
     def _write_item(
         self,
@@ -1625,214 +1762,245 @@ class Distiller:
         quarantine_context = quarantine_context if quarantine_context is not None else {}
         if dry_run:
             return {"action": "planned", "node_ids": []}
-        if prepared is None and not guard_fallback:
-            try:
-                with self._sampling_call_context(transcript, "write_decider") as call_context:
-                    prepared = service.prepare_distilled_write(
-                        title=item.title,
-                        content=item.render(),
-                        node_type=NodeType.PERSISTENT,
-                        sources=list(item.sources),
-                        okf_type=item.okf_type,
+
+        stale_rechecks = 0
+        while stale_rechecks < self.MAX_COMMIT_STALE_RECHECKS:
+            if prepared is None and not guard_fallback:
+                try:
+                    with self._sampling_call_context(transcript, "write_decider") as call_context:
+                        prepared = service.prepare_distilled_write(
+                            title=item.title,
+                            content=item.render(),
+                            node_type=NodeType.PERSISTENT,
+                            sources=list(item.sources),
+                            okf_type=item.okf_type,
+                        )
+                except SynapseServiceError as exc:
+                    if not self._is_transcript_target_guard_error(exc):
+                        raise
+                    guard_fallback = True
+                if isinstance(call_context, dict):
+                    decision_endpoint = next(
+                        (endpoint for endpoint, stats in call_context["endpoints"].items() if stats.get("successes", 0)),
+                        None,
                     )
-            except SynapseServiceError as exc:
-                if not self._is_transcript_target_guard_error(exc):
-                    raise
-                guard_fallback = True
-            if isinstance(call_context, dict):
-                decision_endpoint = next(
-                    (
-                        endpoint
-                        for endpoint, stats in call_context["endpoints"].items()
-                        if stats.get("successes", 0)
-                    ),
-                    None,
-                )
-        decision = ((prepared or {}).get("decision_result") or {}).get("decision") or {}
-        quarantine_context.setdefault("intended_action", decision.get("action") or ("create" if guard_fallback else "create"))
-        quarantine_context.setdefault("target_node_ids", list(decision.get("target_node_ids") or []))
-        quarantine_context["candidate_content"] = prepared.get("content") if prepared else item.render()
-        with self._write_commit_lock:
+
+            decision_result = (prepared or {}).get("decision_result") or {}
+            decision = decision_result.get("decision") or {}
+            decision_target_ids = list(decision.get("target_node_ids") or [])
+            sources = list((prepared or {}).get("sources") or item.sources)
+            quarantine_context.setdefault("intended_action", decision.get("action") or "create")
+            quarantine_context.setdefault("target_node_ids", decision_target_ids)
+            quarantine_context["candidate_content"] = (prepared or {}).get("content") or item.render()
+
+            # Expensive duplicate search, embedding/reranking and any merge LLM
+            # call happen before acquiring the cross-worker commit lock.
             store = self._get_store()
+            query_title = item.title
+            query_title_signature = self._title_index_signature(query_title)
             near_dup = self._find_near_duplicate(item, transcript, store)
             if near_dup is not None:
+                near_dup = store.get_node(near_dup.id)
+                if near_dup is not None and (near_dup.metadata.status is not NodeStatus.ACTIVE or near_dup.metadata.type is not NodeType.PERSISTENT):
+                    near_dup = None
+            if near_dup is not None:
                 quarantine_context["merge_update_target"] = near_dup.id
-            exact_takeaway_duplicate = (
-                near_dup is not None
-                and self._takeaway_key(item.takeaway)
-                == self._takeaway_key(_extract_section(near_dup.content, "Takeaway") or "")
-            )
-            if exact_takeaway_duplicate:
-                candidate_content = prepared["content"] if prepared is not None else item.render()
-                if candidate_content.strip() == near_dup.content.strip():
-                    merged_content = near_dup.content
-                else:
+            exact_item_takeaway = False
+            content = (prepared or {}).get("content") or item.render()
+            if near_dup is not None:
+                exact_item_takeaway = self._takeaway_key(item.takeaway) == self._takeaway_key(
+                    _extract_section(near_dup.content, "Takeaway") or ""
+                )
+                if not exact_item_takeaway and content.strip() != near_dup.content.strip():
                     with self._sampling_call_context(transcript, "near_duplicate_merge"):
-                        merged_content = self._merge_item_into_node(item, near_dup)
-                    if merged_content is None:
+                        merged = self._merge_item_into_node(item, near_dup)
+                    if merged is not None:
+                        content = merged
+                    elif exact_item_takeaway or guard_fallback:
                         raise SynapseServiceError(
                             "EXACT_TAKEAWAY_MERGE_FAILED",
-                            "Exact-takeaway duplicate could not be safely merged",
+                            "Duplicate could not be safely merged",
                             status_code=502,
                             details={"target_node_id": near_dup.id},
                         )
-                updated, _final_content = self._final_takeaway_duplicate_update(
-                    service,
-                    transcript,
-                    item,
-                    report,
-                    store,
-                    merged_content,
-                    sources=list(item.sources),
-                    preferred_target=near_dup,
-                    decision_endpoint=decision_endpoint,
-                )
-                assert updated is not None
-                return updated
-            if guard_fallback:
-                if near_dup is not None:
-                    with self._sampling_call_context(transcript, "near_duplicate_merge"):
-                        merged = self._merge_item_into_node(item, near_dup)
-                    final_candidate = merged or item.render()
-                    updated, _final_content = self._final_takeaway_duplicate_update(
-                        service,
-                        transcript,
-                        item,
-                        report,
-                        store,
-                        final_candidate,
-                        sources=list(item.sources),
-                        preferred_target=near_dup,
-                    )
-                    assert updated is not None
-                    return updated
-                final_candidate = item.render()
-                updated, final_candidate = self._final_takeaway_duplicate_update(
-                    service,
-                    transcript,
-                    item,
-                    report,
-                    store,
-                    final_candidate,
-                    sources=list(item.sources),
-                    decision_endpoint=decision_endpoint,
-                )
-                if updated is not None:
-                    return updated
-                report.guard_fallback_creates += 1
-                self._logger.warning(
-                    "Guard fired on distilled item; falling back to create",
-                    extra={"node_id": transcript.id, "item": item.title},
-                )
-                with self._sampling_call_context(transcript, "write_commit"):
-                    fallback = service.integrate_knowledge(
-                        title=item.title,
-                        content=final_candidate,
-                        node_type=NodeType.PERSISTENT,
-                        sources=list(item.sources),
-                        okf_type=item.okf_type,
-                        okf_version=1,
-                        project=self._transcript_project(transcript),
-                        validate_okf=True,
-                    )
-                node_payload = fallback.get("node") if isinstance(fallback, dict) else None
-                node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
-                return {"action": "guard_fallback_create", "node_ids": [node_id] if node_id else []}
-            if prepared is None:
-                raise RuntimeError("distilled write has no prepared decision")
-            content = prepared["content"]
-            if near_dup is not None:
-                with self._sampling_call_context(transcript, "near_duplicate_merge"):
-                    merged = self._merge_item_into_node(item, near_dup)
-                if merged is not None:
-                    content = merged
-            decision_result = prepared.get("decision_result") or {}
-            decision = decision_result.get("decision") or {}
-            target_ids = list(decision.get("target_node_ids") or [])
-            candidate_links = list(prepared.get("links") or [])
+            links = list((prepared or {}).get("links") or [])
             if decision.get("action") != "create":
-                candidate_links.extend(target_ids)
-            duplicate_update, content = self._final_takeaway_duplicate_update(
+                links.extend(decision_target_ids)
+            if exact_item_takeaway and near_dup is not None:
+                links = [link for link in links if link != near_dup.id]
+            exact_target, final_title, final_content, takeaway_key = self._prepare_final_takeaway_duplicate(
                 service,
                 transcript,
                 item,
-                report,
-                store,
                 content,
-                sources=list(prepared.get("sources") or []),
-                links=candidate_links,
-                decision_endpoint=decision_endpoint,
+                store,
+                sources=sources,
+                links=links,
+                preferred_target=near_dup if (guard_fallback or decision.get("action") == "create") else None,
             )
-            if duplicate_update is not None:
-                return duplicate_update
+            item.title = final_title
+            title_repaired = exact_target is None and final_title != query_title
+            final_title_signature = self._title_index_signature(final_title)
+            if prepared is not None:
+                prepared = dict(prepared)
+                prepared["title"] = final_title
+                prepared["content"] = final_content
+                prepared["okf_type"] = item.okf_type
 
-            forced_node_id: str | None = None
-            if not slugify_english_title(item.title):
-                date_part = datetime.now(UTC).strftime("%Y%m%d")
-                digest = hashlib.sha256(f"{item.title}{item.takeaway}".encode("utf-8")).hexdigest()[:8]
-                type_part = item.okf_type if item.okf_type in ("decision", "fact", "procedure", "pitfall") else "node"
-                forced_node_id = f"mem_{date_part}_{type_part}_{digest}"
-            prepared_write = dict(prepared)
-            prepared_write["content"] = content
+            target_ids = set(decision_target_ids)
+            if near_dup is not None:
+                target_ids.add(near_dup.id)
+            if exact_target is not None:
+                target_ids.add(exact_target.id)
+            snapshots = {node_id: self._node_commit_signature(store.get_node(node_id)) for node_id in target_ids}
+            indexed_exact = self._lookup_takeaway(takeaway_key) if takeaway_key else None
+            expected_exact_id = indexed_exact.id if indexed_exact is not None else None
+
+            lock_wait_started = time.perf_counter()
+            self._write_commit_lock.acquire()
+            lock_acquired = time.perf_counter()
+            stale = title_repaired or query_title_signature != self._title_index_signature(query_title) or final_title_signature != self._title_index_signature(final_title)
+            committed_ids: set[str] = set(target_ids)
+            lock_action = "retry"
             try:
-                with self._sampling_call_context(transcript, "write_commit"):
-                    result = service.commit_distilled_write(
-                        prepared_write,
-                        okf_version=1,
-                        project=self._transcript_project(transcript),
-                        node_id=forced_node_id,
-                        downgrade_supersede=downgrade_supersede,
-                        route="distiller",
+                locked_store = self._get_store()
+                for node_id, snapshot in snapshots.items():
+                    current = locked_store.get_node(node_id)
+                    if self._node_commit_signature(current) != snapshot:
+                        stale = True
+                        break
+                if not stale:
+                    current_exact = self._lookup_takeaway(takeaway_key) if takeaway_key else None
+                    current_exact_id = current_exact.id if current_exact is not None else None
+                    if current_exact_id != expected_exact_id:
+                        stale = True
+
+                if stale:
+                    stale_rechecks += 1
+                elif exact_target is not None:
+                    target_type = item.okf_type
+                    updated = service._merge_update_node(
+                        target_id=exact_target.id,
+                        content=final_content,
+                        title=final_title,
+                        sources=sources,
                         verified=item.verified,
-                        merge_update_target=near_dup.id if near_dup is not None else None,
+                        route="distiller",
+                        okf_type=target_type,
+                        validated_title=final_title,
                     )
-            except SynapseServiceError as exc:
-                if not self._is_transcript_target_guard_error(exc):
-                    raise
-                report.guard_fallback_creates += 1
-                self._logger.warning(
-                    "Guard fired on distilled item; falling back to create",
-                    extra={"node_id": transcript.id, "item": item.title},
-                )
-                with self._sampling_call_context(transcript, "write_commit"):
+                    node_payload = updated.get("node")
+                    node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
+                    action = str(updated.get("action", "updated"))
+                    self._count_action(report, action)
+                    if decision_endpoint is not None:
+                        endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
+                        endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
+                    if node_id:
+                        committed_ids.add(node_id)
+                    lock_action = "merged"
+                    self._refresh_candidate_index(committed_ids)
+                    return {"action": action, "node_ids": [node_id] if node_id else []}
+                elif guard_fallback:
+                    report.guard_fallback_creates += 1
                     fallback = service.integrate_knowledge(
-                        title=item.title,
-                        content=content,
+                        title=final_title,
+                        content=final_content,
                         node_type=NodeType.PERSISTENT,
-                        sources=list(item.sources),
+                        sources=sources,
                         okf_type=item.okf_type,
                         okf_version=1,
                         project=self._transcript_project(transcript),
                         validate_okf=True,
                     )
-                node_payload = fallback.get("node") if isinstance(fallback, dict) else None
-                node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
-                return {"action": "guard_fallback_create", "node_ids": [node_id] if node_id else []}
-
-            decision = result.get("decision", {})
-            action = str(decision.get("action", ""))
-            node_payload = result.get("execution", {}).get("result", {}).get("node", {})
-            node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
-            if not action and result.get("action") in {"updated", "unchanged"}:
-                action = str(result["action"])
-                merged_node = result.get("node")
-                node_id = merged_node.get("id") if isinstance(merged_node, dict) else None
-            self._count_action(report, action)
-            if decision_endpoint is not None:
-                endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
-                endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
-            downgrade = result.get("downgrade")
-            if isinstance(downgrade, dict):
-                report.decider_downgrades += 1
-                report.downgraded.append(
-                    {
-                        "transcript_id": transcript.id,
-                        "item_title": item.title,
-                        "reason": downgrade.get("reason", "supersede downgraded to complement (backfill safety)"),
-                        "target_node_ids": downgrade.get("target_node_ids", []),
-                    }
+                    node_payload = fallback.get("node") if isinstance(fallback, dict) else None
+                    node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
+                    if node_id:
+                        committed_ids.add(node_id)
+                    lock_action = "guard_fallback_create"
+                    self._refresh_candidate_index(committed_ids)
+                    return {"action": lock_action, "node_ids": [node_id] if node_id else []}
+                else:
+                    if prepared is None:
+                        raise RuntimeError("distilled write has no prepared decision")
+                    forced_node_id: str | None = None
+                    if not slugify_english_title(final_title):
+                        date_part = datetime.now(UTC).strftime("%Y%m%d")
+                        digest = hashlib.sha256(f"{final_title}{item.takeaway}".encode("utf-8")).hexdigest()[:8]
+                        type_part = item.okf_type if item.okf_type in ("decision", "fact", "procedure", "pitfall") else "node"
+                        forced_node_id = f"mem_{date_part}_{type_part}_{digest}"
+                    try:
+                        result = service.commit_distilled_write(
+                            prepared,
+                            okf_version=1,
+                            project=self._transcript_project(transcript),
+                            node_id=forced_node_id,
+                            downgrade_supersede=downgrade_supersede,
+                            route="distiller",
+                            verified=item.verified,
+                            merge_update_target=near_dup.id if near_dup is not None else None,
+                        )
+                    except SynapseServiceError as exc:
+                        if not self._is_transcript_target_guard_error(exc):
+                            raise
+                        report.guard_fallback_creates += 1
+                        result = service.integrate_knowledge(
+                            title=final_title,
+                            content=final_content,
+                            node_type=NodeType.PERSISTENT,
+                            sources=sources,
+                            okf_type=item.okf_type,
+                            okf_version=1,
+                            project=self._transcript_project(transcript),
+                            validate_okf=True,
+                        )
+                        lock_action = "guard_fallback_create"
+                    decision_result = result.get("decision", {})
+                    action = str(decision_result.get("action", ""))
+                    execution = result.get("execution", {}).get("result", {})
+                    node_payload = execution.get("node", {}) if isinstance(execution, dict) else {}
+                    node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
+                    if not action and result.get("action") in {"updated", "unchanged"}:
+                        action = str(result["action"])
+                        node_payload = result.get("node")
+                        node_id = node_payload.get("id") if isinstance(node_payload, dict) else None
+                    self._count_action(report, action)
+                    if decision_endpoint is not None:
+                        endpoint_actions = report.actions_by_endpoint.setdefault(decision_endpoint, {})
+                        endpoint_actions[action] = endpoint_actions.get(action, 0) + 1
+                    if isinstance(result.get("downgrade"), dict):
+                        downgrade_record = result["downgrade"]
+                        report.decider_downgrades += 1
+                        report.downgraded.append({"transcript_id": transcript.id,"item_title": item.title,"reason": downgrade_record.get("reason", "supersede downgraded to complement (backfill safety)"),"target_node_ids": downgrade_record.get("target_node_ids", [])})
+                    if node_id:
+                        committed_ids.add(node_id)
+                    lock_action = action or lock_action
+                    self._refresh_candidate_index(committed_ids)
+                    return {"action": lock_action, "node_ids": [node_id] if node_id else []}
+            finally:
+                lock_hold_ms = (time.perf_counter() - lock_acquired) * 1000
+                self._write_commit_lock.release()
+                self._logger.info(
+                    "Distiller item commit lock timing",
+                    extra={"transcript_id": transcript.id,"item": item.title,"wait_ms": round((lock_acquired-lock_wait_started)*1000,3),"hold_ms": round(lock_hold_ms,3),"action": lock_action,"stale_recheck": stale},
                 )
-            return {"action": action, "node_ids": [node_id] if node_id else []}
+
+            if stale:
+                self._logger.info(
+                    "Distiller commit target changed; re-preparing outside commit lock",
+                    extra={"transcript_id": transcript.id,"item": item.title,"recheck": stale_rechecks},
+                )
+                prepared = None
+                decision_endpoint = None
+                guard_fallback = False
+                continue
+
+        raise SynapseServiceError(
+            "STALE_DISTILLER_TARGET",
+            "Distiller targets changed during repeated commit rechecks",
+            status_code=409,
+            details={"transcript_id": transcript.id,"title": item.title,"rechecks": stale_rechecks},
+        )
 
     @staticmethod
     def _count_action(report: DistillerReport, action: str) -> None:

@@ -123,6 +123,13 @@ def _make_distiller(tmp_path: Path, client: Any) -> tuple[Distiller, RuntimePath
     distiller = Distiller(_config(tmp_path), runtime_paths=runtime_paths, sampling_client=client)
     return distiller, runtime_paths
 
+@pytest.fixture(autouse=True)
+def _disable_default_same_run_retry_in_legacy_tests(monkeypatch) -> None:
+    # Retry-specific tests opt back into the production attempt/cooldown policy.
+    monkeypatch.setattr(Distiller, "MAX_TRANSCRIPT_ATTEMPTS_PER_RUN", 1)
+    monkeypatch.setattr(Distiller, "TRANSCRIPT_RETRY_COOLDOWN", timedelta(0))
+
+
 
 # ---------------------------------------------------------------------------
 # 1. Selector + hash gate
@@ -2851,7 +2858,7 @@ def test_concurrent_transcripts_serialize_near_duplicate_gate_and_commit(
         persistent = distiller._get_store().list_nodes(
             {"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT}
         )
-        assert client.write_calls == 3
+        assert client.write_calls >= 3  # stale commits re-run the write decision outside the lock
         assert report.transcripts_scanned == 3
         assert report.transcripts_distilled == 3
         assert report.llm_failures == 0
@@ -3483,5 +3490,223 @@ def test_invalid_item_is_quarantined_without_blocking_later_items(
                 ).fetchone()
             assert run_row is not None and run_row["items_quarantined"] == 1
         assert client.repairs == 1
+    finally:
+        distiller.close()
+
+
+
+
+
+
+def test_retryable_transcript_requeues_after_cooldown_and_respects_attempt_cap(tmp_path: Path, monkeypatch) -> None:
+    import synapse.lifecycle.distiller as distiller_module
+    from synapse.server.sampling import MemoryWriteSamplingDecision
+
+    class DecisionsClient(FakeDistillSamplingClient):
+        def __init__(self, fail_count: int) -> None:
+            super().__init__([dict(_PITFALL_ITEM, title="Same-run retry lesson")])
+            self.fail_count = fail_count
+            self.decisions = 0
+
+        def decide_memory_write(self, _request):
+            self.decisions += 1
+            if self.decisions <= self.fail_count:
+                raise RuntimeError("temporary write-decision failure")
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    for fail_count, expected_writes in ((1, 1), (3, 0)):
+        run_root = tmp_path / f"retry-{fail_count}"
+        run_root.mkdir()
+        client = DecisionsClient(fail_count)
+        distiller, paths = _make_distiller(run_root, client)
+        distiller.MAX_TRANSCRIPT_ATTEMPTS_PER_RUN = 2
+        distiller.TRANSCRIPT_RETRY_COOLDOWN = timedelta(minutes=10)
+        fake_now = [datetime(2026, 10, 16, 0, 0, tzinfo=UTC)]
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            fake_now[0] += timedelta(seconds=seconds)
+
+        monkeypatch.setattr(distiller, "_retry_clock", lambda: fake_now[0])
+        monkeypatch.setattr(distiller_module.time, "sleep", fake_sleep)
+        transcript = _write_transcript(
+            paths,
+            f"mem_session_retry_{fail_count}",
+            "## User\nThe session contains one durable lesson.\n\n## Assistant\nRecorded.",
+            session_key=f"retry-{fail_count}",
+        )
+        old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+        os.utime(paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+        try:
+            report = distiller.run(downgrade_supersede=False)
+            assert client.decisions == distiller.MAX_TRANSCRIPT_ATTEMPTS_PER_RUN == 2
+            assert report.transcripts_scanned == 2
+            assert report.transcripts_distilled == expected_writes
+            assert report.transcripts_skipped == 2 - expected_writes
+            assert sleeps == [600.0]
+            active = distiller._get_store().list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+            assert len([node for node in active if node.title == "Same-run retry lesson"]) == expected_writes
+        finally:
+            distiller.close()
+
+
+def test_concurrent_merges_recheck_target_after_outside_lock_preparation(tmp_path: Path, monkeypatch) -> None:
+    from synapse.server.sampling import MemoryWriteSamplingDecision
+    from synapse.lifecycle.distiller import _extract_section
+
+    takeaway = "Concurrent writers preserve one shared retry target."
+
+    class ConcurrentMergeClient:
+        name = "concurrent-target-recheck"
+
+        def __init__(self) -> None:
+            self.merge_barrier = threading.Barrier(2)
+            self.merge_calls = 0
+            self.guard = threading.Lock()
+
+        def sample_json(self, *, prompt: str, **_kwargs):
+            if "You merge new knowledge INTO an existing OKF knowledge node" in prompt:
+                with self.guard:
+                    self.merge_calls += 1
+                    call = self.merge_calls
+                if call <= 2:
+                    self.merge_barrier.wait(timeout=10)
+                return {
+                    "takeaway": takeaway,
+                    "sections": {
+                        "Symptom": "The two sessions report the same probe issue.",
+                        "Cause": "Both use a region-local deadline.",
+                        "Fix": "Use the shared deadline.",
+                    },
+                }
+            return {"items": [dict(_PITFALL_ITEM, title="Shared retry target", takeaway=takeaway)]}
+
+        def decide_memory_write(self, _request):
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    class FirstTwoCommitBarrier:
+        def __init__(self) -> None:
+            self.lock = threading.RLock()
+            self.barrier = threading.Barrier(2)
+            self.count = 0
+            self.guard = threading.Lock()
+
+        def acquire(self, *args, **kwargs):
+            with self.guard:
+                self.count += 1
+                ordinal = self.count
+            if ordinal <= 2:
+                self.barrier.wait(timeout=10)
+            return self.lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return self.lock.release()
+
+    config = _config(tmp_path)
+    config.distiller.transcript_concurrency = 2
+    paths = _runtime(tmp_path)
+    client = ConcurrentMergeClient()
+    service = SynapseServerService(config, runtime_paths=paths, sampling_client=client)
+    service.integrate_knowledge(
+        title="Existing shared retry target",
+        content=(
+            f"## Takeaway\n{takeaway}\n\n"
+            "## Symptom\nThe initial session reports a probe issue.\n\n"
+            "## Cause\nThe initial deadline is local.\n\n"
+            "## Fix\nUse the original shared deadline.\n\n"
+            "## Sources\n- mem_session_prior"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="pitfall",
+        sources=["mem_session_prior"],
+    )
+    distiller = Distiller(config, runtime_paths=paths, sampling_client=client, service=service)
+    barrier_lock = FirstTwoCommitBarrier()
+    distiller._write_commit_lock = barrier_lock
+    transcripts = [
+        _write_transcript(
+            paths,
+            f"mem_session_same_target_{suffix}",
+            f"## User\nVariant {suffix} states the shared probe lesson.\n\n## Assistant\nRecorded.",
+            session_key=f"same-target-{suffix}",
+        )
+        for suffix in ("a", "b")
+    ]
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    for transcript in transcripts:
+        os.utime(paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+
+    try:
+        report = distiller.run(downgrade_supersede=False)
+        active = distiller._get_store().list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+        matching = [node for node in active if Distiller._takeaway_key(_extract_section(node.content, "Takeaway") or "") == Distiller._takeaway_key(takeaway)]
+        assert report.transcripts_distilled == 2
+        assert report.transcripts_skipped == 0
+        assert len(matching) == 1
+        assert barrier_lock.count >= 3  # second prepared decision was rejected as stale and rechecked
+        assert client.merge_calls >= 2
+    finally:
+        distiller.close()
+
+
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+def test_final_gate_repairs_overlong_title_or_quarantines(tmp_path: Path, monkeypatch, repair_succeeds: bool) -> None:
+    long_title = "AuthZ V2 role assignment pagination uses one consistent stable email cursor across every workspace requested"
+    short_title = "AuthZ role pagination uses a stable email cursor"
+    body = (
+        "## Takeaway\nUse one stable email cursor.\n\n"
+        "## Symptom\nPages can repeat or skip users.\n\n"
+        "## Cause\nThe page ordering changes between requests.\n\n"
+        "## Fix\nRetain the same email cursor.\n\n"
+        "## Sources\n- mem_session_long_title"
+    )
+
+    class FinalTitleClient:
+        name = "final-title-repair"
+
+        def __init__(self) -> None:
+            self.repairs = 0
+
+        def sample_json(self, *, prompt: str, **_kwargs):
+            if "Repair this persistent OKF body" in prompt:
+                self.repairs += 1
+                return {"title": short_title if repair_succeeds else long_title, "content": body}
+            return {"items": [dict(_PITFALL_ITEM, title=long_title, takeaway="Use one stable email cursor.")]}
+
+        def decide_memory_write(self, _request):
+            from synapse.server.sampling import MemoryWriteSamplingDecision
+            return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
+
+    client = FinalTitleClient()
+    config = _config(tmp_path)
+    paths = _runtime(tmp_path)
+    distiller = Distiller(config, runtime_paths=paths, sampling_client=client)
+    # Exercise the final persisted-body gate rather than the earlier CJK/slug repair.
+    monkeypatch.setattr(distiller, "_title_needs_repair", lambda _title: False)
+    import synapse.server.write_normalize as write_normalize_module
+    monkeypatch.setattr(write_normalize_module, "title_needs_repair", lambda _title: False)
+    transcript = _write_transcript(
+        paths,
+        "mem_session_long_title",
+        "## User\nThe endpoint uses a stable email cursor.\n\n## Assistant\nRecorded.",
+        session_key="final-title-repair",
+    )
+    old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(paths.active / f"{transcript.id}.md", (old_ts, old_ts))
+    try:
+        report = distiller.run(downgrade_supersede=False)
+        assert client.repairs == 1
+        active = distiller._get_store().list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+        if repair_succeeds:
+            assert any(node.title == short_title for node in active)
+            assert report.items_quarantined == 0
+        else:
+            assert report.items_quarantined == 1
+            assert not any(node.title == long_title for node in active)
+            quarantine = next((paths.base / ".distiller-quarantine").glob("*.jsonl"))
+            record = json.loads(quarantine.read_text(encoding="utf-8").splitlines()[0])
+            assert "okf_title_too_long" in {finding["code"] for finding in record["validator_findings"]}
     finally:
         distiller.close()

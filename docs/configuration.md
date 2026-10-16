@@ -232,6 +232,7 @@ Controls the local OpenAI-compatible LLM pool used for sampling decisions (write
 - `timeout_seconds` — HTTP timeout per endpoint for write-path decisions. Distiller extraction/reduce/title-repair use `[distiller].llm_timeout_seconds`; each distiller write decision returns to this timeout.
 - `max_tokens` (default `200000`) — generation token budget; keep it high enough for reasoning plus the structured answer rather than imposing a tight cap
 - `temperature` (default `0.0`) — sampling temperature; zero is preferred for deterministic structured decisions
+- `local_llm` transient failures (transport/disconnect/reset/timeout, HTTP 429/5xx, invalid JSON) get up to 3 attempts per endpoint with jittered 5s/20s backoff before endpoint failover; other 4xx and configuration errors are not retried.
 
 > Configure the serving model name exactly as advertised by the endpoint. Leave `api_key_env` blank for no-auth local endpoints.
 
@@ -282,6 +283,7 @@ Controls the session distiller — the server-side pipeline that converts sessio
 - `llm_timeout_seconds` (int, ≥1, default `300`) — HTTP timeout for the distiller's own LLM client; the write-path decider timeout is unchanged
 - `max_transcripts_per_run` (int, 1–5000, default `500`) — bounded per-sweep safety cap; freed transcript slots refill from the pending backlog until this cap or exhaustion
 - `backoff_sweeps` (int, default `3`) — sweeps a failing transcript is skipped before retry
+- A failed or partial transcript may be retried once within the same sweep after a 10-minute cooldown; the sweep waits for that retry if it is still eligible. Each transcript task logs its duration, and each item commit logs lock wait/hold time.
 
 Maintenance commands: `python -m synapse distill status | run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`.
 
