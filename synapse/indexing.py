@@ -265,6 +265,7 @@ def collect_health_status(
     runtime_paths: RuntimePaths | None = None,
     embedding_report: EmbeddingProbeReport | None = None,
     sync_result: SyncBatchResult | None = None,
+    include_missing_link_diagnostics: bool = True,
 ) -> SystemHealthReport:
     """Collect a health snapshot for status commands and future APIs."""
 
@@ -315,25 +316,26 @@ def collect_health_status(
             stats["superseded_nodes"] = counts.get("superseded", 0)
             stats["disputed_nodes"] = counts.get("disputed", 0)
             embedding_fingerprint = store.get_embedding_fingerprint()
+            missing_link_pair_count = 0
+            missing_link_histogram = _empty_similarity_histogram()
+            if include_missing_link_diagnostics:
+                missing_link_pairs, missing_link_histogram = store.analyze_missing_links(
+                    cosine_threshold=thresholds["missing_link_cosine"],
+                    histogram_thresholds=(0.70, 0.75, 0.80, 0.85, 0.90),
+                    recency_days=thresholds["link_weaving_recency_days"],
+                )
+                missing_link_pair_count = len(missing_link_pairs)
             lifecycle_stats = {
                 "thresholds": thresholds,
                 "current_candidates": {
                     "stale_orphans": len(store.find_orphan_candidates(thresholds["stale_orphan_days"])),
-                    "missing_link_pairs": len(
-                        store.find_missing_link_pairs(
-                            cosine_threshold=thresholds["missing_link_cosine"],
-                            recency_days=thresholds["link_weaving_recency_days"],
-                        )
-                    ),
+                    "missing_link_pairs": missing_link_pair_count,
                     "disputed_pairs": store.count_disputed_pairs(),
                     "superseded_archival_candidates": len(
                         store.find_superseded_for_archival(days_threshold=thresholds["superseded_archive_days"])
                     ),
                 },
-                "missing_link_similarity_histogram": store.missing_link_similarity_histogram(
-                    thresholds=(0.70, 0.75, 0.80, 0.85, 0.90),
-                    recency_days=thresholds["link_weaving_recency_days"],
-                ),
+                "missing_link_similarity_histogram": missing_link_histogram,
                 **store.get_dreamer_metrics_summary(),
             }
             write_stats = store.get_write_memory_metrics_summary()
@@ -482,6 +484,7 @@ def run_startup_checks(
         runtime_paths=paths,
         embedding_report=embedding_probe,
         sync_result=sync_result,
+        include_missing_link_diagnostics=False,
     )
     return StartupReport(
         runtime_paths=paths,

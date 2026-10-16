@@ -21,6 +21,10 @@ python -m synapse serve --run-server
 pytest
 ```
 
+### Health diagnostics
+
+Server startup runs integrity and readiness checks without calculating missing-link candidates or similarity histograms. Those informational diagnostics remain available on demand through `synapse status` and detailed service stats, where both are calculated in one scan. Dreamer continues to scan the full exact candidate set when it runs and applies its configured pair cap afterward.
+
 ## Starting local inference with llama.cpp
 
 Synapse requires two running inference servers — one for embedding, one for reranking.
