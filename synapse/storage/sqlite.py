@@ -13,10 +13,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Literal, Sequence
 
+import numpy as np
+
 from synapse.models import Node, NodeMetadata, NodeStatus, NodeType
 from synapse.storage.markdown import extract_wiki_links
 
 
+_MISSING_LINK_BLOCK_ROWS = 1024
 SCHEMA_VERSION = 7
 FALLBACK_VECTOR_BACKEND = "python-fallback"
 SQLITE_VEC_BACKEND = "sqlite-vec"
@@ -1213,78 +1216,99 @@ class SQLiteNodeStore:
         recency_days: int = 30,
     ) -> list[tuple[Node, Node]]:
         """Find active node pairs with high cosine similarity but no edge between them."""
-        cutoff = _utc_cutoff(recency_days)
-        # Get active nodes accessed since cutoff that have embeddings
-        rows = self._connection.execute(
-            """
-            SELECT n.id
-            FROM nodes AS n
-            JOIN nodes_vec AS v ON v.id = n.id
-            WHERE n.status = ? AND n.last_accessed > ?
-            ORDER BY n.id ASC
-            """,
-            [NodeStatus.ACTIVE.value, cutoff],
-        ).fetchall()
-        candidate_ids = [str(row["id"]) for row in rows]
-
-        if len(candidate_ids) < 2:
-            return []
-
-        # Load embeddings for all candidates
-        embeddings: dict[str, list[float]] = {}
-        for cid in candidate_ids:
-            vec_row = self._connection.execute(
-                "SELECT embedding FROM nodes_vec WHERE id = ?", [cid]
-            ).fetchone()
-            if vec_row is not None:
-                try:
-                    embeddings[cid] = json.loads(str(vec_row["embedding"]))
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
-        embed_ids = list(embeddings.keys())
-        if len(embed_ids) < 2:
-            return []
-
-        pairs: list[tuple[Node, Node]] = []
-        seen_pairs: set[tuple[str, str]] = set()
-
-        for i, id_a in enumerate(embed_ids):
-            vec_a = embeddings[id_a]
-            for id_b in embed_ids[i + 1 :]:
-                vec_b = embeddings[id_b]
-                try:
-                    distance = _cosine_distance(vec_a, vec_b)
-                except ValueError:
-                    continue
-                if distance > (1.0 - cosine_threshold):
-                    continue
-
-                pair_key = (id_a, id_b) if id_a < id_b else (id_b, id_a)
-                if pair_key in seen_pairs:
-                    continue
-
-                # Check if edge already exists between them
-                edge_row = self._connection.execute(
-                    """
-                    SELECT COUNT(*) AS cnt FROM edges
-                    WHERE (source_id = ? AND target_id = ?)
-                       OR (source_id = ? AND target_id = ?)
-                    """,
-                    [id_a, id_b, id_b, id_a],
-                ).fetchone()
-                if edge_row and int(edge_row["cnt"]) > 0:
-                    continue
-
-                node_a = self.get_node(id_a)
-                node_b = self.get_node(id_b)
-                if node_a is None or node_b is None:
-                    continue
-
-                seen_pairs.add(pair_key)
-                pairs.append((node_a, node_b))
-
+        pairs, _ = self.analyze_missing_links(
+            cosine_threshold=cosine_threshold,
+            recency_days=recency_days,
+        )
         return pairs
+
+    def analyze_missing_links(
+        self,
+        *,
+        cosine_threshold: float | None = None,
+        histogram_thresholds: Iterable[float] = (),
+        recency_days: int = 30,
+    ) -> tuple[list[tuple[Node, Node]], dict[str, int]]:
+        """Compute requested missing-link results in one exact, blocked scan."""
+        buckets = sorted({round(float(threshold), 2) for threshold in histogram_thresholds})
+        counts = {f"{threshold:.2f}": 0 for threshold in buckets}
+        if cosine_threshold is None and not buckets:
+            return [], counts
+
+        embeddings = self._recent_active_embeddings(recency_days)
+        ids = list(embeddings)
+        if len(ids) < 2:
+            return [], counts
+
+        thresholds = list(buckets)
+        if cosine_threshold is not None:
+            thresholds.append(cosine_threshold)
+        candidate_floor = min(thresholds)
+
+        edge_rows = self._connection.execute("SELECT source_id, target_id FROM edges").fetchall()
+        edges: set[tuple[str, str]] = set()
+        for row in edge_rows:
+            source_id = str(row["source_id"])
+            target_id = str(row["target_id"])
+            edges.add((source_id, target_id))
+            edges.add((target_id, source_id))
+
+        # Group dimensions because the previous scalar implementation skipped only
+        # unequal-length pairs, rather than rejecting the entire candidate set.
+        groups: dict[int, list[tuple[int, str, list[float]]]] = {}
+        for position, node_id in enumerate(ids):
+            vector = embeddings[node_id]
+            groups.setdefault(len(vector), []).append((position, node_id, vector))
+
+        pair_positions: list[tuple[int, int, str, str]] = []
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            vectors = np.asarray([item[2] for item in group], dtype=np.float64)
+            vector_count = len(group)
+            for block_start in range(0, vector_count, _MISSING_LINK_BLOCK_ROWS):
+                block_end = min(block_start + _MISSING_LINK_BLOCK_ROWS, vector_count)
+                similarities = vectors[block_start:block_end] @ vectors[block_start:].T
+                for row_offset, local_left in enumerate(range(block_start, block_end)):
+                    first_right = local_left - block_start + 1
+                    candidate_offsets = np.flatnonzero(
+                        similarities[row_offset, first_right:] >= candidate_floor - 1e-6
+                    )
+                    for candidate_offset in candidate_offsets:
+                        local_right = block_start + first_right + int(candidate_offset)
+                        original_left, id_a, vector_a = group[local_left]
+                        original_right, id_b, vector_b = group[local_right]
+                        similarity = float(similarities[row_offset, local_right - block_start])
+                        distance = round(1.0 - max(-1.0, min(1.0, similarity)), 8)
+                        rounded_similarity = 1.0 - distance
+
+                        if any(abs(rounded_similarity - threshold) <= 1e-6 for threshold in thresholds):
+                            distance = _cosine_distance(vector_a, vector_b)
+                            rounded_similarity = 1.0 - distance
+
+                        if (id_a, id_b) in edges:
+                            continue
+
+                        for threshold in buckets:
+                            if rounded_similarity >= threshold:
+                                counts[f"{threshold:.2f}"] += 1
+
+                        if cosine_threshold is not None and distance <= (1.0 - cosine_threshold):
+                            pair_positions.append((original_left, original_right, id_a, id_b))
+
+        pair_positions.sort(key=lambda item: (item[0], item[1]))
+        node_cache: dict[str, Node | None] = {}
+        pairs: list[tuple[Node, Node]] = []
+        for _, _, id_a, id_b in pair_positions:
+            if id_a not in node_cache:
+                node_cache[id_a] = self.get_node(id_a)
+            if id_b not in node_cache:
+                node_cache[id_b] = self.get_node(id_b)
+            node_a = node_cache[id_a]
+            node_b = node_cache[id_b]
+            if node_a is not None and node_b is not None:
+                pairs.append((node_a, node_b))
+        return pairs, counts
 
     def find_superseded_for_archival(self, days_threshold: int = 7) -> list[Node]:
         cutoff = _utc_cutoff(days_threshold)
@@ -1348,21 +1372,10 @@ class SQLiteNodeStore:
         recency_days: int,
     ) -> dict[str, int]:
         """Count unlinked recent active node pairs above fixed cosine-similarity buckets."""
-        buckets = sorted({round(float(threshold), 2) for threshold in thresholds})
-        counts = {f"{threshold:.2f}": 0 for threshold in buckets}
-        if not buckets:
-            return counts
-
-        embeddings = self._recent_active_embeddings(recency_days)
-        ids = list(embeddings)
-        for i, id_a in enumerate(ids):
-            for id_b in ids[i + 1 :]:
-                if self._edge_exists_between(id_a, id_b):
-                    continue
-                similarity = _safe_cosine_similarity(embeddings[id_a], embeddings[id_b])
-                if similarity is None:
-                    continue
-                _increment_similarity_buckets(counts, buckets, similarity)
+        _, counts = self.analyze_missing_links(
+            histogram_thresholds=thresholds,
+            recency_days=recency_days,
+        )
         return counts
 
     def _recent_active_embeddings(self, recency_days: int) -> dict[str, list[float]]:
@@ -1384,17 +1397,6 @@ class SQLiteNodeStore:
             except (json.JSONDecodeError, TypeError):
                 continue
         return embeddings
-
-    def _edge_exists_between(self, id_a: str, id_b: str) -> bool:
-        row = self._connection.execute(
-            """
-            SELECT COUNT(*) AS cnt FROM edges
-            WHERE (source_id = ? AND target_id = ?)
-               OR (source_id = ? AND target_id = ?)
-            """,
-            [id_a, id_b, id_b, id_a],
-        ).fetchone()
-        return bool(row and int(row["cnt"]) > 0)
 
     def record_dreamer_run(self, metrics: DreamerRunMetrics) -> None:
         """Persist a low-cardinality Dreamer run summary for long-term stats."""
@@ -1901,12 +1903,6 @@ def _safe_cosine_similarity(left: list[float], right: list[float]) -> float | No
         return 1.0 - _cosine_distance(left, right)
     except ValueError:
         return None
-
-
-def _increment_similarity_buckets(counts: dict[str, int], buckets: list[float], similarity: float) -> None:
-    for threshold in buckets:
-        if similarity >= threshold:
-            counts[f"{threshold:.2f}"] += 1
 
 
 def _round_optional(value: Any) -> float:

@@ -1348,7 +1348,11 @@ class SynapseServerService:
         return payload
 
     def health(self) -> dict[str, Any]:
-        health = collect_health_status(self.config, runtime_paths=self.runtime_paths)
+        health = collect_health_status(
+            self.config,
+            runtime_paths=self.runtime_paths,
+            include_missing_link_diagnostics=False,
+        )
         payload = {
             "status": health.status,
             "components": health.components,

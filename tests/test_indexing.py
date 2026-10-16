@@ -146,6 +146,56 @@ def test_run_startup_checks_recovers_from_corrupt_db(tmp_path: Path) -> None:
         assert store.count_nodes() == 2
 
 
+def test_startup_checks_skip_missing_link_scan(tmp_path: Path, monkeypatch) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    write_sample_nodes(runtime_paths.base)
+    rebuild_index(config, runtime_paths=runtime_paths)
+
+    def fail_if_scanned(*args, **kwargs):
+        raise AssertionError("startup must not compute missing-link diagnostics")
+
+    monkeypatch.setattr(SQLiteNodeStore, "analyze_missing_links", fail_if_scanned)
+    report = run_startup_checks(config, runtime_paths=runtime_paths)
+
+    assert report.health.components["sqlite"] == "ok"
+    assert report.health.lifecycle_stats["current_candidates"]["missing_link_pairs"] == 0
+    assert report.health.lifecycle_stats["missing_link_similarity_histogram"] == {
+        "0.70": 0,
+        "0.75": 0,
+        "0.80": 0,
+        "0.85": 0,
+        "0.90": 0,
+    }
+
+
+def test_collect_health_status_combines_missing_link_diagnostics(tmp_path: Path, monkeypatch) -> None:
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    write_sample_nodes(runtime_paths.base)
+    rebuild_index(config, runtime_paths=runtime_paths)
+    calls = 0
+    analyze = SQLiteNodeStore.analyze_missing_links
+
+    def counted_analysis(self, **kwargs):
+        nonlocal calls
+        calls += 1
+        return analyze(self, **kwargs)
+
+    monkeypatch.setattr(SQLiteNodeStore, "analyze_missing_links", counted_analysis)
+    health = collect_health_status(config, runtime_paths=runtime_paths)
+
+    assert calls == 1
+    assert health.lifecycle_stats["current_candidates"]["missing_link_pairs"] == 0
+    assert health.lifecycle_stats["missing_link_similarity_histogram"] == {
+        "0.70": 0,
+        "0.75": 0,
+        "0.80": 0,
+        "0.85": 0,
+        "0.90": 0,
+    }
+
+
 def test_collect_health_status_reports_degraded_embedding_when_provider_is_unavailable(
     tmp_path: Path,
     monkeypatch,

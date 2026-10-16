@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from synapse.models import Node, NodeMetadata, NodeStatus, NodeType, SensitivityLevel
 from synapse.storage import DreamerRunMetrics, SQLiteNodeStore, WriteMemoryEventMetrics
+import synapse.storage.sqlite as sqlite_module
 from synapse.storage.sqlite import _cosine_distance
 
 
@@ -308,6 +310,154 @@ def test_missing_link_similarity_histogram_counts_unlinked_recent_pairs(tmp_path
 
     assert histogram == {"0.70": 1, "0.90": 1}
     assert [(left.id, right.id) for left, right in pairs] == [(alpha.id, beta.id)]
+
+
+def _scalar_missing_link_results(
+    store: SQLiteNodeStore,
+    *,
+    cosine_threshold: float | None,
+    histogram_thresholds: tuple[float, ...],
+    recency_days: int,
+) -> tuple[list[tuple[str, str]], dict[str, int]]:
+    buckets = sorted({round(float(threshold), 2) for threshold in histogram_thresholds})
+    counts = {f"{threshold:.2f}": 0 for threshold in buckets}
+    embeddings = store._recent_active_embeddings(recency_days)
+    edge_rows = store.connection.execute("SELECT source_id, target_id FROM edges").fetchall()
+    edges = {
+        (str(row["source_id"]), str(row["target_id"]))
+        for row in edge_rows
+    } | {
+        (str(row["target_id"]), str(row["source_id"]))
+        for row in edge_rows
+    }
+    pairs: list[tuple[str, str]] = []
+    ids = list(embeddings)
+    for index, id_a in enumerate(ids):
+        for id_b in ids[index + 1 :]:
+            try:
+                distance = _cosine_distance(embeddings[id_a], embeddings[id_b])
+            except ValueError:
+                continue
+            if (id_a, id_b) in edges:
+                continue
+            similarity = 1.0 - distance
+            for threshold in buckets:
+                if similarity >= threshold:
+                    counts[f"{threshold:.2f}"] += 1
+            if cosine_threshold is not None and distance <= (1.0 - cosine_threshold):
+                pairs.append((id_a, id_b))
+    return pairs, counts
+
+
+def test_numpy_missing_link_scan_matches_scalar_rounding_at_thresholds(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    nodes_and_vectors = [
+        ("mem_boundary_a", [1.0, 0.0]),
+        ("mem_boundary_b", [0.9, math.sqrt(1.0 - 0.9**2)]),
+        ("mem_boundary_c", [0.9000000003, math.sqrt(1.0 - 0.9000000003**2)]),
+        ("mem_boundary_d", [0.8999999997, math.sqrt(1.0 - 0.8999999997**2)]),
+        ("mem_boundary_e", [0.75, math.sqrt(1.0 - 0.75**2)]),
+    ]
+    with SQLiteNodeStore(db_path, embedding_dimension=2) as store:
+        for node_id, vector in nodes_and_vectors:
+            store.upsert_node(
+                make_node(
+                    node_id=node_id,
+                    title=node_id,
+                    content="Boundary vector",
+                    file_name=f"{node_id}.md",
+                    last_accessed=datetime.now(UTC),
+                ),
+                embedding=vector,
+            )
+
+        expected_pairs, expected_histogram = _scalar_missing_link_results(
+            store,
+            cosine_threshold=0.90,
+            histogram_thresholds=(0.70, 0.75, 0.90),
+            recency_days=30,
+        )
+        pairs, histogram = store.analyze_missing_links(
+            cosine_threshold=0.90,
+            histogram_thresholds=(0.70, 0.75, 0.90),
+            recency_days=30,
+        )
+
+    assert [(left.id, right.id) for left, right in pairs] == expected_pairs
+    assert histogram == expected_histogram
+
+
+def test_numpy_missing_link_scan_skips_unequal_vector_lengths(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    nodes = [
+        make_node(
+            node_id=node_id,
+            title=node_id,
+            content="Dimension vector",
+            file_name=f"{node_id}.md",
+            last_accessed=datetime.now(UTC),
+        )
+        for node_id in ("mem_dim_a", "mem_dim_b", "mem_dim_c")
+    ]
+    with SQLiteNodeStore(db_path, embedding_dimension=2) as store:
+        store.upsert_node(nodes[0], embedding=[1.0, 0.0])
+        store.upsert_node(nodes[1])
+        store.upsert_node(nodes[2], embedding=[1.0, 0.0])
+        store.connection.execute(
+            "INSERT INTO nodes_vec(id, embedding, dimension) VALUES (?, ?, ?)",
+            (nodes[1].id, json.dumps([1.0, 0.0, 0.0]), 3),
+        )
+        store.connection.commit()
+
+        expected_pairs, expected_histogram = _scalar_missing_link_results(
+            store,
+            cosine_threshold=0.90,
+            histogram_thresholds=(0.90,),
+            recency_days=30,
+        )
+        pairs, histogram = store.analyze_missing_links(
+            cosine_threshold=0.90,
+            histogram_thresholds=(0.90,),
+            recency_days=30,
+        )
+
+    assert [(left.id, right.id) for left, right in pairs] == expected_pairs == [(nodes[0].id, nodes[2].id)]
+    assert histogram == expected_histogram == {"0.90": 1}
+
+
+def test_numpy_missing_link_scan_preserves_order_across_partial_blocks(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "synapse.db"
+    nodes = [
+        make_node(
+            node_id=f"mem_block_{suffix}",
+            title=f"Block {suffix}",
+            content="Block boundary vector",
+            file_name=f"mem_block_{suffix}.md",
+            last_accessed=datetime.now(UTC),
+        )
+        for suffix in "abcde"
+    ]
+    monkeypatch.setattr(sqlite_module, "_MISSING_LINK_BLOCK_ROWS", 2)
+    with SQLiteNodeStore(db_path, embedding_dimension=2) as store:
+        for node in nodes:
+            store.upsert_node(node, embedding=[1.0, 0.0])
+        store.upsert_edges(nodes[0].id, [nodes[1].id])
+        store.upsert_edges(nodes[3].id, [nodes[2].id])
+
+        pairs, histogram = store.analyze_missing_links(
+            cosine_threshold=0.99,
+            histogram_thresholds=(0.90,),
+            recency_days=30,
+        )
+
+    expected = [
+        (nodes[left].id, nodes[right].id)
+        for left in range(len(nodes))
+        for right in range(left + 1, len(nodes))
+        if (left, right) not in {(0, 1), (2, 3)}
+    ]
+    assert [(left.id, right.id) for left, right in pairs] == expected
+    assert histogram == {"0.90": len(expected)}
 
 
 def test_reopening_existing_db_performs_no_writes(tmp_path: Path) -> None:
