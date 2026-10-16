@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Callable, Iterator
 
 import httpx
-
 
 from synapse.config import DeciderSettings
 from synapse.server.sampling import (
@@ -26,6 +26,18 @@ from synapse.server.sampling import (
 
 LOGGER = logging.getLogger("synapse.local-llm-decider")
 _CHAT_COMPLETIONS_PATH = "/chat/completions"
+
+_MAX_ATTEMPTS_PER_ENDPOINT = 3
+_RETRY_BASE_DELAYS_SECONDS = (5.0, 20.0)
+
+
+class _InvalidCompletionResponse(ValueError):
+    """The endpoint returned a response that could not be parsed as JSON."""
+
+
+def _retry_delay_seconds(retry_number: int) -> float:
+    base_delay = _RETRY_BASE_DELAYS_SECONDS[retry_number - 1]
+    return random.uniform(base_delay * 0.8, base_delay * 1.2)
 
 
 class LocalLLMDecider:
@@ -225,7 +237,6 @@ class LocalLLMDecider:
             index = self._acquire_endpoint(attempted)
             attempted.add(index)
             base_url, model, api_key_env, extra_body = self._endpoints[index]
-            started = perf_counter()
             call_context = self._call_context.get()
             timeout_seconds = (
                 call_context.get("timeout_seconds")
@@ -233,31 +244,70 @@ class LocalLLMDecider:
                 else self.settings.timeout_seconds
             )
             try:
-                response_payload = self._post_completion(
-                    base_url=base_url,
-                    model=model,
-                    api_key_env=api_key_env,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                    timeout_seconds=timeout_seconds,
-                    extra_body=extra_body,
-                )
-                result = parser(response_payload)
-            except Exception as exc:  # count every endpoint attempt, then fail over only on transport/5xx
-                elapsed_ms = (perf_counter() - started) * 1000
-                self._record_endpoint_call(index, elapsed_ms=elapsed_ms, succeeded=False)
-                retryable = isinstance(exc, httpx.RequestError) or (
-                    isinstance(exc, httpx.HTTPStatusError)
-                    and 500 <= exc.response.status_code < 600
-                )
-                if not retryable or len(attempted) >= len(self._endpoints):
-                    raise
-                LOGGER.warning("Local LLM endpoint %s failed; trying another endpoint: %s", base_url, exc)
-            else:
-                elapsed_ms = (perf_counter() - started) * 1000
-                self._record_endpoint_call(index, elapsed_ms=elapsed_ms, succeeded=True)
-                return result
+                for attempt in range(1, _MAX_ATTEMPTS_PER_ENDPOINT + 1):
+                    started = perf_counter()
+                    parsing_response = False
+                    try:
+                        response_payload = self._post_completion(
+                            base_url=base_url,
+                            model=model,
+                            api_key_env=api_key_env,
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            reasoning_effort=reasoning_effort,
+                            timeout_seconds=timeout_seconds,
+                            extra_body=extra_body,
+                        )
+                        parsing_response = True
+                        result = parser(response_payload)
+                    except Exception as exc:
+                        elapsed_ms = (perf_counter() - started) * 1000
+                        self._record_endpoint_call(index, elapsed_ms=elapsed_ms, succeeded=False)
+                        retryable = (
+                            isinstance(exc, (httpx.RequestError, _InvalidCompletionResponse))
+                            or (
+                                isinstance(exc, httpx.HTTPStatusError)
+                                and (
+                                    exc.response.status_code == 429
+                                    or 500 <= exc.response.status_code < 600
+                                )
+                            )
+                            or (
+                                parsing_response
+                                and isinstance(exc, (ValueError, TypeError, KeyError, IndexError))
+                            )
+                        )
+                        if not retryable:
+                            raise
+                        stage = call_context.get("stage") if call_context is not None else None
+                        if attempt < _MAX_ATTEMPTS_PER_ENDPOINT:
+                            LOGGER.warning(
+                                "Retrying local LLM endpoint %s (stage=%s, attempt=%d/%d, error_class=%s): %s",
+                                base_url,
+                                stage,
+                                attempt + 1,
+                                _MAX_ATTEMPTS_PER_ENDPOINT,
+                                type(exc).__name__,
+                                exc,
+                            )
+                            sleep(_retry_delay_seconds(attempt))
+                            continue
+                        if len(attempted) >= len(self._endpoints):
+                            raise
+                        LOGGER.warning(
+                            "Local LLM endpoint %s exhausted %d attempts; trying another endpoint "
+                            "(stage=%s, error_class=%s): %s",
+                            base_url,
+                            _MAX_ATTEMPTS_PER_ENDPOINT,
+                            stage,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        break
+                    else:
+                        elapsed_ms = (perf_counter() - started) * 1000
+                        self._record_endpoint_call(index, elapsed_ms=elapsed_ms, succeeded=True)
+                        return result
             finally:
                 self._release_endpoint(index)
         raise RuntimeError("all local LLM endpoints failed")
@@ -308,9 +358,12 @@ class LocalLLMDecider:
             timeout=timeout_seconds,
         )
         response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise _InvalidCompletionResponse("Local LLM response was not valid JSON") from exc
         if not isinstance(payload, dict):
-            raise ValueError("Local LLM response must be a JSON object")
+            raise _InvalidCompletionResponse("Local LLM response must be a JSON object")
         return payload
 
     @staticmethod

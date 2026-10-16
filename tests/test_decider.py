@@ -4,8 +4,10 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from synapse.config import DeciderSettings
+from synapse.server import decider as decider_module
 from synapse.server.decider import LocalLLMDecider
 from synapse.server.sampling import MemoryWriteSamplingRequest
 
@@ -113,17 +115,19 @@ def test_endpoint_extra_bodies_are_isolated_to_selected_endpoint() -> None:
 
 
 
-def test_decider_fails_over_to_second_endpoint_and_api_key(monkeypatch) -> None:
+def test_decider_retries_endpoint_before_failing_over_and_api_key(monkeypatch) -> None:
     calls: list[tuple[str, dict[str, Any], str | None]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         calls.append((str(request.url), body, request.headers.get("authorization")))
-        if len(calls) == 1:
+        if len(calls) <= 3:
             return _completion_response("primary unavailable", status_code=503)
         return _completion_response('{"action":"create","target_node_ids":[],"reasoning":"New memory."}')
 
     monkeypatch.setenv("FALLBACK_KEY", "secret-key")
+    monkeypatch.setattr("synapse.server.decider.sleep", lambda _delay: None)
+    monkeypatch.setattr("synapse.server.decider._retry_delay_seconds", lambda _retry: 0.0)
     settings = DeciderSettings(
         endpoints=[
             {"base_url": "http://primary.example/v1", "model": "primary-model", "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
@@ -140,20 +144,139 @@ def test_decider_fails_over_to_second_endpoint_and_api_key(monkeypatch) -> None:
         metrics = decider.call_metrics()
 
     assert decision.action == "create"
-    assert [call[0] for call in calls] == [
-        "http://primary.example/v1/chat/completions",
-        "http://fallback.example/v1/chat/completions",
-    ]
-    assert calls[0][1]["model"] == "primary-model"
-    assert calls[1][1]["model"] == "fallback-model"
-    assert calls[0][1]["chat_template_kwargs"] == {"enable_thinking": False}
-    assert "chat_template_kwargs" not in calls[1][1]
-    assert calls[0][2] is None
-    assert calls[1][2] == "Bearer secret-key"
+    primary_url = "http://primary.example/v1/chat/completions"
+    fallback_url = "http://fallback.example/v1/chat/completions"
+    assert [call[0] for call in calls] == [primary_url, primary_url, primary_url, fallback_url]
+    assert calls[0][1]["model"] == calls[1][1]["model"] == calls[2][1]["model"] == "primary-model"
+    assert calls[3][1]["model"] == "fallback-model"
+    assert all(call[1]["chat_template_kwargs"] == {"enable_thinking": False} for call in calls[:3])
+    assert "chat_template_kwargs" not in calls[3][1]
+    assert all(call[2] is None for call in calls[:3])
+    assert calls[3][2] == "Bearer secret-key"
     primary = metrics["primary-model@http://primary.example/v1"]
     secondary = metrics["fallback-model@http://fallback.example/v1"]
-    assert primary["failures"] == 1 and primary["successes"] == 0
-    assert secondary["successes"] == 1 and secondary["failures"] == 0
+    assert primary["calls"] == 3 and primary["failures"] == 3 and primary["successes"] == 0
+    assert secondary["calls"] == 1 and secondary["successes"] == 1 and secondary["failures"] == 0
+
+
+def test_retry_delay_uses_jittered_five_and_twenty_second_bases(monkeypatch) -> None:
+    bounds: list[tuple[float, float]] = []
+
+    def uniform(lower: float, upper: float) -> float:
+        bounds.append((lower, upper))
+        return lower
+
+    monkeypatch.setattr(decider_module.random, "uniform", uniform)
+
+    assert decider_module._retry_delay_seconds(1) == 4.0
+    assert decider_module._retry_delay_seconds(2) == 16.0
+    assert bounds == [(4.0, 6.0), (16.0, 24.0)]
+
+
+@pytest.mark.parametrize(("status_code", "should_retry"), [(429, True), (503, True), (400, False)])
+def test_http_status_retry_classification(monkeypatch, status_code: int, should_retry: bool) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _completion_response("temporary failure", status_code=status_code)
+        return _completion_response('{"ok":true}')
+
+    monkeypatch.setattr("synapse.server.decider.sleep", lambda _delay: None)
+    monkeypatch.setattr("synapse.server.decider._retry_delay_seconds", lambda _retry: 0.0)
+    settings = DeciderSettings(endpoints=[{"base_url": "http://llm.example/v1", "model": "test-model"}])
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        decider = LocalLLMDecider(settings, client=client)
+        if should_retry:
+            assert decider.sample_json(prompt="{}", system_prompt="") == {"ok": True}
+        else:
+            with pytest.raises(httpx.HTTPStatusError):
+                decider.sample_json(prompt="{}", system_prompt="")
+        metrics = decider.call_metrics()["test-model@http://llm.example/v1"]
+
+    assert calls == (2 if should_retry else 1)
+    assert metrics["calls"] == calls
+    assert metrics["failures"] == 1
+    assert metrics["successes"] == (1 if should_retry else 0)
+
+
+def test_invalid_json_retries_and_records_stage_metrics_and_log(monkeypatch) -> None:
+    calls = 0
+    retry_numbers: list[int] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(200, content=b"not JSON")
+        if calls == 2:
+            return _completion_response("not JSON")
+        return _completion_response('{"ok":true}')
+
+    def retry_delay(retry_number: int) -> float:
+        retry_numbers.append(retry_number)
+        return 0.0
+
+    import synapse.server.decider as decider_module
+
+    retry_logs: list[str] = []
+    monkeypatch.setattr(decider_module.LOGGER, "warning", lambda message, *args: retry_logs.append(message % args))
+
+    monkeypatch.setattr("synapse.server.decider.sleep", lambda _delay: None)
+    monkeypatch.setattr("synapse.server.decider._retry_delay_seconds", retry_delay)
+    settings = DeciderSettings(endpoints=[{"base_url": "http://llm.example/v1", "model": "test-model"}])
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        decider = LocalLLMDecider(settings, client=client)
+        with decider.call_context(transcript_id="mem_session_retry", stage="extract"):
+            assert decider.sample_json(prompt="{}", system_prompt="") == {"ok": True}
+        metrics = decider.call_metrics(transcript_id="mem_session_retry")
+
+    endpoint_metrics = metrics["test-model@http://llm.example/v1"]
+    stage_metrics = endpoint_metrics["stages"]["extract"]
+    assert calls == 3
+    assert retry_numbers == [1, 2]
+    assert endpoint_metrics["calls"] == 3
+    assert endpoint_metrics["failures"] == 2 and endpoint_metrics["successes"] == 1
+    assert stage_metrics["calls"] == 3
+    assert stage_metrics["failures"] == 2 and stage_metrics["successes"] == 1
+    assert len(retry_logs) == 2
+    assert all("http://llm.example/v1" in message for message in retry_logs)
+    assert all("stage=extract" in message for message in retry_logs)
+    assert "attempt=2/3" in retry_logs[0]
+    assert "error_class=_InvalidCompletionResponse" in retry_logs[0]
+    assert "attempt=3/3" in retry_logs[1]
+    assert "error_class=ValueError" in retry_logs[1]
+
+
+def test_transport_timeout_retries_and_configuration_error_does_not(monkeypatch) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("request timed out", request=request)
+        return _completion_response('{"ok":true}')
+
+    monkeypatch.setattr("synapse.server.decider.sleep", lambda _delay: None)
+    monkeypatch.setattr("synapse.server.decider._retry_delay_seconds", lambda _retry: 0.0)
+    settings = DeciderSettings(endpoints=[{"base_url": "http://llm.example/v1", "model": "test-model"}])
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        decider = LocalLLMDecider(settings, client=client)
+        assert decider.sample_json(prompt="{}", system_prompt="") == {"ok": True}
+        metrics = decider.call_metrics()["test-model@http://llm.example/v1"]
+
+    assert calls == 2
+    assert metrics["calls"] == 2 and metrics["failures"] == 1 and metrics["successes"] == 1
+
+    with pytest.raises(ValueError, match="extra_body cannot override completion fields"):
+        DeciderSettings(
+            endpoints=[
+                {"base_url": "http://llm.example/v1", "model": "test-model", "extra_body": {"model": "override"}}
+            ]
+        )
 
 
 def test_sample_json_extracts_prose_and_markdown_fenced_json() -> None:
