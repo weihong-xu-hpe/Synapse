@@ -21,7 +21,7 @@ class _FakeClient:
 
 
 def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, fail_ids: set[str]) -> dict[str, Any]:
-    state: dict[str, Any] = {"ran": [], "clients": [], "archive_calls": 0, "limits": []}
+    state: dict[str, Any] = {"ran": [], "clients": [], "archive_calls": 0, "limits": [], "metrics": []}
 
     def fake_select(self: Any, *, limit: int | None = None) -> list[Any]:
         state["limits"].append(limit)
@@ -47,10 +47,14 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch, *, fail_ids: set[str]) -> di
             state["clients"].append(client)
             return client
 
-        def run(self, session: str) -> None:
+        def run(self, session: str) -> Any:
             if session in fail_ids:
                 raise RuntimeError("boom")
             state["ran"].append(session)
+            return SimpleNamespace(stamped=True, lessons=[{}], ops=[{"action": "created"}])
+
+        def record_run_metrics(self, runs: list[Any], **kwargs: Any) -> None:
+            state["metrics"].append((runs, kwargs))
 
         def close(self) -> None:
             pass
@@ -79,6 +83,8 @@ def test_sweep_runs_episode_distiller_on_selected_transcripts(tmp_path: Any, mon
     assert state["ran"] == ["mem_session_a", "mem_session_b"]
     assert state["archive_calls"] == 1
     assert state["clients"] and all(client.closed for client in state["clients"])
+    assert state["metrics"][0][1]["transcripts_scanned"] == 2
+    assert state["metrics"][0][1]["llm_failures"] == 0
 
 
 def test_sweep_continues_after_one_transcript_fails(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,3 +95,18 @@ def test_sweep_continues_after_one_transcript_fails(tmp_path: Any, monkeypatch: 
 
     assert state["ran"] == ["mem_session_b"]
     assert state["archive_calls"] == 1
+    assert state["metrics"][0][1]["transcripts_scanned"] == 2
+    assert state["metrics"][0][1]["llm_failures"] == 1
+
+
+def test_empty_sweep_still_records_run_metrics(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    config, runtime_paths = _config(tmp_path)
+    state = _install_fakes(monkeypatch, fail_ids=set())
+    monkeypatch.setattr(distiller_module.Distiller, "select_transcripts", lambda self, *, limit=None: [])
+
+    DistillerScheduler(config, runtime_paths=runtime_paths)._run_sweep()
+
+    assert state["archive_calls"] == 1
+    assert len(state["metrics"]) == 1
+    assert state["metrics"][0][0] == []
+    assert state["metrics"][0][1]["transcripts_scanned"] == 0

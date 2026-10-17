@@ -292,9 +292,12 @@ Turn numbering follows the session transcript contract
 (`docs/transcript-format.md`): v2 transcripts number turns `T1..Tn` at submission;
 legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
 
-## 10. Chunked + incremental distillation
+## 10. Legacy segment distillation (`synapse distill run`)
 
-- Transcripts are split into segments at turn boundaries
+This section describes only the legacy manual segment-distiller command, not the scheduled live
+path or `/api/episode/close`; both server triggers run the Two-Stage Episode Distiller in §11.
+
+- For the legacy `synapse distill run` path, transcripts are split into segments at turn boundaries
   (`[distiller].segment_chars`, default 16 000 — same size as the old single-call
   budget); a single oversized turn is split by characters. One extraction LLM call
   runs per segment; nothing is head/tail-truncated away. **No item-count cap**:
@@ -334,20 +337,24 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
   first failed segment and `distilled_hash` is left unset so the next sweep
   retries the failed range.
 
-## 11. Episode pipeline pilot
+## 11. Two-Stage Episode Distiller
 
-The opt-in `synapse distill episode` command runs the episode-based pipeline on an explicitly
-selected database/base copy. It remains distinct from the scheduled segment distiller. The REST
-fallback `POST /api/episode/close` accepts `session_key` and a reason of `idle`, `shutdown`, or
-`switch`; with `[distiller].enabled=false` it returns `status=disabled`, otherwise it queues a
-per-session serialized background run and returns `status=accepted`. The CLI accepts repeated
-`--session` values and processes them sequentially so later sessions can retrieve earlier writes.
+The active server-side pipeline is the Two-Stage Episode Distiller. Both bridge-triggered
+`POST /api/episode/close` calls and the `DistillerScheduler` idle fallback run this pipeline. The
+fallback selects transcripts idle for `[distiller].idle_minutes` (60 minutes by default) on the
+configured sweep interval. The close endpoint accepts `session_key` and a reason of `idle`,
+`shutdown`, or `switch`; with `[distiller].enabled=false` it returns `status=disabled`, otherwise it
+queues a per-session serialized background run and returns `status=accepted`.
+
+The `synapse distill episode` CLI runs the same pipeline against an explicitly selected database/base
+copy. It accepts repeated `--session` values and processes them sequentially so later sessions can
+retrieve earlier writes.
 
 The Stage 1 scanner uses `[distiller.episode.scanner_endpoints]` (or `endpoints`); legacy
 `[distiller.episode.endpoint]` remains the single-endpoint fallback. Missing scanner
 `reasoning_effort` defaults to `low`. Stage 2 uses `gatekeeper_endpoint`, defaulting to the local
-`claude-haiku-5.5` endpoint. The episode client timeout is 300 seconds by default, the model token
-budget is 200,000, and temperature is 0.
+`claude-haiku-5.5` endpoint. The episode timeout is 300 seconds by default, `max_tokens` is 200,000,
+and temperature is 0.
 
 Stage 0 strips the configured polling/status tool sections and empty Assistant turns, then builds a
 chronological Global User Spine from every User turn in the transcript, clipping each body to 350
@@ -368,7 +375,7 @@ targeting at most 160 characters (hard limit 200), with the required OKF section
 takeaway-only repair when needed. A gatekeeper `verified` annotation is honored at write time; false
 verification never blocks a valid node write.
 
-The pilot report records stage latency and proxy usage tokens when supplied, lesson decisions, and
+The CLI report records stage latency and proxy usage tokens when supplied, lesson decisions, and
 full bodies of changed nodes. A failed stage does not advance `distilled_turn`; rerunning an
-already-applied create uses the canonical title/date node ID and becomes a no-op. The pilot writes no
+already-applied create uses the canonical title/date node ID and becomes a no-op. CLI runs write no
 data outside `--base` except the explicitly selected report file.

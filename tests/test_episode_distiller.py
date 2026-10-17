@@ -472,10 +472,68 @@ def test_gatekeeper_verified_false_is_written_without_quarantine(
         assert op.justification == "Gatekeeper approved new knowledge node"
         assert result["verified"] is False
         assert captured["verified"] is False
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            event = store.connection.execute(
+                "SELECT node_id, node_type, action, route FROM write_memory_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert event["node_id"] == node_id
+        assert event["node_type"] == "persistent"
+        assert event["action"] == "created"
+        assert event["route"] == "distiller"
         assert not list((paths.base / ".distiller-quarantine").glob("*.jsonl"))
     finally:
         runner.close()
 
+
+
+def test_episode_run_metrics_are_recorded_with_episode_funnel(tmp_path: Path) -> None:
+    config, paths, _transcript = _setup(tmp_path)
+    runner = _runner(config, paths, FakeClient(), FakeClient())
+    runs = [
+        EpisodeRun(
+            "mem_fixture_session_one",
+            "session-one",
+            "episode-one",
+            100,
+            2,
+            1,
+            lessons=[{}, {}],
+            ops=[
+                {"action": "created"},
+                {"action": "updated"},
+                {"action": "none"},
+                {"action": "quarantined"},
+            ],
+            stamped=True,
+        ),
+        EpisodeRun("mem_fixture_session_two", "session-two", "episode-two", 10, 1, 1, stamped=True),
+    ]
+    try:
+        runner.record_run_metrics(
+            runs,
+            started_at="2026-10-17T00:00:00Z",
+            completed_at="2026-10-17T00:00:02Z",
+            duration_ms=2000,
+            transcripts_scanned=3,
+            llm_failures=2,
+            archived_transcripts=4,
+        )
+    finally:
+        runner.close()
+
+    with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+        row = store.connection.execute("SELECT * FROM distiller_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["transcripts_scanned"] == 3
+    assert row["transcripts_distilled"] == 1
+    assert row["transcripts_skipped"] == 1
+    assert row["items_extracted"] == 2
+    assert row["items_invalid"] == 1
+    assert row["items_quarantined"] == 1
+    assert row["decider_creates"] == 1
+    assert row["decider_complements"] == 1
+    assert row["decider_supersedes"] == row["decider_downgrades"] == 0
+    assert row["llm_failures"] == 2
+    assert row["archived_transcripts"] == 4
 
 def test_gatekeeper_verified_flag_is_parsed_and_assistant_quotes_verify() -> None:
     op = _parse_ops(

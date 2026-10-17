@@ -166,7 +166,30 @@ def _node_counts(store: SQLiteNodeStore) -> dict[str, Any]:
         by_type[node_type] = by_type.get(node_type, 0) + count
         by_okf_type[okf_type] = by_okf_type.get(okf_type, 0) + count
         by_project[project] = by_project.get(project, 0) + count
-    return {"total": total, "by_status": by_status, "by_type": by_type, "by_okf_type": by_okf_type, "by_project": by_project}
+    verified_counts = {"verified_true": 0, "verified_false": 0, "verified_unset": 0}
+    for row in store.connection.execute(
+        """
+        SELECT json_extract(okf_meta, '$.verified') AS verified, COUNT(*) AS count
+        FROM nodes
+        WHERE status = 'active' AND type = 'persistent'
+        GROUP BY json_extract(okf_meta, '$.verified')
+        """
+    ).fetchall():
+        if row["verified"] == 1:
+            key = "verified_true"
+        elif row["verified"] == 0:
+            key = "verified_false"
+        else:
+            key = "verified_unset"
+        verified_counts[key] += int(row["count"])
+    return {
+        "total": total,
+        "by_status": by_status,
+        "by_type": by_type,
+        "by_okf_type": by_okf_type,
+        "by_project": by_project,
+        "by_verified": verified_counts,
+    }
 
 
 def _transcript_counts(store: SQLiteNodeStore) -> dict[str, int]:
@@ -256,6 +279,9 @@ def _day_distiller_yield(store: SQLiteNodeStore, start_utc: str, end_utc: str) -
                COALESCE(SUM(transcripts_skipped), 0) AS transcripts_skipped,
                COALESCE(SUM(items_extracted), 0) AS items_extracted,
                COALESCE(SUM(items_invalid), 0) AS items_invalid,
+               COALESCE(SUM(decider_complements), 0) AS items_updated,
+               COALESCE(SUM(decider_creates), 0) AS items_created,
+               COALESCE(SUM(items_quarantined), 0) AS items_quarantined,
                COALESCE(SUM(llm_failures), 0) AS llm_failures,
                COALESCE(SUM(decider_downgrades), 0) AS decider_downgrades,
                COALESCE(SUM(archived_transcripts), 0) AS archived_transcripts
@@ -548,8 +574,9 @@ def _report_sections(
         """
         SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS count,
                json_extract(okf_meta, '$.okf_type') AS okf_type,
-               json_extract(okf_meta, '$.project') AS project
-        FROM nodes WHERE created_at >= ? GROUP BY day, okf_type, project ORDER BY day
+               json_extract(okf_meta, '$.project') AS project,
+               json_extract(okf_meta, '$.verified') AS verified
+        FROM nodes WHERE created_at >= ? GROUP BY day, okf_type, project, verified ORDER BY day
         """,
         (cutoff,),
     ).fetchall()
@@ -557,6 +584,7 @@ def _report_sections(
         lines.append("_No new nodes in the window._")
     else:
         by_day: dict[str, int] = {}
+        by_verified: dict[str, int] = {"verified_true": 0, "verified_false": 0, "verified_unset": 0}
         by_okf: dict[str, int] = {}
         by_project: dict[str, int] = {}
         for row in growth:
@@ -564,10 +592,22 @@ def _report_sections(
             by_day[str(row["day"])] = by_day.get(str(row["day"]), 0) + count
             okf_type = str(row["okf_type"] or "untyped")
             project = str(row["project"] or "unassigned")
+            if row["verified"] == 1:
+                verification = "verified_true"
+            elif row["verified"] == 0:
+                verification = "verified_false"
+            else:
+                verification = "verified_unset"
+            by_verified[verification] = by_verified.get(verification, 0) + count
             by_okf[okf_type] = by_okf.get(okf_type, 0) + count
             by_project[project] = by_project.get(project, 0) + count
         lines.append(f"New nodes: {sum(by_day.values())} over {len(by_day)} days")
         lines.append(f"- By okf_type: {json.dumps(by_okf, ensure_ascii=False)}")
+        lines.append(
+            "- By verified: "
+            f"{json.dumps(by_verified, ensure_ascii=False)} "
+            "(verified=true auto-injectable; verified=false search-only; verified_unset not classified)"
+        )
         lines.append(f"- By project: {json.dumps(dict(sorted(by_project.items(), key=lambda kv: -kv[1])), ensure_ascii=False)}")
     lines.append("")
 
@@ -608,7 +648,12 @@ def _report_sections(
         """
         SELECT COUNT(*) AS runs,
                COALESCE(SUM(transcripts_distilled), 0) AS distilled,
+               COALESCE(SUM(transcripts_skipped), 0) AS skipped,
                COALESCE(SUM(items_extracted), 0) AS items,
+               COALESCE(SUM(decider_creates), 0) AS creates,
+               COALESCE(SUM(decider_complements), 0) AS updates,
+               COALESCE(SUM(items_invalid), 0) AS filtered,
+               COALESCE(SUM(items_quarantined), 0) AS quarantined,
                COALESCE(SUM(llm_failures), 0) AS failures,
                COALESCE(SUM(archived_transcripts), 0) AS archived
         FROM distiller_runs WHERE started_at >= ?
@@ -626,8 +671,12 @@ def _report_sections(
     ).fetchone()
     lines.append("## Lifecycle")
     lines.append(
-        f"- Distiller: {int(distiller_row['runs'])} runs, {int(distiller_row['distilled'])} transcripts distilled, "
-        f"{int(distiller_row['items'])} items, {int(distiller_row['failures'])} LLM failures, {int(distiller_row['archived'])} archived"
+        f"- Distiller: {int(distiller_row['runs'])} runs, {int(distiller_row['distilled'])} transcripts distilled "
+        f"({int(distiller_row['skipped'])} short/noop skipped), {int(distiller_row['items'])} Stage-1 lessons -> "
+        f"{int(distiller_row['creates'])} created + {int(distiller_row['updates'])} updated + "
+        f"{int(distiller_row['filtered'])} gatekeeper-filtered (none) + "
+        f"{int(distiller_row['quarantined'])} quarantined, {int(distiller_row['failures'])} LLM failures, "
+        f"{int(distiller_row['archived'])} archived"
     )
     lines.append(
         f"- Dreamer: {int(dreamer_row['runs'])} runs, {int(dreamer_row['archived'])} archived, {int(dreamer_row['condensed'])} condensed"

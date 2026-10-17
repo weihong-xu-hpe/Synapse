@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import fcntl
 import threading
+import time
 from datetime import UTC, datetime
 from typing import Any, Callable
-
 from synapse.config import SynapseConfig
 from synapse.lifecycle.distiller import Distiller, DistillerReport
 from synapse.models.node import Node
@@ -95,15 +95,50 @@ class DistillerScheduler:
             except OSError:
                 self._logger.info("Distiller sweep skipped: another run holds the lock")
                 return
+            started = datetime.now(UTC)
+            started_at = started.isoformat().replace("+00:00", "Z")
+            started_clock = time.perf_counter()
             selector = Distiller(self.config, runtime_paths=self.runtime_paths, logger=self._logger)
+            from synapse.lifecycle.episode_distiller import EpisodeDistiller
+
+            scanner_client = None
+            gatekeeper_client = None
+            runner = None
             try:
+                scanner_client = EpisodeDistiller.make_scanner_client(self.config)
+                gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(self.config)
+                runner = EpisodeDistiller(
+                    self.config,
+                    runtime_paths=self.runtime_paths,
+                    sampling_client=scanner_client,
+                    gatekeeper_client=gatekeeper_client,
+                )
                 transcripts = selector.select_transcripts(limit=self.config.distiller.max_transcripts_per_run)
-                if transcripts:
-                    self._distill(transcripts)
-                now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-                selector._archive_expired(DistillerReport(started_at=now, completed_at=now))
+                runs, llm_failures = self._distill(transcripts, runner)
+                archive_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                archived = selector._archive_expired(
+                    DistillerReport(started_at=archive_started_at, completed_at=archive_started_at)
+                )
+                completed = datetime.now(UTC)
+                runner.record_run_metrics(
+                    runs,
+                    started_at=started_at,
+                    completed_at=completed.isoformat().replace("+00:00", "Z"),
+                    duration_ms=round((time.perf_counter() - started_clock) * 1000),
+                    transcripts_scanned=len(transcripts),
+                    llm_failures=llm_failures,
+                    archived_transcripts=archived,
+                )
             finally:
                 selector.close()
+                try:
+                    if runner is not None:
+                        runner.close()
+                finally:
+                    for client in (scanner_client, gatekeeper_client):
+                        close_client = getattr(client, "close", None)
+                        if callable(close_client):
+                            close_client()
             # Observability snapshot piggybacks on the sweep cadence (no
             # separate timer): today's row if missing, plus yesterday when the
             # machine slept through a day boundary. Never breaks the sweep.
@@ -112,32 +147,16 @@ class DistillerScheduler:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
 
-    def _distill(self, transcripts: list[Node]) -> None:
-        # Lazy import: episode_distiller pulls in the server service stack.
-        from synapse.lifecycle.episode_distiller import EpisodeDistiller
-
-        scanner_client = EpisodeDistiller.make_scanner_client(self.config)
-        gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(self.config)
-        runner = EpisodeDistiller(
-            self.config,
-            runtime_paths=self.runtime_paths,
-            sampling_client=scanner_client,
-            gatekeeper_client=gatekeeper_client,
-        )
-        try:
-            for transcript in transcripts:
-                try:
-                    runner.run(transcript.id)
-                except Exception:
-                    self._logger.exception("Episode sweep failed", extra={"transcript_id": transcript.id})
-        finally:
+    def _distill(self, transcripts: list[Node], runner: Any) -> tuple[list[Any], int]:
+        runs: list[Any] = []
+        failures = 0
+        for transcript in transcripts:
             try:
-                runner.close()
-            finally:
-                for client in (scanner_client, gatekeeper_client):
-                    close_client = getattr(client, "close", None)
-                    if callable(close_client):
-                        close_client()
+                runs.append(runner.run(transcript.id))
+            except Exception:
+                failures += 1
+                self._logger.exception("Episode sweep failed", extra={"transcript_id": transcript.id})
+        return runs, failures
 
     def _write_metrics_snapshots(self) -> None:
         try:

@@ -380,6 +380,8 @@ def run_episode_distiller(
     )
     runs = []
     failures = []
+    metrics_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    metrics_started_clock = time.perf_counter()
     try:
         if workers > 1 and len(session_ids) > 1:
             with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -410,9 +412,23 @@ def run_episode_distiller(
                     failures.append({"session": session_id, "error": f"{type(exc).__name__}: {exc}"})
                     typer.echo(f"[{index}/{len(session_ids)}] {session_id}: failed, {time.perf_counter() - started:.1f}s")
     finally:
-        runner.close()
-        scanner_client.close()
-        gatekeeper_client.close()
+        try:
+            runner.record_run_metrics(
+                runs,
+                started_at=metrics_started_at,
+                completed_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                duration_ms=round((time.perf_counter() - metrics_started_clock) * 1000),
+                transcripts_scanned=len(session_ids),
+                llm_failures=len(failures),
+            )
+        finally:
+            try:
+                runner.close()
+            finally:
+                try:
+                    scanner_client.close()
+                finally:
+                    gatekeeper_client.close()
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -596,6 +612,12 @@ def distiller_status(ctx: typer.Context) -> None:
     typer.echo(f"Interval: {settings.interval_minutes} min, idle threshold: {settings.idle_minutes} min")
     typer.echo(f"Retention: {settings.retention_days} days (distilled-only gate)")
     typer.echo(f"Downgrade-supersede: {settings.downgrade_supersede}, enforce-OKF: {settings.enforce_okf}")
+    episode = settings.episode
+    scanner_endpoints = episode.scanner_endpoints or episode.endpoints or [episode.endpoint]
+    scanner_models = ", ".join(endpoint.model for endpoint in scanner_endpoints)
+    gatekeeper_model = episode.gatekeeper_endpoint.model if episode.gatekeeper_endpoint is not None else "claude-haiku-5.5"
+    typer.echo(f"Episode scanner models: {scanner_models}")
+    typer.echo(f"Episode gatekeeper model: {gatekeeper_model}")
 
     from synapse.lifecycle.distiller import Distiller, is_fully_distilled
 
@@ -613,13 +635,21 @@ def distiller_status(ctx: typer.Context) -> None:
         embedding_dimension=state.config.embedding.dimension or 0,
     ) as store:
         rows = store._connection.execute(
-            "SELECT started_at, transcripts_distilled, items_extracted, llm_failures, archived_transcripts "
-            "FROM distiller_runs ORDER BY started_at DESC LIMIT 5"
+            """
+            SELECT started_at, transcripts_distilled, items_extracted, items_invalid,
+                   decider_creates, decider_complements, llm_failures, archived_transcripts
+            FROM distiller_runs ORDER BY started_at DESC LIMIT 5
+            """
         ).fetchall()
     if rows:
         typer.echo("Recent runs:")
         for row in rows:
-            typer.echo(f"  {row['started_at']} distilled={row['transcripts_distilled']} items={row['items_extracted']} failures={row['llm_failures']} archived={row['archived_transcripts']}")
+            typer.echo(
+                f"  {row['started_at']} distilled={row['transcripts_distilled']} items={row['items_extracted']} "
+                f"creates={row['decider_creates']} updates={row['decider_complements']} "
+                f"gatekeeper_filtered={row['items_invalid']} failures={row['llm_failures']} "
+                f"archived={row['archived_transcripts']}"
+            )
     else:
         typer.echo("No distiller runs recorded yet.")
 

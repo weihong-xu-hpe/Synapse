@@ -268,36 +268,45 @@ To change the cadence, edit `interval_hours` and restart the service. To disable
 
 ### `[distiller]`
 
-Controls the session distiller — the server-side pipeline that converts session transcript nodes into typed OKF knowledge nodes (see `docs/okf.md` for the format spec).
+Controls the server-side transcript pipeline that converts session transcripts into typed OKF knowledge nodes (see `docs/okf.md`). The live path is the Two-Stage Episode Distiller, triggered by `/api/episode/close` or the idle-transcript fallback scheduler.
 
 - `enabled` (bool, default `true`) — whether the in-process sweep scheduler auto-starts when the server runs
 - `interval_minutes` (int, ≥1, default `10`) — sweep interval; short enough that macOS sleep drift is harmless
 - `idle_minutes` (int, ≥1, default `60`) — a transcript must be untouched this long before it is distilled (avoids distilling mid-pause). The idle and retention clocks both use the transcript **file mtime**: stamping (distillation write-back) and failure backoff rewrite the file and thus reset the clock.
 - `retention_days` (int, ≥1, default `45`) — transcripts distilled at their **current** content revision are archived this many days after their last content update (file mtime); **undistilled or stale-distilled transcripts are never archived**. A transcript that yielded zero knowledge items counts as distilled-current (the LLM judged nothing durable) and is archived after retention like any other.
-- `max_transcript_chars` (int, default `16000`) — prompt cap per transcript (head + tail split)
-- `max_concurrency` (int, 1–30, default `30`) — extraction-call concurrency within each transcript
-- `transcript_concurrency` (int, 1–16, default `4`) — transcripts processed concurrently in one sweep
-- `segment_chars` (int, default `16000`) — segment size at turn boundaries
-- `item_warn_threshold` (int, default `40`) — log threshold only; no extracted items are dropped
-- `reasoning_effort` (optional) — omitted by default; only sent when explicitly configured
-- `llm_timeout_seconds` (int, ≥1, default `300`) — HTTP timeout for the distiller's own LLM client; the write-path decider timeout is unchanged
-- `max_transcripts_per_run` (int, 1–5000, default `500`) — bounded per-sweep safety cap; freed transcript slots refill from the pending backlog until this cap or exhaustion
-- `backoff_sweeps` (int, default `3`) — sweeps a failing transcript is skipped before retry
-- A failed or partial transcript may be retried once within the same sweep after a 10-minute cooldown; the sweep waits for that retry if it is still eligible. Each transcript task logs its duration, and each item commit logs lock wait/hold time.
+
+The following options configure the legacy segment distiller used by manual `synapse distill run`; they do not configure the active episode pipeline:
+
+- `max_transcript_chars` (legacy `distill run`, default `16000`) — prompt cap per transcript (head + tail split)
+- `max_concurrency` (legacy `distill run`, 1–30, default `30`) — extraction-call concurrency within each transcript
+- `transcript_concurrency` (legacy `distill run`, 1–16, default `4`) — transcripts processed concurrently in one run
+- `segment_chars` (legacy `distill run`, default `16000`) — segment size at turn boundaries
+- `item_warn_threshold` (legacy `distill run`, default `40`) — log threshold only; no extracted items are dropped
+- `reasoning_effort` (legacy `distill run`, optional) — omitted by default; only sent when explicitly configured
+- `llm_timeout_seconds` (legacy `distill run`, ≥1, default `300`) — timeout for the segment-distiller LLM client
+- `max_transcripts_per_run` (int, 1–5000, default `500`) — cap on transcripts selected by one server sweep or manual run
+- `backoff_sweeps` (int, default `3`) — legacy segment-distiller sweeps a failing transcript is skipped before retry
+- A failed or partial legacy segment-distiller transcript may be retried once within the same run after a 10-minute cooldown. The episode pipeline uses its own `timeout_seconds` and does not use segment extraction concurrency.
 
 #### `[distiller.episode]` two-stage pipeline
 
-The episode close path dehydrates tool-polling noise, carries a Global User Spine across incremental runs, scans with a low-effort endpoint pool, and passes candidate lessons to a separate gatekeeper/integrator.
+The active episode pipeline dehydrates tool-polling noise, carries a Global User Spine across incremental runs, scans with a low-effort endpoint pool, and sends lessons through the gatekeeper and integrator. It runs on `/api/episode/close` and the server idle fallback.
 
-- `scanner_endpoints` (optional list) selects the Stage 1 endpoint pool; `endpoints` is also accepted for the pool, while legacy `endpoint` remains the single-endpoint fallback. Missing `reasoning_effort` defaults to `low` for scanner endpoints.
-- `gatekeeper_endpoint` defaults to `http://127.0.0.1:47870/v1` with model `claude-haiku-5.5`; it may be set to `null` to use that default.
+- `scanner_endpoints` (optional list) selects Stage 1 models; `endpoints` is also accepted for the pool, while legacy `endpoint` remains the single-endpoint fallback. Missing scanner `reasoning_effort` defaults to `low`.
+- `gatekeeper_endpoint` defaults to the `claude-haiku-5.5` model at `http://127.0.0.1:47870/v1`; it may be set to `null` to use that default.
 - `chunk_chars` (int, ≥1,000, default `400000`) controls turn-boundary chunking for large transcripts.
-- `integrate_lessons_per_call` (int, default `12`), `retrieval_top_k_per_lesson` (int, default `5`), and `evidence_context_token_budget` (int, default `24000`) bound gatekeeper batches and retrieved evidence.
+- `max_tokens` (int, default `200000`) sets the output token budget for episode-model calls.
+- `evidence_context_token_budget` (int, default `24000`) bounds evidence excerpts passed to the gatekeeper.
+- `timeout_seconds` (int, default `300`) is the episode LLM request timeout.
+- `integrate_lessons_per_call` (int, default `12`) and `retrieval_top_k_per_lesson` (int, default `5`) bound gatekeeper batches and retrieved evidence.
 - Pending episodes with fewer than two dehydrated turns or fewer than 600 dehydrated characters are stamped without LLM calls.
 
-`POST /api/episode/close` accepts `{"session_key":"…","reason":"idle|shutdown|switch"}`. It returns `status=disabled` when `[distiller].enabled` is false; otherwise it returns `status=accepted` and schedules per-session serialized background distillation.
+`POST /api/episode/close` accepts `{"session_key":"…","reason":"idle|shutdown|switch"}`. It returns `status=disabled` when `[distiller].enabled` is false; otherwise it returns `status=accepted` and schedules per-session serialized background distillation. The fallback scheduler selects transcripts idle for `idle_minutes` (default 60) on the configured `interval_minutes` cadence.
 
-Maintenance commands: `python -m synapse distill status | run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`.
+Commands: `python -m synapse distill status`, legacy `python -m synapse distill run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`, and `python -m synapse distill episode` for an explicitly selected copy.
+
+`distill status` prints the active scanner and gatekeeper models plus recent run creates, updates, and gatekeeper-filtered items.
+
 
 ### `[observability]`
 
@@ -310,13 +319,13 @@ Controls the local usage-analytics tables (schema v7) and the lookback reports. 
 What gets recorded:
 
 - **`search_events`** (one row per `search_memory` call): timestamp, `source` (`bridge` when the REST call carries `exclude_session_key`, else `rest`; `mcp` for the MCP tool), sha1-prefix `session_hash`, query text + char count + CJK ratio, top_k, include, latency, and the returned results as JSON (rank, node_id, type, okf_type, rerank_logit, score, inject). Eval runs call `RetrievalPipeline.search` directly and are **never recorded** — eval stays out of usage statistics by construction.
-- **`metrics_snapshots`** (one row per local day, written by the distiller sweep; idempotent per day with 2-day backfill for slept-through boundaries; `python -m synapse metrics snapshot` runs it manually): node counts by status/type/okf_type/project, transcript distillation state, the day's write mix by route + decider action, distiller yield/failures/downgrades, search stats (count by source, p50/p95 latency, inject rate, zero-inject share, top injected node ids), Dreamer runs, and DB/active/archive sizes.
+- **`metrics_snapshots`** (one row per local day, written by the distiller sweep; idempotent per day with 2-day backfill for slept-through boundaries; `python -m synapse metrics snapshot` runs it manually): node counts by status/type/okf_type/project and active-persistent `verified` status (`verified_true`, `verified_false`, `verified_unset`), transcript distillation state, the day's write mix by route + decider action, distiller yield (including creates, updates, quarantine, and gatekeeper-filtered lessons), search stats (count by source, p50/p95 latency, inject rate, zero-inject share, top injected node ids), Dreamer runs, and DB/active/archive sizes.
 - **`write_memory_events.route`** (new column): write attribution — `mcp`, `rest`, `session_upsert`, `distiller`, `write_node`. The dedupe-guard `unchanged` early return now also records an event (it previously wrote nothing, undercounting identical writes). Legacy rows have `route = NULL`.
 
 Commands:
 
 - `python -m synapse metrics snapshot [--backfill-days N]` — write/print the daily snapshot
-- `python -m synapse report --since 30d [--out file.md]` — markdown lookback (weekly search/latency buckets, inject rate per source, zero-injection sessions, most/least injected knowledge, knowledge growth, write mix, decider actions + downgrades, distiller/Dreamer yield, storage growth, eval trend from the eval history JSONL, injection-audit history). Works with partial/empty data.
+- `python -m synapse report --since 30d [--out file.md]` — markdown lookback (weekly search/latency buckets, inject rate per source, zero-injection sessions, most/least injected knowledge, knowledge growth with new-node verification breakdown, write mix, decider actions + downgrades, the Episode Distiller funnel, Dreamer yield, storage growth, eval trend from eval history JSONL, and injection-audit history). Works with partial/empty data.
 - `python -m synapse audit injections --since 30d --sample 30 [--report path]` — samples injected results (`inject=true`, sources bridge/mcp) from `search_events`, asks the configured `[decider]` LLM to judge relevance (0 irrelevant / 1 related / 2 directly useful + one-line reason), prints a Wilson-interval precision estimate (per source and per okf_type), lists the worst cases, and appends a summary line to `audit_history_path`.
 
 Monthly schedule (macOS): the `synapse install --service` flow does not manage the audit job; generate and load it explicitly:

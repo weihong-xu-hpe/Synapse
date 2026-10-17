@@ -35,7 +35,7 @@ from synapse.okf.transcript_format import TranscriptTurn, parse_transcript
 from synapse.okf.transcripts import is_session_transcript
 from synapse.retrieval import RetrievalPipeline
 from synapse.server.service import SynapseServiceError, SynapseServerService
-from synapse.storage import SQLiteNodeStore
+from synapse.storage import DistillerRunMetrics, SQLiteNodeStore
 from synapse.utils.runtime import RuntimePaths
 
 
@@ -207,6 +207,41 @@ class EpisodeDistiller:
 
     def close(self) -> None:
         self._distiller_helpers.close()
+
+    def record_run_metrics(
+        self,
+        runs: list[EpisodeRun],
+        *,
+        started_at: str,
+        completed_at: str,
+        duration_ms: int,
+        transcripts_scanned: int | None = None,
+        llm_failures: int = 0,
+        archived_transcripts: int = 0,
+    ) -> None:
+        operations = [op for run in runs for op in run.ops]
+        metrics = DistillerRunMetrics(
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=duration_ms,
+            transcripts_scanned=transcripts_scanned or len(runs),
+            transcripts_distilled=sum(1 for run in runs if run.stamped and (run.lessons or run.ops)),
+            transcripts_skipped=sum(1 for run in runs if not run.lessons and not run.ops),
+            items_extracted=sum(len(run.lessons) for run in runs),
+            items_invalid=sum(op.get("action") == "none" for op in operations),
+            items_quarantined=sum(op.get("action") == "quarantined" for op in operations),
+            decider_creates=sum(op.get("action") == "created" for op in operations),
+            decider_complements=sum(op.get("action") == "updated" for op in operations),
+            decider_supersedes=0,
+            decider_downgrades=0,
+            llm_failures=llm_failures,
+            archived_transcripts=archived_transcripts,
+        )
+        with SQLiteNodeStore(
+            self.runtime_paths.base / "synapse.db",
+            embedding_dimension=self.config.embedding.dimension or 0,
+        ) as store:
+            store.record_distiller_run(metrics)
 
     def run(self, session: str) -> EpisodeRun:
         return self.integrate_episode(*self.extract_episode(session))
@@ -711,6 +746,12 @@ class EpisodeDistiller:
                     )
                     node = self._load_node(stable_id)
                     action = "created"
+                    self.service._record_route_write_event(
+                        node_id=node.id,
+                        node_type=node.metadata.type.value,
+                        action="created",
+                        route="distiller",
+                    )
             except SynapseServiceError as exc:
                 if exc.code == "INVALID_OKF_FINAL_BODY":
                     return self._quarantine(

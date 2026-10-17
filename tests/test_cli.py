@@ -11,7 +11,7 @@ import synapse.server as server_module
 from synapse.cli import app
 from synapse.deployment import ServiceActionResult, ServiceLogView, ServiceStatus
 from synapse.models import Node, NodeMetadata, NodeType, SensitivityLevel
-from synapse.storage import write_node_file
+from synapse.storage import DistillerRunMetrics, SQLiteNodeStore, write_node_file
 
 
 runner = CliRunner()
@@ -350,3 +350,33 @@ def test_prune_transcript_vectors_dry_run_then_apply(tmp_path: Path) -> None:
     again = runner.invoke(app, ["--config", str(config_path), "prune-transcript-vectors", "--apply"])
     assert again.exit_code == 0, again.output
     assert "Vectors deleted: 0" in again.output
+
+
+def test_distiller_status_shows_episode_models_and_recent_actions(tmp_path: Path) -> None:
+    config_path = write_config(tmp_path)
+    with SQLiteNodeStore(tmp_path / ".synapse" / "synapse.db", embedding_dimension=1024) as store:
+        store.record_distiller_run(
+            DistillerRunMetrics(
+                started_at="2026-10-17T00:00:00Z",
+                completed_at="2026-10-17T00:00:01Z",
+                duration_ms=1000,
+                transcripts_scanned=2,
+                transcripts_distilled=1,
+                transcripts_skipped=1,
+                items_extracted=3,
+                items_invalid=2,
+                decider_creates=1,
+                decider_complements=1,
+                decider_supersedes=0,
+                decider_downgrades=0,
+                llm_failures=0,
+                archived_transcripts=0,
+            )
+        )
+
+    result = runner.invoke(app, ["--config", str(config_path), "distill", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Episode scanner models: gpt-6-luna" in result.output
+    assert "Episode gatekeeper model: claude-haiku-5.5" in result.output
+    assert "creates=1 updates=1 gatekeeper_filtered=2" in result.output

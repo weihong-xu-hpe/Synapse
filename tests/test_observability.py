@@ -23,7 +23,7 @@ from synapse.observability import (
 )
 from synapse.server.decider import LocalLLMDecider
 from synapse.server.service import SynapseServerService
-from synapse.storage import SQLiteNodeStore, SearchEventMetrics
+from synapse.storage import DistillerRunMetrics, SQLiteNodeStore, SearchEventMetrics
 from synapse.utils.runtime import bootstrap_runtime_directories, get_runtime_paths
 
 
@@ -313,15 +313,40 @@ def test_snapshot_payload_contains_expected_sections(tmp_path: Path) -> None:
     service.integrate_knowledge(
         title="Snapshot Section Sentinel",
         content="Snapshot section sentinel body.",
+        node_type="persistent",
         okf_type="fact",
         project="probe-project",
+    )
+    service.integrate_knowledge(
+        title="Verified Snapshot Sentinel",
+        content="Verified snapshot sentinel body.",
+        node_type="persistent",
+        okf_type="fact",
+        verified=True,
+    )
+    service.integrate_knowledge(
+        title="Search Only Snapshot Sentinel",
+        content="Search only snapshot sentinel body.",
+        node_type="persistent",
+        okf_type="fact",
+        verified=False,
     )
     payload = collect_daily_snapshot(config, paths, day=datetime.now().astimezone().date())
     assert payload["nodes"]["total"] >= 1
     assert "fact" in payload["nodes"]["by_okf_type"]
     assert "probe-project" in payload["nodes"]["by_project"]
+    assert payload["nodes"]["by_verified"] == {
+        "verified_true": 1,
+        "verified_false": 1,
+        "verified_unset": 1,
+    }
     assert set(payload["transcripts"]) == {"represented", "zero_item", "undistilled"}
     assert set(payload["writes"]) >= {"total", "by_route", "by_action"}
+    assert set(payload["distiller"]) >= {
+        "items_created",
+        "items_updated",
+        "items_quarantined",
+    }
     assert "distiller" in payload and "searches" in payload and "storage" in payload
 
 
@@ -360,6 +385,49 @@ def test_report_renders_weekly_buckets_and_sources(tmp_path: Path) -> None:
     assert "`bridge`" in content and "`mcp`" in content
     assert "Sessions with zero injections" in content
 
+
+def test_report_includes_episode_distiller_funnel_and_verification(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    paths = get_runtime_paths(config)
+    service = SynapseServerService(config, runtime_paths=paths)
+    service.integrate_knowledge(
+        title="Report Verified Sentinel",
+        content="Report verified sentinel body.",
+        verified=True,
+    )
+    service.integrate_knowledge(
+        title="Report Search Only Sentinel",
+        content="Report search only sentinel body.",
+        verified=False,
+    )
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    with _store(config) as store:
+        store.record_distiller_run(
+            DistillerRunMetrics(
+                started_at=now,
+                completed_at=now,
+                duration_ms=100,
+                transcripts_scanned=4,
+                transcripts_distilled=1,
+                transcripts_skipped=2,
+                items_extracted=3,
+                items_invalid=1,
+                decider_creates=1,
+                decider_complements=1,
+                decider_supersedes=0,
+                decider_downgrades=0,
+                llm_failures=1,
+                archived_transcripts=2,
+                items_quarantined=1,
+            )
+        )
+
+    content = render_report(config, paths, since_days=7)
+    assert "verified_true" in content and "verified_false" in content and "verified_unset" in content
+    assert (
+        "- Distiller: 1 runs, 1 transcripts distilled (2 short/noop skipped), 3 Stage-1 lessons -> "
+        "1 created + 1 updated + 1 gatekeeper-filtered (none) + 1 quarantined, 1 LLM failures, 2 archived"
+    ) in content
 
 def test_report_includes_snapshot_storage_table(tmp_path: Path) -> None:
     config = _config(tmp_path)

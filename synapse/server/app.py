@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from threading import Lock, Thread
 from time import perf_counter
 from typing import Any
@@ -450,9 +451,14 @@ def _create_episode_close_handler(config, runtime_paths, logger):
             with session_lock:
                 from synapse.lifecycle.episode_distiller import EpisodeDistiller
 
+                started = datetime.now(UTC)
+                started_at = started.isoformat().replace("+00:00", "Z")
+                started_clock = perf_counter()
                 scanner_client = None
                 gatekeeper_client = None
                 runner = None
+                runs = []
+                llm_failures = 0
                 try:
                     scanner_client = EpisodeDistiller.make_scanner_client(config)
                     gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(config)
@@ -462,8 +468,9 @@ def _create_episode_close_handler(config, runtime_paths, logger):
                         sampling_client=scanner_client,
                         gatekeeper_client=gatekeeper_client,
                     )
-                    runner.run(session_key)
+                    runs.append(runner.run(session_key))
                 except Exception:
+                    llm_failures = 1
                     if logger is not None:
                         logger.exception(
                             "Episode close distillation failed",
@@ -472,6 +479,22 @@ def _create_episode_close_handler(config, runtime_paths, logger):
                 finally:
                     try:
                         if runner is not None:
+                            completed = datetime.now(UTC)
+                            try:
+                                runner.record_run_metrics(
+                                    runs,
+                                    started_at=started_at,
+                                    completed_at=completed.isoformat().replace("+00:00", "Z"),
+                                    duration_ms=round((perf_counter() - started_clock) * 1000),
+                                    transcripts_scanned=1,
+                                    llm_failures=llm_failures,
+                                )
+                            except Exception:
+                                if logger is not None:
+                                    logger.exception(
+                                        "Episode close metrics recording failed",
+                                        extra={"session_key": session_key, "reason": reason},
+                                    )
                             runner.close()
                     finally:
                         for client in (scanner_client, gatekeeper_client):

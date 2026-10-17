@@ -23,8 +23,9 @@ calls/results attach under the assistant turn that issued them. Thinking is omit
 ## T2 Assistant
 <full assistant text>
 ### Tool T2.1 <tool_name>
-call: <single line, <=300 chars>
-result [ok|error]: <head …elided… tail, <=600 chars>
+call: <single line, <=1000 chars>
+result [ok|error]:
+<multiline result, preserved up to 4000 chars (800 for glob/grep)>
 
 ## T3 User
 <full user text>
@@ -35,8 +36,12 @@ Rules:
 - Turn headings are exactly `## T<n> User` / `## T<n> Assistant` (level 2, sequential
   `n` starting at 1).
 - Tool sections are level 3 under the owning assistant turn: `### Tool T<n>.<m>
-  <tool_name>`; `call:` is a single line ≤ 300 chars; `result [ok|error]:` carries a
-  head/elided/tail excerpt ≤ 600 chars.
+  <tool_name>`; `call:` is one line of at most 1,000 characters. `result [ok|error]:`
+  preserves multiline formatting up to 4,000 characters for core tools and 800 characters
+  for `glob` and `grep`.
+- Scheduling/polling noise is omitted at render time: `todo`, `vibe_wait`, `vibe_list`,
+  `vibe_kill`, `vibe_send`, `wait`, and `hub` wait/list/status/poll/kill operations.
+- The complete rendered transcript is capped at 1,500,000 characters.
 - The distiller extracts evidence quotes from **User turn bodies** and **tool result
   lines** only (see docs/okf.md §9) — keep those verbatim where possible.
 
@@ -49,9 +54,12 @@ enclosing turn body.
 
 ## Distillation effects
 
-- The distiller splits transcripts into segments at turn boundaries (~`segment_chars`,
-  default 16 000); one extraction call runs per segment; oversized single turns are
-  split by characters. Nothing is head/tail-truncated away.
+- The live Two-Stage Episode Distiller dehydrates scheduling/polling noise and empty
+  Assistant turns (Stage 0), builds a chronological Global User Spine, scans pending
+  turns with a low-effort Stage 1 model in chunks up to `chunk_chars = 400000`, then
+  passes candidate lessons to the Stage 2 gatekeeper and integrator.
+- Bridge `POST /api/episode/close` triggers episode processing; the server's idle
+  scheduler is the fallback, selecting transcripts idle for 60 minutes by default.
 - Distillation progress is stamped on the transcript frontmatter: `distilled_turn`
   (last turn number covered) plus the existing `distilled_hash` / `distilled_at` /
   `distilled_node_ids`. Re-distillation after new turns arrive only processes turns

@@ -263,13 +263,13 @@ Load and trigger manually: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAge
 Every search and write is recorded locally (SQLite tables `search_events`, `write_memory_events.route`, `metrics_snapshots` — schema v7) so the owner can look back after 1–2 months and decide the next upgrade direction. All data stays on the machine; query text is stored in the private local DB only. Full key reference: `docs/configuration.md` § `[observability]`.
 
 - **Search events** — one row per `search_memory` call with `source` (`bridge` / `rest` / `mcp`), session hash, query text, CJK ratio, latency, and per-result `inject` decisions. Eval runs bypass the service layer and are never recorded (usage statistics stay eval-free). Rows older than `search_events_retention_days` (default 180) are pruned on write.
-- **Daily snapshots** — written automatically after each distiller sweep (idempotent per local day, 2-day backfill when the machine slept); `python -m synapse metrics snapshot` runs/prints one manually.
-- **Write attribution** — `write_memory_events.route` distinguishes `mcp`, `rest`, `session_upsert`, `distiller`, `write_node`; the dedupe-guard `unchanged` path is now recorded too.
+- **Daily snapshots** — written automatically after each server distiller sweep (idempotent per local day, 2-day backfill when the machine slept); node counts include active persistent nodes by `verified_true`, `verified_false`, and `verified_unset`, and distiller yield includes creates, updates, quarantines, and gatekeeper-filtered items. `python -m synapse metrics snapshot` runs/prints one manually.
+- **Write attribution** — `write_memory_events.route` distinguishes `mcp`, `rest`, `session_upsert`, `distiller`, `write_node`; the dedupe-guard `unchanged` path is recorded too.
 
 Lookback commands:
 
 ```sh
-python -m synapse report --since 30d --out lookback.md   # markdown summary (weekly buckets, inject rates, growth, eval trend)
+python -m synapse report --since 30d --out lookback.md   # weekly buckets, verification breakdown, and episode distiller funnel
 python -m synapse audit injections --since 30d --sample 30 --report audit.md   # LLM-judged injection precision
 python -m synapse metrics snapshot                        # today's raw metrics JSON
 ```
@@ -289,29 +289,39 @@ Knowledge nodes follow **OKF** (see `docs/okf.md` for the authoritative spec): t
 `## Takeaway`, and a `## Sources` provenance section. Body content may be Chinese, English, or mixed.
 Every OKF node carries `okf_type`, `okf_version`, and `sources` frontmatter.
 
-The **session distiller** converts session transcript nodes into OKF knowledge automatically:
+The active server pipeline is the **Two-Stage Episode Distiller**. It converts session transcript
+nodes into typed OKF knowledge and is triggered both by bridge `POST /api/episode/close` and by the
+server's idle-transcript fallback scheduler:
 
-- a sweep runs every `distiller.interval_minutes` (default 10) when `[distiller] enabled = true`,
-  selecting idle transcripts (`idle_minutes`, default 60) whose content changed since last distillation;
-- **both the idle clock and the retention clock use the transcript file's mtime** — stamping
-  (`distilled_hash` write-back) and failure backoff rewrite the file, so they reset the clock;
-  this is intentional: a stamp means "this transcript was just processed", and retention counts
-  from the last real content update;
-- extracted items are written through the normal `write_memory` decider path as `persistent` nodes
-  with provenance (`sources` + backlink on the transcript's `distilled_node_ids`);
-- fully-distilled transcripts are excluded from default search (`include=all` restores them) and
-  archived after `distiller.retention_days` (default 45) — **never before they are distilled**;
-- distilled items can complement existing knowledge but never supersede curated nodes by default
-  in backfill mode (`downgrade_supersede`).
+- the fallback sweep runs every `distiller.interval_minutes` (default 10) when `[distiller] enabled = true`,
+  selecting transcripts idle for at least `idle_minutes` (default 60) whose content changed since last distillation;
+- Stage 0 dehydrates tool-polling noise and empty Assistant turns, then builds a chronological Global User Spine;
+- Stage 1 scans with the low-effort models in `[distiller.episode.scanner_endpoints]`, chunking pending turns at
+  `chunk_chars` (default 400,000); Stage 2 uses `gatekeeper_endpoint` to validate lessons, retrieve evidence,
+  and integrate them into existing or new nodes;
+- episode settings include `scanner_endpoints`, `gatekeeper_endpoint`, `chunk_chars`, `max_tokens`, and
+  `evidence_context_token_budget` under `[distiller.episode]` (see `docs/configuration.md`);
+- extracted lessons are written as `persistent` nodes with provenance (`sources` + transcript backlink in
+  `distilled_node_ids`); fully-distilled transcripts are excluded from default search and archived after
+  `distiller.retention_days` (default 45), never before they are distilled.
+
+The manual segment-distiller options `segment_chars`, `max_concurrency`, `transcript_concurrency`, and
+`item_warn_threshold` are legacy `synapse distill run` settings, not settings for the server or close-triggered
+episode pipeline.
+
+`synapse distill status` prints the active scanner and gatekeeper models and recent run creates, updates, and
+`gatekeeper_filtered` (`items_invalid`) counts. `synapse report --since 7d` shows new-node counts by verification
+status and the Episode Distiller funnel: runs, distilled/skipped transcripts, Stage-1 lessons, created/updated,
+gatekeeper-filtered, quarantined, LLM failures, and archived transcripts.
 
 Maintenance commands:
 
 ```bash
-python -m synapse distill status                  # queue depth + recent run metrics
-python -m synapse distill run --dry-run           # plan only, no writes
-python -m synapse distill run --apply --limit 5   # sweep up to 5 transcripts
-python -m synapse distill run --id <node-id>      # distill one transcript
-python -m synapse distill run --legacy-groups groups.json --report out.json   # backfill mode
+python -m synapse distill status                  # queue, active episode models, and recent run metrics
+python -m synapse distill run --dry-run           # legacy segment-distiller plan only; no writes
+python -m synapse distill run --apply --limit 5   # run the legacy segment distiller
+python -m synapse distill run --id <node-id>      # legacy segment-distill one transcript
+python -m synapse distill run --legacy-groups groups.json --report out.json   # legacy backfill mode
 ```
 
 ## Maintenance commands
