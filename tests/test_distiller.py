@@ -2882,7 +2882,7 @@ def test_near_duplicate_reranker_uses_bounded_shortlist_for_large_corpus(
     corpus = [
         Node(
             metadata=NodeMetadata(
-                id=f"mem_20261015_corpus_node_{index:04d}",
+                id=f"mem_fixture_corpus_node_{index:04d}",
                 title=(
                     "Unrelated vector candidate"
                     if index == 100
@@ -2891,7 +2891,7 @@ def test_near_duplicate_reranker_uses_bounded_shortlist_for_large_corpus(
                 type=NodeType.PERSISTENT,
             ),
             content="",
-            file_path=Path(f"active/mem_20261015_corpus_node_{index:04d}.md"),
+            file_path=Path(f"active/mem_fixture_corpus_node_{index:04d}.md"),
         )
         for index in range(2620)
     ]
@@ -2899,7 +2899,7 @@ def test_near_duplicate_reranker_uses_bounded_shortlist_for_large_corpus(
     class FakeStore:
         def vector_search(self, _vector, *, limit: int):
             assert limit == distiller.NEAR_DUP_VECTOR_TOP_K
-            return [("mem_20261015_corpus_node_0100", 0.1)]
+            return [("mem_fixture_corpus_node_0100", 0.1)]
 
         def get_node(self, node_id: str):
             return corpus[100] if node_id == corpus[100].id else None

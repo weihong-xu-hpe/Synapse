@@ -122,7 +122,7 @@ log_dir = "./.synapse/.logs"
 def seed_markdown_nodes(base_dir: Path) -> None:
     gateway = Node(
         metadata=NodeMetadata(
-            id="mem_20260307_gateway_design",
+            id="mem_fixture_gateway_design",
             title="Gateway Design",
             created_at=FIXED_TIME,
             last_accessed=FIXED_TIME,
@@ -131,7 +131,7 @@ def seed_markdown_nodes(base_dir: Path) -> None:
             sensitivity=SensitivityLevel.INTERNAL,
         ),
         content="# Gateway Design\n\nSee [[Rate Limiting Strategy]].",
-        file_path=Path("active/mem_20260307_gateway_design.md"),
+        file_path=Path("active/mem_fixture_gateway_design.md"),
     )
     rate_limit = Node(
         metadata=NodeMetadata(
@@ -323,7 +323,7 @@ def test_prune_transcript_vectors_dry_run_then_apply(tmp_path: Path) -> None:
     )
     db.execute(
         "INSERT INTO edges (source_id, target_id) VALUES (?, ?)",
-        ("mem_20260307_gateway_design", "mem_session_cli1"),
+        ("mem_fixture_gateway_design", "mem_session_cli1"),
     )
     db.commit()
     db.close()
@@ -341,7 +341,7 @@ def test_prune_transcript_vectors_dry_run_then_apply(tmp_path: Path) -> None:
     db = sqlite3.connect(db_path)
     vector_rows = db.execute("SELECT id FROM nodes_vec WHERE id = 'mem_session_cli1'").fetchall()
     edge_rows = db.execute(
-        "SELECT * FROM edges WHERE source_id = 'mem_20260307_gateway_design' AND target_id = 'mem_session_cli1'"
+        "SELECT * FROM edges WHERE source_id = 'mem_fixture_gateway_design' AND target_id = 'mem_session_cli1'"
     ).fetchall()
     db.close()
     assert vector_rows == []

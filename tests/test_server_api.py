@@ -1168,7 +1168,7 @@ def test_keyed_upsert_redacts_secret_patterns_in_content(tmp_path: Path) -> None
         )
         assert response.status_code == 200
 
-    node_file = runtime_paths.active / "mem_session_9f2b3c2f0a45b2d3.md"
+    node_file = runtime_paths.active / "mem_session_fixture_node.md"
     # id derives from sha1("secret-session")[:16]; read whatever the response said.
     stored = response.json()["node"]["content"]
     assert secret not in stored
