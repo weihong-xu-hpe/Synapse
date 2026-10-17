@@ -111,8 +111,16 @@ def main_callback(
     except (FileNotFoundError, ValidationError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
-    runtime_paths = bootstrap_runtime_directories(loaded_config)
-    loggers = configure_logging(loaded_config, runtime_paths)
+    command_tokens = ctx.args
+    episode_pilot = ctx.invoked_subcommand == "distill" and "episode" in command_tokens
+    if episode_pilot:
+        # Episode command replaces every runtime path from its explicit --base before opening storage.
+        placeholder = Path("/tmp/synapse-episode-cli-unbound")
+        runtime_paths = RuntimePaths(placeholder, placeholder / "active", placeholder / ".archive", placeholder / ".logs", placeholder / ".audit")
+        loggers = {}
+    else:
+        runtime_paths = bootstrap_runtime_directories(loaded_config)
+        loggers = configure_logging(loaded_config, runtime_paths)
     ctx.obj = AppState(
         config_path=loaded_config.config_path,
         runtime_paths=runtime_paths,
@@ -289,6 +297,143 @@ def run_distiller(
     typer.echo(f"Archived transcripts: {summary['archived_transcripts']}")
     typer.echo(f"LLM failures: {summary['llm_failures']}")
 
+
+
+@distiller_app.command("episode")
+def run_episode_distiller(
+    ctx: typer.Context,
+    db: Annotated[Path, typer.Option("--db", exists=True, dir_okay=False, help="SQLite copy to mutate; must be BASE/synapse.db.")],
+    base: Annotated[Path, typer.Option("--base", exists=True, file_okay=False, help="Copied Synapse base containing active/ and .archive/.")],
+    session: Annotated[list[str], typer.Option("--session", help="Transcript node id or session_key; repeat to run sequentially.")],
+    report_path: Annotated[Path, typer.Option("--report", help="Markdown report path including full changed node bodies.")],
+    comparison_db: Annotated[Path | None, typer.Option("--comparison-db", help="Read-only old-pipeline database for citation counts.")] = None,
+    selection_note: Annotated[list[str], typer.Option("--selection-note", help="NODE_ID=reason; repeated notes are included in the report.")] = [],
+) -> None:
+    """Run the episode pipeline sequentially against an explicit copied database."""
+    from synapse.lifecycle.episode_distiller import EpisodeDistiller
+    from synapse.utils.runtime import bootstrap_runtime_directories
+
+    state = _state_from_context(ctx)
+    base_path = base.expanduser().resolve()
+    db_path = db.expanduser().resolve()
+    forbidden = (Path.home() / "synapse").resolve()
+    report_path = report_path.expanduser().resolve()
+    for path in (base_path, db_path, report_path, base_path / "active", base_path / ".archive", base_path / ".logs"):
+        resolved = path.resolve()
+        if resolved == forbidden or forbidden in resolved.parents:
+            raise typer.BadParameter(f"Pilot path resolves inside forbidden live data: {resolved}")
+    if db_path != (base_path / "synapse.db").resolve():
+        raise typer.BadParameter("--db must be exactly --base/synapse.db so all writes stay in the selected copy")
+    if not (base_path / "active").is_dir() or not (base_path / ".archive").is_dir():
+        raise typer.BadParameter("--base must contain copied active/ and .archive/ directories")
+    old_db = comparison_db.expanduser().resolve() if comparison_db is not None else None
+    if old_db is not None and (old_db == forbidden or forbidden in old_db.parents):
+        raise typer.BadParameter("--comparison-db must not resolve inside ~/synapse")
+
+    config = state.config.model_copy(deep=True)
+    config.memory.base_path = base_path
+    config.memory.archive_path = base_path / ".archive"
+    config.logging.log_dir = base_path / ".logs"
+    paths = bootstrap_runtime_directories(config)
+    if paths.base != base_path or paths.base == forbidden or forbidden in paths.base.parents:
+        raise typer.BadParameter("Resolved pilot runtime path is not the supplied safe copy")
+
+    notes = {}
+    for note in selection_note:
+        node_id, separator, reason = note.partition("=")
+        if not separator or not node_id.strip() or not reason.strip():
+            raise typer.BadParameter("--selection-note must be NODE_ID=reason")
+        notes[node_id.strip()] = reason.strip()
+
+    client = EpisodeDistiller.make_sampling_client(config)
+    runner = EpisodeDistiller(config, runtime_paths=paths, sampling_client=client)
+    runs = []
+    failures = []
+    try:
+        for session_id in session:
+            try:
+                runs.append(runner.run(session_id))
+            except Exception as exc:  # preserve successful earlier/later sessions in the report
+                failures.append({"session": session_id, "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        runner.close()
+        client.close()
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        _render_episode_pilot_report(runs, notes=notes, comparison_db=old_db, failures=failures),
+        encoding="utf-8",
+    )
+    typer.echo(f"Episode pilot report: {report_path.resolve()}")
+    typer.echo(f"Sessions: {len(runs)}; failures: {len(failures)}; operations: {sum(len(run.ops) for run in runs)}")
+    if failures:
+        raise typer.Exit(code=1)
+
+
+def _render_episode_pilot_report(runs: list[Any], *, notes: dict[str, str], comparison_db: Path | None, failures: list[dict[str, str]]) -> str:
+    lines = ["# Episode distiller pilot", "", "Runs are sequential on the selected copy; stage usage comes from the proxy response when available.", ""]
+    if comparison_db is not None:
+        lines.append(f"Read-only old-pipeline comparison DB: `{comparison_db}`")
+        lines.append("")
+
+    if failures:
+        lines.extend(["## Failed sessions", ""])
+        for failure in failures:
+            lines.append(f"- `{failure['session']}`: {failure['error']}")
+        lines.append("")
+    for run in runs:
+        lines.extend([f"## {run.transcript_id}", ""])
+        if run.transcript_id in notes:
+            lines.append(f"Selection: {notes[run.transcript_id]}")
+        lines.extend([
+            f"- Session key: `{run.session_key or '(legacy transcript key unavailable)'}`",
+            f"- Input: {run.chars} chars, {run.turns} turns, {run.chunks} summarize chunk(s)",
+            f"- Retrieval calls: {run.retrieval_calls}",
+            f"- Watermark stamped: {run.stamped}",
+        ])
+        if comparison_db is not None:
+            lines.append(f"- Old-pipeline distiller nodes citing this transcript: {_count_old_distiller_nodes(comparison_db, run.transcript_id)}")
+        lines.extend(["", "### Lessons", ""])
+        if run.lessons:
+            for index, lesson in enumerate(run.lessons, 1):
+                lines.append(f"{index}. **{lesson['topic']}** — {lesson['claim']} (evidence: {', '.join(lesson['evidence_turns'])})")
+        else:
+            lines.append("No durable lessons.")
+        lines.extend(["", "### Stage calls, tokens, and latency", "", "| Stage | Calls | Prompt tokens | Completion tokens | Reasoning tokens | Latency ms |", "|---|---:|---:|---:|---:|---:|"])
+        for stage, metrics in run.stages.items():
+            data = metrics.as_dict()
+            lines.append(f"| {stage} | {data['calls']} | {data['prompt_tokens'] if data['usage_available'] else 'unavailable'} | {data['completion_tokens'] if data['usage_available'] else 'unavailable'} | {data['reasoning_tokens'] if data['usage_available'] else 'unavailable'} | {data['latency_ms']} |")
+        lines.extend(["", "### Operations", "", "| Action | Title | Target title / ID | Result / reason |", "|---|---|---|---|"])
+        if run.ops:
+            for op in run.ops:
+                target_label = " — ".join(value for value in (op.get("target_title"), op.get("target_id") or op.get("node_id")) if value) or "—"
+                lines.append(f"| {op.get('action')} | {op.get('title', '')} | {target_label} | {op.get('reason', '')} |")
+        else:
+            lines.append("| none | — | — | No integrate operations |")
+        for node in run.node_bodies:
+            lines.extend(["", f"### Full body: {node['title']} (`{node['node_id']}`)", "", "````markdown", node["content"].rstrip(), "````"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _count_old_distiller_nodes(database: Path, transcript_id: str) -> int:
+    import sqlite3
+
+    uri = f"file:{database.as_posix()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute("SELECT okf_meta, content FROM nodes WHERE type = 'persistent'").fetchall()
+    count = 0
+    for row in rows:
+        try:
+            metadata = json.loads(row["okf_meta"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        sources = metadata.get("sources") if isinstance(metadata, dict) else []
+        content = str(row["content"] or "")
+        if (isinstance(sources, list) and transcript_id in sources) or f"[[{transcript_id}]]" in content:
+            count += 1
+    return count
 
 def _run_legacy_backfill(
     distiller: Any,

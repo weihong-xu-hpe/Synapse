@@ -343,3 +343,35 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
   On a partial segment failure the watermark is held back to the turn before the
   first failed segment and `distilled_hash` is left unset so the next sweep
   retries the failed range.
+
+## 11. Episode pipeline pilot
+
+The opt-in `synapse distill episode` command runs the episode-based pipeline on an explicitly
+selected database/base copy. It is currently separate from the existing scheduled distiller and
+does not change bridge retention or add the episode REST API. The command accepts repeated
+`--session` values and processes them sequentially so later sessions can retrieve earlier writes.
+
+```sh
+synapse --config /copy/pilot.toml distill episode \
+  --db /copy/synapse.db --base /copy \
+  --session <transcript-node-id> --report /copy/report.md
+```
+
+The pilot uses the dedicated `[distiller.episode.endpoint]` config, not `[decider].endpoints`;
+the default endpoint targets a local proxy and forwards `reasoning_effort=medium`. Configure the
+dedicated endpoint explicitly in a private pilot config as needed (documentation examples use
+placeholder hosts such as `http://llm-proxy.example/v1`). The default model token budget remains
+200,000 and temperature 0.
+
+Small episodes use one summary call. Larger episodes map complete turns into approximately
+100,000-character chunks, then make one lesson-reduce call to merge duplicates and let later
+corrections replace earlier claims. Integrate retrieves five candidates per lesson, deduplicates
+the union under a 24,000-character conservative body budget, and calls once per batch of at most
+12 lessons. Updates target only retrieved active persistent nodes; creates require justification;
+empty operations are valid. The final OKF gate and existing distiller quarantine remain in force.
+
+The pilot report records stage latency and proxy usage tokens when supplied, lesson decisions,
+old-pipeline source-citation counts when `--comparison-db` is provided, and full bodies of changed
+nodes. A failed stage does not advance `distilled_turn`; rerunning an already-applied create uses
+the canonical title/date node ID and becomes a no-op. The pilot writes no data outside `--base`
+except the explicitly selected report file.
