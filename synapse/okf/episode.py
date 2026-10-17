@@ -1,4 +1,4 @@
-"""Prompt builders for the episode-based session knowledge pipeline."""
+"""Prompt builders for the two-stage episode knowledge pipeline."""
 
 from __future__ import annotations
 
@@ -10,38 +10,40 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def render_episode_summary_prompt(*, turns: str, turn_eligibility: list[dict[str, Any]]) -> str:
+_SCANNER_POLICY = [
+    "Extract only high-value, durable system knowledge; do not summarize the conversation or its progress.",
+    "Keep these categories: (1) component/config/repository ownership and topology, including which repo or chart owns a resource; (2) internal or external API quirks, error codes, and contract edge cases such as 404/400/empty-result handling; (3) infrastructure, middleware, and auth debugging pitfalls stated as exact Symptom -> Cause -> Fix; (4) confirmed architectural or engineering decisions approved by the user.",
+    "FORBIDDEN: self-inflicted bugs in temporary scripts or session-written code that were fixed in the same session (including typos, regex mistakes, and indentation errors); one-off probe timings or batch progress counts; and early hypotheses later refuted or corrected by the user or later turns.",
+    "Use the Global User Spine to resolve corrections and evolving intent. Do NOT filter or reject lessons based on `turn_eligibility` or `assistant_prose_is_not_evidence`; every User, Assistant, and Tool turn is valid Stage 1 context.",
+    "Write a detailed Chinese synthesis while preserving exact English identifiers, repository names, file paths, config keys, error strings, and code symbols. `topic` is an English title.",
+]
+
+
+def render_episode_summary_prompt(*, turns: str, global_user_spine: str) -> str:
     return "\n".join(
         [
-            "Summarize this coding-agent conversation episode into durable, reusable engineering lessons.",
-            "Keep decisions with rationale, system facts, reproducible procedures, corrections, and pitfalls.",
-            "Drop progress/status chatter, temporary state, one-off measurements, and numbers-of-the-day.",
-            "Evidence may cite ONLY turn IDs marked eligible=true below: assertive User bodies and attached tool results. Never cite Assistant prose as evidence; question-only User turns are not evidence.",
-            "Use the full turns as context, but cite only eligible evidence. For each lesson return 1-3 exact verbatim evidence_quotes of at most 200 characters and set evidence_turns to exactly their unique turn IDs.",
-            "Return JSON only: {\"lessons\":[{\"topic\":\"...\",\"claim\":\"...\",\"evidence_turns\":[\"T1\"],\"evidence_quotes\":[{\"turn\":\"T1\",\"quote\":\"exact source text\"}]}]}.",
-            "Turn roles and eligibility:",
-            _json(turn_eligibility),
-            "Episode turns:",
+            "Stage 1 scanner: inspect this complete dehydrated episode and propose only its most durable, reusable system lessons (usually 3–8; fewer when warranted).",
+            *_SCANNER_POLICY,
+            'Return JSON only with this schema: {"lessons":[{"okf_type":"pitfall|fact|decision|procedure","topic":"English title/topic","claim":"Detailed Chinese synthesis preserving exact technical identifiers","evidence_turns":["T12","T15"]}]}.',
+            "Global User Spine (all User turns in the complete transcript, chronological):",
+            global_user_spine,
+            "Dehydrated episode turns:",
             turns,
         ]
     )
 
 
 def render_episode_map_prompt(
-    *, turns: str, turn_eligibility: list[dict[str, Any]], chunk_index: int, chunk_count: int
+    *, turns: str, global_user_spine: str, chunk_index: int, chunk_count: int
 ) -> str:
     return "\n".join(
         [
-            "Extract durable engineering lessons from this chunk of a larger conversation episode.",
-            "Keep decisions with rationale, system facts, reproducible procedures, corrections, and pitfalls.",
-            "Drop progress/status chatter, temporary state, one-off measurements, and numbers-of-the-day.",
-            "Evidence may cite ONLY turn IDs marked eligible=true below: assertive User bodies and attached tool results. Never cite Assistant prose as evidence; question-only User turns are not evidence.",
-            "Use the full turns as context, but cite only eligible evidence. For each lesson return 1-3 exact verbatim evidence_quotes of at most 200 characters and set evidence_turns to exactly their unique turn IDs.",
-            "This is chunk " + str(chunk_index) + " of " + str(chunk_count) + "; preserve claims that later chunks may correct.",
-            "Return JSON only: {\"lessons\":[{\"topic\":\"...\",\"claim\":\"...\",\"evidence_turns\":[\"T1\"],\"evidence_quotes\":[{\"turn\":\"T1\",\"quote\":\"exact source text\"}]}]}.",
-            "Return an empty lessons array when nothing is durable. Do not impose a count cap.",
-            "Turn roles and eligibility:",
-            _json(turn_eligibility),
+            f"Stage 1 scanner: inspect chunk {chunk_index} of {chunk_count} from one dehydrated conversation episode.",
+            *_SCANNER_POLICY,
+            "Extract only lessons supported by this chunk, but keep them provisional: later chunks and the Global User Spine can correct them.",
+            'Return JSON only with this schema: {"lessons":[{"okf_type":"pitfall|fact|decision|procedure","topic":"English title/topic","claim":"Detailed Chinese synthesis preserving exact technical identifiers","evidence_turns":["T12","T15"]}]}. Return an empty lessons array when no durable lesson is present.',
+            "Global User Spine (all User turns in the complete transcript, chronological):",
+            global_user_spine,
             "Chunk turns:",
             turns,
         ]
@@ -49,19 +51,17 @@ def render_episode_map_prompt(
 
 
 def render_episode_lesson_reduce_prompt(
-    *, chunk_lessons: list[dict[str, Any]], eligible_turns: list[dict[str, Any]]
+    *, chunk_lessons: list[dict[str, Any]], global_user_spine: str
 ) -> str:
     return "\n".join(
         [
-            "Reduce lessons mapped from chunks of one conversation episode.",
-            "Merge duplicate or overlapping lessons into the fewest complete reusable claims without losing distinct facts.",
-            "Reconcile evolving claims: a later explicit correction supersedes the earlier conflicting claim; retain both only when the distinction matters.",
-            "Union only verbatim evidence_quotes from the supporting lessons; never rewrite quotes, invent IDs, or cite an ineligible turn.",
-            "Each lesson's evidence_turns must exactly match the unique turn IDs in its evidence_quotes; keep quotes at most 200 characters.",
-            "Return JSON only: {\"lessons\":[{\"topic\":\"...\",\"claim\":\"...\",\"evidence_turns\":[\"T1\"],\"evidence_quotes\":[{\"turn\":\"T1\",\"quote\":\"exact source text\"}]}]}.",
-            "Eligible turn IDs and roles:",
-            _json(eligible_turns),
-            "Chunk lessons:",
+            "Stage 1 lesson_reduce: reconcile mapped candidates into the fewest complete, high-value durable lessons without losing distinct facts.",
+            *_SCANNER_POLICY,
+            "Merge overlapping lessons, preserve exact evidence turn IDs, and let later explicit user corrections in the Global User Spine supersede refuted claims. Keep the correct final state, not the abandoned hypothesis.",
+            'Return JSON only with this schema: {"lessons":[{"okf_type":"pitfall|fact|decision|procedure","topic":"English title/topic","claim":"Detailed Chinese synthesis preserving exact technical identifiers","evidence_turns":["T12","T15"]}]}.',
+            "Global User Spine:",
+            global_user_spine,
+            "Mapped lesson candidates:",
             _json(chunk_lessons),
         ]
     )
@@ -73,35 +73,37 @@ def render_episode_integrate_prompt(
     same_session_nodes: list[dict[str, Any]],
     retrieved_nodes: list[dict[str, Any]],
     evidence_context: list[dict[str, Any]],
+    global_user_spine: str,
 ) -> str:
     return "\n".join(
         [
-            "Integrate the supplied episode lessons into durable Synapse knowledge.",
-            "For every lesson choose update to an existing node stating the same lesson, create only if no suitable node exists, or none if unsupported/redundant/transient.",
-            "Default to update; every create requires a specific justification. Do not split one coherent lesson into fragments or create siblings for the same claim.",
-            "Updates may target only IDs in the supplied same-session nodes or retrieved persistent candidates. Never target a session transcript.",
-            "For each update/create return one full valid OKF body with the type's required sections and Sources section; title must be English.",
-            "Takeaway is exactly one non-empty line, target at most 160 characters and never more than 200 characters.",
-            "Also return evidence as exact {turn, quote} snippets copied from that lesson's verbatim eligible evidence excerpts; do not cite assistant prose or invent quotes.",
-            "Return JSON only: {\"ops\":[{\"action\":\"update\",\"target_id\":\"...\",\"title\":\"...\",\"okf_type\":\"fact|decision|procedure|pitfall\",\"content\":\"...\",\"evidence\":[{\"turn\":\"T1\",\"quote\":\"...\"}]},{\"action\":\"create\",\"title\":\"...\",\"okf_type\":\"...\",\"content\":\"...\",\"justification\":\"...\",\"evidence\":[{\"turn\":\"T1\",\"quote\":\"...\"}]},{\"action\":\"none\",\"lesson_index\":0,\"reason\":\"...\"}]}.",
-            "An empty ops list is valid. No fixed operation-count cap.",
+            "You are both the Strict Gatekeeper and the OKF Integrator for durable Synapse knowledge.",
+            "Value and refutation gate: output action=none for a self-inflicted temporary script/code bug fixed in this session, a one-off timing or batch-progress count, or an early hypothesis refuted by later turns. Use the Global User Spine and cited excerpts to detect corrections; for example, if a later turn clarifies that 401 was not caused by CORS, do not preserve the CORS hypothesis.",
+            "Merge/update versus create: default to update when a same-session or retrieved persistent node already covers the topic; use its exact target_id. Create only when no candidate fits, and provide a specific justification. Never create a duplicate sibling for an existing claim.",
+            "Language and OKF format: title MUST be a specific English title. Content MUST be a complete valid OKF body with `## Takeaway` as one Chinese line (target <=160 characters, hard maximum 200), the required sections for okf_type, and `## Sources`. Write Takeaway and body sections in Chinese while preserving exact English identifiers, repository names, paths, commands, config keys, and error strings. Required sections: fact=Details; decision=Decision and Consequences; procedure=Steps; pitfall=Symptom, Cause, and Fix.",
+            "Verification is an annotation, never a write gate. Set verified=true when the technical claim (including repo, path, config key, error string, or root cause) is grounded in the supplied excerpts from User turns, Tool outputs, or Assistant source-code/log analysis and is not refuted later. Set verified=false only for speculative or ungrounded claims. Return verbatim evidence quotes, each <=200 characters, with its turn ID.",
+            'Return JSON only: {"ops":[{"action":"update","lesson_index":0,"target_id":"...","title":"...","okf_type":"fact|decision|procedure|pitfall","content":"...","verified":true,"evidence":[{"turn":"T12","quote":"verbatim excerpt <= 200 chars"}]},{"action":"create","lesson_index":1,"title":"...","okf_type":"...","content":"...","justification":"...","verified":false,"evidence":[]},{"action":"none","lesson_index":2,"reason":"..."}]}.',
+            "Return one operation per lesson. Use `none` when the lesson fails the value/refutation gate. Updates may target only supplied same-session or retrieved persistent nodes; never target a session transcript.",
             "Lessons:",
             _json(lessons),
-            "Previously produced nodes for this session (compact summary):",
+            "Existing nodes already produced from this session:",
             _json(same_session_nodes),
-            "Retrieved persistent knowledge candidates (only these IDs can be update targets):",
+            "Retrieved active persistent candidates (only these IDs may be update targets):",
             _json(retrieved_nodes),
-            "Per-lesson eligible evidence excerpts (verbatim, with role/source markers):",
+            "Global User Spine (all User turns in the complete transcript, chronological):",
+            global_user_spine,
+            "Verbatim excerpts for each lesson's evidence_turns (include User, Assistant, and surviving Tool sections):",
             _json(evidence_context),
         ]
     )
+
 
 def render_episode_takeaway_repair_prompt(*, title: str, okf_type: str, takeaway: str) -> str:
     return "\n".join(
         [
             "Rewrite only the supplied OKF Takeaway line; do not rewrite or add any other section.",
-            "Return JSON only: {\"takeaway\":\"...\"}.",
-            "The result must be one non-empty line, target at most 160 characters, and never exceed the hard 200-character limit.",
+            'Return JSON only: {"takeaway":"..."}.',
+            "The result must be one non-empty Chinese line, target at most 160 characters, and never exceed the hard 200-character limit.",
             "Preserve the original supported meaning; do not add claims.",
             f"Title: {title}",
             f"OKF type: {okf_type}",

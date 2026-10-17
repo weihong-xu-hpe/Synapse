@@ -1071,7 +1071,11 @@ def test_root_handler_advertises_rest_endpoints(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["rest"] == {"search": "/api/search", "write": "/api/write"}
+    assert payload["rest"] == {
+        "search": "/api/search",
+        "write": "/api/write",
+        "episode_close": "/api/episode/close",
+    }
 
 
 def test_keyed_upsert_create_unchanged_update(tmp_path: Path) -> None:

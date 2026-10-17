@@ -292,7 +292,7 @@ Every OKF node carries `okf_type`, `okf_version`, and `sources` frontmatter.
 The **session distiller** converts session transcript nodes into OKF knowledge automatically:
 
 - a sweep runs every `distiller.interval_minutes` (default 10) when `[distiller] enabled = true`,
-  selecting idle transcripts (`idle_minutes`, default 30) whose content changed since last distillation;
+  selecting idle transcripts (`idle_minutes`, default 60) whose content changed since last distillation;
 - **both the idle clock and the retention clock use the transcript file's mtime** — stamping
   (`distilled_hash` write-back) and failure backoff rewrite the file, so they reset the clock;
   this is intentional: a stamp means "this transcript was just processed", and retention counts

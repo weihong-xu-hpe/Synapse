@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from synapse.config import DeciderEndpointSettings, SynapseConfig
 from synapse.lifecycle.distiller import Distiller, content_sha256
 from synapse.models import Node, NodeStatus, NodeType, generate_node_id, slugify_english_title
 from synapse.okf import (
@@ -76,7 +78,6 @@ class EpisodeRun:
     lessons: list[dict[str, Any]] = field(default_factory=list)
     ops: list[dict[str, Any]] = field(default_factory=list)
     node_bodies: list[dict[str, str]] = field(default_factory=list)
-    evidence_rejections: list[dict[str, str]] = field(default_factory=list)
     stages: dict[str, StageMetrics] = field(default_factory=dict)
     retrieval_calls: int = 0
     stamped: bool = False
@@ -91,7 +92,6 @@ class EpisodeRun:
             "chunks": self.chunks,
             "lessons": self.lessons,
             "ops": self.ops,
-            "evidence_rejections": self.evidence_rejections,
             "node_bodies": self.node_bodies,
             "stages": {name: metrics.as_dict() for name, metrics in self.stages.items()},
             "retrieval_calls": self.retrieval_calls,
@@ -104,14 +104,14 @@ class Lesson:
     topic: str
     claim: str
     evidence_turns: list[str]
-    evidence_quotes: list[EvidenceEntry]
+    okf_type: str = "fact"
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "okf_type": self.okf_type,
             "topic": self.topic,
             "claim": self.claim,
             "evidence_turns": self.evidence_turns,
-            "evidence_quotes": [{"turn": quote.turn, "quote": quote.quote} for quote in self.evidence_quotes],
         }
 
 
@@ -124,9 +124,9 @@ class EpisodeOp:
     target_id: str | None = None
     justification: str = ""
     evidence: list[EvidenceEntry] = field(default_factory=list)
+    verified: bool | None = None
     reason: str = ""
     lesson_index: int | None = None
-
 
 class EpisodeDistiller:
     """Run the new pilot pipeline against one explicitly supplied runtime copy."""
@@ -137,11 +137,13 @@ class EpisodeDistiller:
         *,
         runtime_paths: RuntimePaths,
         sampling_client: Any,
+        gatekeeper_client: Any | None = None,
     ) -> None:
         self.config = config
         self.settings = config.distiller.episode
         self.runtime_paths = runtime_paths
         self.sampling_client = sampling_client
+        self.gatekeeper_client = gatekeeper_client if gatekeeper_client is not None else sampling_client
         self.service = SynapseServerService(
             config,
             runtime_paths=runtime_paths,
@@ -152,20 +154,53 @@ class EpisodeDistiller:
             runtime_paths=runtime_paths,
             sampling_client=sampling_client,
         )
+        self._commit_lock = threading.Lock()
 
     @staticmethod
-    def make_sampling_client(config: SynapseConfig) -> Any:
+    def make_scanner_client(config: SynapseConfig) -> Any:
         from synapse.server.decider import LocalLLMDecider
 
-        endpoint = config.distiller.episode.endpoint
+        episode = config.distiller.episode
+        endpoints = episode.scanner_endpoints or episode.endpoints or [episode.endpoint]
+        scanner_endpoints = [
+            endpoint.model_copy(
+                update={
+                    "extra_body": {
+                        **endpoint.extra_body,
+                        "reasoning_effort": endpoint.extra_body.get("reasoning_effort", "low"),
+                    }
+                }
+            )
+            for endpoint in endpoints
+        ]
+        settings = config.decider.model_copy(
+            update={
+                "provider": "local_llm",
+                "endpoints": scanner_endpoints,
+                "timeout_seconds": episode.timeout_seconds,
+                "max_tokens": episode.max_tokens,
+                "temperature": episode.temperature,
+                "endpoint_max_concurrency": max(16, config.decider.endpoint_max_concurrency),
+            }
+        )
+        return LocalLLMDecider(settings)
+
+    @staticmethod
+    def make_gatekeeper_client(config: SynapseConfig) -> Any:
+        from synapse.server.decider import LocalLLMDecider
+
+        episode = config.distiller.episode
+        endpoint = episode.gatekeeper_endpoint or DeciderEndpointSettings(
+            base_url="http://127.0.0.1:47870/v1",
+            model="claude-haiku-5.5",
+        )
         settings = config.decider.model_copy(
             update={
                 "provider": "local_llm",
                 "endpoints": [endpoint],
-                "timeout_seconds": config.distiller.episode.timeout_seconds,
-                "max_tokens": config.distiller.episode.max_tokens,
-                "temperature": config.distiller.episode.temperature,
-                "endpoint_max_concurrency": 4,
+                "max_tokens": episode.max_tokens,
+                "temperature": episode.temperature,
+                "endpoint_max_concurrency": max(16, config.decider.endpoint_max_concurrency),
             }
         )
         return LocalLLMDecider(settings)
@@ -174,81 +209,118 @@ class EpisodeDistiller:
         self._distiller_helpers.close()
 
     def run(self, session: str) -> EpisodeRun:
+        return self.integrate_episode(*self.extract_episode(session))
+
+    def extract_episode(
+        self, session: str
+    ) -> tuple[Node, list[TranscriptTurn], list[TranscriptTurn], list[TranscriptTurn], str, list[Lesson], EpisodeRun]:
+        """Read and summarize one transcript without consulting or changing the knowledge graph."""
         transcript = self._resolve_transcript(session)
         if not is_session_transcript(transcript):
             raise ValueError(f"Not a session transcript: {transcript.id}")
         parsed = parse_transcript(transcript.content)
         watermark = transcript.metadata.distilled_turn or 0
-        pending = parsed.turns_after(watermark)
-        if not pending:
+        original_pending = parsed.turns_after(watermark)
+        if not original_pending:
             episode_id = self._episode_id(transcript, watermark, watermark, transcript.content)
-            return EpisodeRun(transcript.id, transcript.metadata.session_key, episode_id, 0, 0, 0, stamped=True)
+            with self._commit_lock:
+                self._distiller_helpers._stamp_transcript(transcript, [], distilled_turn=watermark)
+            run = EpisodeRun(transcript.id, transcript.metadata.session_key, episode_id, 0, 0, 0, stamped=True)
+            return transcript, [], [], parsed.turns, "", [], run
 
+        all_turns: list[TranscriptTurn] = []
+        for turn in parsed.turns:
+            dehydrated = _dehydrate_turn(turn)
+            if dehydrated is not None:
+                all_turns.append(dehydrated)
+        dehydrated_by_number = {turn.number: turn for turn in all_turns}
+        pending = [dehydrated_by_number[turn.number] for turn in original_pending if turn.number in dehydrated_by_number]
         source_text = "\n\n".join(_render_turn(turn) for turn in pending)
+        global_user_spine = _render_global_user_spine(parsed.turns)
         chunks = build_episode_chunks(pending, self.settings.chunk_chars)
         run = EpisodeRun(
             transcript_id=transcript.id,
             session_key=transcript.metadata.session_key,
-            episode_id=self._episode_id(transcript, pending[0].number, pending[-1].number, source_text),
+            episode_id=self._episode_id(
+                transcript, original_pending[0].number, original_pending[-1].number, source_text
+            ),
             chars=len(source_text),
             turns=len(pending),
             chunks=len(chunks),
         )
-        turn_evidence = _turn_evidence_records(pending)
-        eligible_by_id = {row["turn"]: row for row in turn_evidence}
-        eligible_text_by_id = {row["turn"]: row["text"] for row in turn_evidence if row["eligible"]}
+
         lesson_rows: list[Lesson] = []
-        if len(chunks) == 1:
-            text, ids = chunks[0]
-            eligible_rows = [eligible_by_id[turn_id] for turn_id in ids]
-            eligible_chunk = {turn_id: eligible_text_by_id[turn_id] for turn_id in ids if turn_id in eligible_text_by_id}
-            payload = self._call(
-                run,
-                "summarize",
-                render_episode_summary_prompt(turns=text, turn_eligibility=eligible_rows),
-            )
-            lesson_rows = _parse_lessons(payload, eligible_chunk, rejected=run.evidence_rejections)
-        else:
-            mapped: list[Lesson] = []
-            for index, (text, ids) in enumerate(chunks, 1):
-                eligible_rows = [eligible_by_id[turn_id] for turn_id in ids]
-                eligible_chunk = {turn_id: eligible_text_by_id[turn_id] for turn_id in ids if turn_id in eligible_text_by_id}
+        if len(pending) >= 2 and len(source_text) >= 600:
+            if len(chunks) == 1:
+                text, _ids = chunks[0]
                 payload = self._call(
                     run,
-                    "map",
-                    render_episode_map_prompt(
-                        turns=text,
-                        turn_eligibility=eligible_rows,
-                        chunk_index=index,
-                        chunk_count=len(chunks),
+                    "summarize",
+                    render_episode_summary_prompt(turns=text, global_user_spine=global_user_spine),
+                )
+                lesson_rows = _parse_lessons(payload)
+            else:
+                mapped: list[Lesson] = []
+                for index, (text, _ids) in enumerate(chunks, 1):
+                    payload = self._call(
+                        run,
+                        "map",
+                        render_episode_map_prompt(
+                            turns=text,
+                            global_user_spine=global_user_spine,
+                            chunk_index=index,
+                            chunk_count=len(chunks),
+                        ),
+                    )
+                    mapped.extend(_parse_lessons(payload))
+                reduced = self._call(
+                    run,
+                    "lesson_reduce",
+                    render_episode_lesson_reduce_prompt(
+                        chunk_lessons=[lesson.as_dict() for lesson in mapped],
+                        global_user_spine=global_user_spine,
                     ),
                 )
-                mapped.extend(_parse_lessons(payload, eligible_chunk, rejected=run.evidence_rejections))
-            eligible_role_rows = [
-                {key: row[key] for key in ("turn", "role", "eligible", "source", "reason") if key in row}
-                for row in turn_evidence
-            ]
-            reduced = self._call(
-                run,
-                "lesson_reduce",
-                render_episode_lesson_reduce_prompt(
-                    chunk_lessons=[lesson.as_dict() for lesson in mapped],
-                    eligible_turns=eligible_role_rows,
-                ),
-            )
-            lesson_rows = _parse_lessons(reduced, eligible_text_by_id, rejected=run.evidence_rejections)
+                lesson_rows = _parse_lessons(reduced)
 
         run.lessons = [lesson.as_dict() for lesson in lesson_rows]
-        try:
-            self._integrate(transcript, pending, lesson_rows, run)
-        except Exception:
-            # Never stamp partial model/commit failures; already-applied creates use deterministic IDs.
-            raise
-        self._distiller_helpers._stamp_transcript(
-            transcript,
-            [str(op.get("node_id")) for op in run.ops if op.get("node_id")],
-            distilled_turn=pending[-1].number,
-        )
+        return transcript, all_turns, pending, parsed.turns, global_user_spine, lesson_rows, run
+
+    def integrate_episode(
+        self,
+        transcript: Node,
+        all_turns: list[TranscriptTurn],
+        pending_turns: list[TranscriptTurn],
+        verification_turns: list[TranscriptTurn],
+        global_user_spine: str,
+        lessons: list[Lesson],
+        run: EpisodeRun,
+    ) -> EpisodeRun:
+        """Retrieve, integrate, commit, and stamp one extracted episode."""
+        if run.stamped:
+            return run
+        original_pending = [
+            turn for turn in verification_turns if turn.number > (transcript.metadata.distilled_turn or 0)
+        ]
+        if not original_pending:
+            run.stamped = True
+            return run
+
+        if lessons:
+            self._integrate(
+                transcript,
+                all_turns,
+                lessons,
+                run,
+                global_user_spine=global_user_spine,
+                verification_turns=verification_turns,
+            )
+        with self._commit_lock:
+            self._distiller_helpers._stamp_transcript(
+                transcript,
+                [str(op.get("node_id")) for op in run.ops if op.get("node_id")],
+                distilled_turn=original_pending[-1].number,
+            )
         run.stamped = True
         return run
 
@@ -275,9 +347,10 @@ class EpisodeDistiller:
         return f"{transcript.id}:{start}-{end}:{digest}"
 
     def _call(self, run: EpisodeRun, stage: str, prompt: str) -> Any:
+        client = self.gatekeeper_client if stage in {"integrate", "takeaway_repair"} else self.sampling_client
         metrics = run.stages.setdefault(stage, StageMetrics())
         started = time.perf_counter()
-        call_context = getattr(self.sampling_client, "call_context", None)
+        call_context = getattr(client, "call_context", None)
         context = None
         try:
             if callable(call_context):
@@ -286,13 +359,13 @@ class EpisodeDistiller:
                     stage=f"episode_{stage}",
                     timeout_seconds=self.settings.timeout_seconds,
                 ) as context:
-                    payload = self.sampling_client.sample_json(
+                    payload = client.sample_json(
                         prompt=prompt,
                         system_prompt="",
                         max_tokens=self.settings.max_tokens,
                     )
             else:
-                payload = self.sampling_client.sample_json(
+                payload = client.sample_json(
                     prompt=prompt,
                     system_prompt="",
                     max_tokens=self.settings.max_tokens,
@@ -305,7 +378,7 @@ class EpisodeDistiller:
             metrics.add(elapsed_ms=(time.perf_counter() - started) * 1000, usage=usage, calls=calls or 1)
 
     def _commit_call(self, run: EpisodeRun, callback: Callable[[], Any]) -> Any:
-        call_context = getattr(self.sampling_client, "call_context", None)
+        call_context = getattr(self.gatekeeper_client, "call_context", None)
         if not callable(call_context):
             return callback()
         context = None
@@ -334,15 +407,20 @@ class EpisodeDistiller:
         turns: list[TranscriptTurn],
         lessons: list[Lesson],
         run: EpisodeRun,
+        *,
+        global_user_spine: str,
+        verification_turns: list[TranscriptTurn],
     ) -> None:
         if not lessons:
             return
-        helper_token = self.service.push_sampling_client(self.sampling_client)
+        helper_token = self.service.push_sampling_client(self.gatekeeper_client)
         try:
             prior_nodes = self._same_session_nodes(transcript)
             with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as retrieval:
                 for batch in self._integrate_lesson_batches(turns, lessons):
                     candidates = self._retrieve_for_lessons(retrieval, batch, run)
+                    allowed_target_ids = {node["id"] for node in candidates}
+                    allowed_target_ids.update(node["id"] for node in prior_nodes)
                     evidence_context = self._evidence_context(turns, batch)
                     payload = self._call(
                         run,
@@ -352,17 +430,16 @@ class EpisodeDistiller:
                             same_session_nodes=prior_nodes,
                             retrieved_nodes=candidates,
                             evidence_context=evidence_context,
+                            global_user_spine=global_user_spine,
                         ),
                     )
-                    allowed_target_ids = {node["id"] for node in candidates}
-                    allowed_target_ids.update(node["id"] for node in prior_nodes)
-                    ops = _parse_ops(payload, len(batch))
-                    batch_evidence_turns = {turn_id for lesson in batch for turn_id in lesson.evidence_turns}
-                    for op in ops:
+                    for op in _parse_ops(payload, len(batch)):
                         result = self._apply_op(
-                            transcript, turns, op, run,
+                            transcript,
+                            verification_turns,
+                            op,
+                            run,
                             allowed_target_ids=allowed_target_ids,
-                            allowed_evidence_turns=batch_evidence_turns,
                         )
                         run.ops.append(result)
                         if result.get("node_id"):
@@ -372,7 +449,6 @@ class EpisodeDistiller:
                                 run.node_bodies.append({"node_id": node.id, "title": node.title, "content": node.content})
         finally:
             self.service.reset_sampling_client(helper_token)
-
     def _integrate_lesson_batches(
         self, turns: list[TranscriptTurn], lessons: list[Lesson]
     ) -> list[list[Lesson]]:
@@ -449,26 +525,18 @@ class EpisodeDistiller:
 
     @staticmethod
     def _evidence_context(turns: list[TranscriptTurn], lessons: list[Lesson]) -> list[dict[str, Any]]:
-        eligible_by_id = {
-            row["turn"]: row
-            for row in _turn_evidence_records(turns)
-            if row["eligible"]
-        }
+        turns_by_id = {turn.id: turn for turn in turns}
         result: list[dict[str, Any]] = []
         for index, lesson in enumerate(lessons):
             excerpts: list[dict[str, str]] = []
-            for quote in lesson.evidence_quotes:
-                row = eligible_by_id.get(quote.turn)
-                if row is None:
-                    raise ValueError(f"Lesson cites ineligible or unavailable evidence turn {quote.turn}")
-                excerpts.append(
-                    {
-                        "turn": quote.turn,
-                        "role": row["role"],
-                        "source": row["source"],
-                        "text": quote.quote,
-                    }
-                )
+            for turn_id in dict.fromkeys(lesson.evidence_turns):
+                turn = turns_by_id.get(turn_id)
+                if turn is None:
+                    excerpts.append(
+                        {"turn": turn_id, "role": "missing", "text": "[turn not present in the transcript]"}
+                    )
+                    continue
+                excerpts.append({"turn": turn.id, "role": turn.role, "text": _turn_evidence_excerpt(turn)})
             result.append(
                 {
                     "lesson_index": index,
@@ -518,50 +586,64 @@ class EpisodeDistiller:
         run: EpisodeRun,
         *,
         allowed_target_ids: set[str],
-        allowed_evidence_turns: set[str],
     ) -> dict[str, Any]:
-        if op.action == "none":
-            return {"action": "none", "reason": op.reason, "lesson_index": op.lesson_index}
-        if op.action == "invalid":
-            return self._quarantine(transcript, op, op.reason or "Malformed Integrate operation", run)
-        if not op.title or not slugify_english_title(op.title):
-            return self._quarantine(transcript, op, "Operation title must be an English knowledge title", run)
-        if op.okf_type not in TYPE_REQUIRED_SECTIONS:
-            return self._quarantine(transcript, op, "Unknown OKF type", run)
-        if op.action == "create" and not op.justification.strip():
-            return self._quarantine(transcript, op, "Create operation requires a justification", run)
-        if op.action == "update" and not op.target_id:
-            return self._quarantine(transcript, op, "Update operation requires target_id", run)
-        if op.action not in {"create", "update"}:
-            return self._quarantine(transcript, op, "Unsupported operation", run)
-
-        evidence = [entry for entry in op.evidence if entry.turn in allowed_evidence_turns]
-        evidence_turns: dict[str, str] = {}
-        question_only: set[str] = set()
-        for turn in turns:
-            if turn.id not in allowed_evidence_turns:
-                continue
-            if turn.role == "User":
-                text, is_question = Distiller._user_turn_evidence(turn.body)
-                if is_question:
-                    question_only.add(turn.id)
+        turn_by_id = {turn.id: turn for turn in turns}
+        evidence_turns = {turn.id: _turn_verification_text(turn) for turn in turns}
+        _verified_quotes, unverified = verify_evidence(op.evidence, turns=evidence_turns)
+        verified_flag = (
+            bool(op.verified)
+            if op.verified is not None
+            else bool(op.evidence) and not unverified
+        )
+        evidence_sources: list[str] = []
+        for entry in op.evidence:
+            turn = turn_by_id.get(entry.turn)
+            if turn is None:
+                source = "unknown"
+            elif turn.role == "User":
+                source = "user"
+            elif verify_evidence([entry], turns={turn.id: turn.body})[0]:
+                source = "assistant"
+            elif any(verify_evidence([entry], turns={turn.id: section})[0] for section in turn.tool_sections):
+                source = "tool_result"
             else:
-                text = turn.eligible_evidence_text()
-            evidence_turns[turn.id] = text
-        verified, _unverified = verify_evidence(evidence, turns=evidence_turns, question_only_turns=question_only)
-        if not verified:
-            return self._quarantine(transcript, op, "Operation has no verifiable episode evidence", run)
+                source = "assistant"
+            if source not in evidence_sources:
+                evidence_sources.append(source)
+        def no_op(reason: str) -> dict[str, Any]:
+            return {
+                "action": "none",
+                "title": op.title,
+                "target_id": op.target_id,
+                "reason": reason,
+                "verified": verified_flag,
+                "evidence_sources": evidence_sources,
+            }
+
+        if op.action in {"none", "invalid"}:
+            return no_op(op.reason or ("Malformed Integrate operation" if op.action == "invalid" else ""))
+        if not op.title or not slugify_english_title(op.title):
+            return no_op("Operation title must be an English knowledge title")
+        if op.okf_type not in TYPE_REQUIRED_SECTIONS:
+            return no_op("Unknown OKF type")
+        if op.action == "create" and not op.justification.strip():
+            op.justification = op.reason.strip() or "Gatekeeper approved new knowledge node"
+        if op.action == "update" and not op.target_id:
+            return no_op("Update operation requires target_id")
+        if op.action not in {"create", "update"}:
+            return no_op("Unsupported operation")
 
         target: Node | None = None
         sources = [transcript.id]
         if op.action == "update":
             if op.target_id not in allowed_target_ids:
-                return self._quarantine(transcript, op, f"Update target was not retrieved: {op.target_id}", run)
-            target = self._load_node_or_none(op.target_id or "")
+                return no_op(f"Update target was not retrieved: {op.target_id}")
+            with self._commit_lock:
+                target = self._load_node_or_none(op.target_id or "")
             if target is None or target.metadata.type is not NodeType.PERSISTENT or target.metadata.status is not NodeStatus.ACTIVE:
-                return self._quarantine(transcript, op, f"Unknown or inactive update target: {op.target_id}", run)
+                return no_op(f"Unknown or inactive update target: {op.target_id}")
             sources = list(dict.fromkeys([*target.metadata.sources, transcript.id]))
-        final_content = _with_provenance(op.content, sources, verified)
+        final_content = _with_provenance(op.content, sources, op.evidence)
         final_content, repair_error = self._repair_takeaway_only(op, final_content, sources, run)
         if repair_error:
             warnings = validate_okf_node(
@@ -577,56 +659,74 @@ class EpisodeDistiller:
                 status_code=422,
                 details={"warnings": [finding.as_dict() for finding in warnings], "final_content": final_content},
             )
-            return self._quarantine(
-                transcript, op, repair_error, run, error=error, content=final_content, target_id=op.target_id
-            )
-        try:
-            if op.action == "update":
-                payload = self._commit_call(
-                    run,
-                    lambda: self.service._merge_update_node(
-                        target_id=op.target_id or "",
-                        content=final_content,
-                        title=op.title,
-                        sources=[transcript.id],
-                        verified=True,
-                        route="distiller",
-                        okf_type=op.okf_type,
-                        validated_title=op.title,
-                    ),
+            with self._commit_lock:
+                return self._quarantine(
+                    transcript, op, repair_error, run, error=error, content=final_content, target_id=op.target_id,
+                    verified=verified_flag, evidence_sources=evidence_sources,
                 )
-                node = self._load_node(op.target_id or "")
-                action = str(payload.get("action", "updated"))
-            else:
-                stable_id = self._stable_create_id(transcript, op)
-                existing = self._load_node_or_none(stable_id)
-                if existing is not None:
-                    if existing.metadata.sources and transcript.id in existing.metadata.sources:
-                        return {"action": "unchanged", "node_id": existing.id, "title": existing.title, "target_id": existing.id, "target_title": existing.title}
-                    return self._quarantine(transcript, op, "Deterministic create ID collides with unrelated knowledge", run)
-                payload = self._commit_call(
-                    run,
-                    lambda: self.service.integrate_knowledge(
-                        title=op.title,
-                        content=final_content,
-                        node_type=NodeType.PERSISTENT,
-                        action="create",
-                        okf_type=op.okf_type,
-                        okf_version=1,
-                        sources=sources,
-                        project=transcript.metadata.project,
-                        node_id=stable_id,
-                        verified=True,
-                        validate_okf=True,
-                    ),
-                )
-                node = self._load_node(stable_id)
-                action = "created"
-        except SynapseServiceError as exc:
-            if exc.code == "INVALID_OKF_FINAL_BODY":
-                return self._quarantine(transcript, op, exc.message, run, error=exc, content=final_content, target_id=op.target_id)
-            raise
-        return {"action": action, "node_id": node.id, "title": node.title, "target_id": op.target_id or node.id, "target_title": node.title}
+        with self._commit_lock:
+            try:
+                if op.action == "update":
+                    payload = self._commit_call(
+                        run,
+                        lambda: self.service._merge_update_node(
+                            target_id=op.target_id or "",
+                            content=final_content,
+                            title=op.title,
+                            sources=[transcript.id],
+                            verified=verified_flag,
+                            route="distiller",
+                            okf_type=op.okf_type,
+                            validated_title=op.title,
+                        ),
+                    )
+                    node = self._load_node(op.target_id or "")
+                    action = str(payload.get("action", "updated"))
+                else:
+                    stable_id = self._stable_create_id(transcript, op)
+                    existing = self._load_node_or_none(stable_id)
+                    if existing is not None:
+                        if existing.metadata.sources and transcript.id in existing.metadata.sources:
+                            return {
+                                "action": "unchanged", "node_id": existing.id, "title": existing.title,
+                                "target_id": existing.id, "target_title": existing.title,
+                                "verified": verified_flag, "evidence_sources": evidence_sources,
+                            }
+                        return no_op("Deterministic create ID collides with unrelated knowledge")
+                    payload = self._commit_call(
+                        run,
+                        lambda: self.service.integrate_knowledge(
+                            title=op.title,
+                            content=final_content,
+                            node_type=NodeType.PERSISTENT,
+                            action="create",
+                            okf_type=op.okf_type,
+                            okf_version=1,
+                            sources=sources,
+                            project=transcript.metadata.project,
+                            node_id=stable_id,
+                            verified=verified_flag,
+                            validate_okf=True,
+                        ),
+                    )
+                    node = self._load_node(stable_id)
+                    action = "created"
+            except SynapseServiceError as exc:
+                if exc.code == "INVALID_OKF_FINAL_BODY":
+                    return self._quarantine(
+                        transcript, op, exc.message, run, error=exc, content=final_content,
+                        target_id=op.target_id, verified=verified_flag, evidence_sources=evidence_sources,
+                    )
+                raise
+        return {
+            "action": action,
+            "node_id": node.id,
+            "title": node.title,
+            "target_id": op.target_id or node.id,
+            "target_title": node.title,
+            "verified": verified_flag,
+            "evidence_sources": evidence_sources,
+        }
 
     def _quarantine(
         self,
@@ -634,15 +734,17 @@ class EpisodeDistiller:
         op: EpisodeOp,
         reason: str,
         run: EpisodeRun,
-        *,
+        *, 
         error: SynapseServiceError | None = None,
         content: str | None = None,
         target_id: str | None = None,
+        verified: bool = False,
+        evidence_sources: list[str] | None = None,
     ) -> dict[str, Any]:
         error = error or SynapseServiceError("INVALID_EPISODE_OPERATION", reason, status_code=422)
         sources = [transcript.id]
         body = content if content is not None else op.content
-        item = _item_from_op(op, body, sources, op.evidence)
+        item = _item_from_op(op, body, sources, op.evidence, verified=verified)
         self._distiller_helpers._quarantine_invalid_item(
             transcript,
             item,
@@ -656,7 +758,14 @@ class EpisodeDistiller:
                 "failure_reason": reason,
             },
         )
-        return {"action": "quarantined", "title": op.title, "target_id": target_id or op.target_id, "reason": reason}
+        return {
+            "action": "quarantined",
+            "title": op.title,
+            "target_id": target_id or op.target_id,
+            "reason": reason,
+            "verified": verified,
+            "evidence_sources": evidence_sources or [],
+        }
 
     def _stable_create_id(self, transcript: Node, op: EpisodeOp) -> str:
         return generate_node_id(op.title, transcript.metadata.created_at)
@@ -672,7 +781,7 @@ class EpisodeDistiller:
         return node
 
 
-def build_episode_chunks(turns: list[TranscriptTurn], max_chars: int = 100_000) -> list[tuple[str, list[str]]]:
+def build_episode_chunks(turns: list[TranscriptTurn], max_chars: int = 400_000) -> list[tuple[str, list[str]]]:
     """Group complete numbered turns; no chunk boundary can split a turn."""
     chunks: list[tuple[str, list[str]]] = []
     blocks: list[str] = []
@@ -700,88 +809,97 @@ def _render_turn(turn: TranscriptTurn) -> str:
     lines.extend(turn.tool_sections)
     return "\n".join(lines)
 
+def _turn_verification_text(turn: TranscriptTurn) -> str:
+    parts = [turn.body] if turn.body else []
+    parts.extend(turn.tool_sections)
+    return "\n".join(parts)
+
+def _turn_evidence_excerpt(turn: TranscriptTurn, limit: int = 1500) -> str:
+    if not turn.tool_sections:
+        return turn.body[:limit]
+    tool_chars = sum(len(section) for section in turn.tool_sections) + len(turn.tool_sections) - 1
+    body_budget = min(len(turn.body), limit - min(tool_chars, limit // 2))
+    body_excerpt = turn.body[:body_budget]
+    parts = [body_excerpt] if body_excerpt else []
+    remaining = limit - len(body_excerpt)
+    for index, section in enumerate(turn.tool_sections):
+        separators = 1 if parts else 0
+        sections_left = len(turn.tool_sections) - index
+        share = max(0, (remaining - separators * (sections_left - 1)) // sections_left)
+        excerpt = section[:share]
+        if excerpt:
+            parts.append(excerpt)
+            remaining -= separators + len(excerpt)
+    return "\n".join(parts)[:limit]
 
 
-def _turn_evidence_records(turns: list[TranscriptTurn]) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
+
+_NOISE_TOOL_NAMES = {"todo", "vibe_wait", "vibe_list", "vibe_kill", "vibe_send", "wait"}
+_NOISE_HUB_OPS = {"wait", "list", "status", "poll", "kill"}
+_TOOL_HEADER_RE = re.compile(r"^### Tool T\d+\.\d+\s+(.+?)\s*$", re.IGNORECASE)
+
+
+def _is_noise_tool_section(section: str) -> bool:
+    header = section.splitlines()[0] if section else ""
+    match = _TOOL_HEADER_RE.match(header)
+    if match is None:
+        return False
+    tool_name = match.group(1).strip().strip("`").split()[0].casefold()
+    if tool_name in _NOISE_TOOL_NAMES:
+        return True
+    if tool_name != "hub":
+        return False
+    call_match = re.search(r"(?m)^\s*call:\s*", section)
+    if call_match is None:
+        return False
+    decoder = json.JSONDecoder()
+    try:
+        call, _end = decoder.raw_decode(section[call_match.end():].lstrip())
+    except json.JSONDecodeError:
+        return False
+    return isinstance(call, Mapping) and str(call.get("op") or "").casefold() in _NOISE_HUB_OPS
+
+
+def _dehydrate_turn(turn: TranscriptTurn) -> TranscriptTurn | None:
+    tools = [section for section in turn.tool_sections if not _is_noise_tool_section(section)]
+    if turn.role == "Assistant" and not turn.body and not tools:
+        return None
+    return TranscriptTurn(number=turn.number, role=turn.role, body=turn.body, tool_sections=tools)
+
+
+def _render_global_user_spine(turns: list[TranscriptTurn]) -> str:
+    lines = []
     for turn in turns:
-        if turn.role == "User":
-            text, question_only = Distiller._user_turn_evidence(turn.body)
-            eligible = bool(text) and not question_only
-            source = "user_body"
-            reason = "question_only_user_turn" if question_only else "empty_user_turn"
-        else:
-            text = turn.eligible_evidence_text()
-            eligible = bool(text)
-            source = "tool_result"
-            reason = "assistant_prose_is_not_evidence"
-        row: dict[str, Any] = {"turn": turn.id, "role": turn.role, "eligible": eligible}
-        if eligible:
-            row.update(source=source, text=text)
-        else:
-            row["reason"] = reason
-        records.append(row)
-    return records
-def _parse_lessons(
-    payload: Any,
-    eligible_evidence: Mapping[str, str],
-    *,
-    rejected: list[dict[str, str]] | None = None,
-) -> list[Lesson]:
+        if turn.role != "User":
+            continue
+        body = turn.body
+        excerpt = body if len(body) <= 350 else body[:347] + "..."
+        lines.append(f"{turn.id}: {excerpt}")
+    return "\n".join(lines) if lines else "(No User turns.)"
+
+
+def _parse_lessons(payload: Any) -> list[Lesson]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("lessons"), list):
         raise ValueError("Episode stage response must contain a lessons array")
-    rejected = rejected if rejected is not None else []
+    allowed_types = set(TYPE_REQUIRED_SECTIONS)
     result: list[Lesson] = []
-
-    def reject(topic: str, turn: str, reason: str) -> None:
-        rejected.append({"topic": topic, "turn": turn, "reason": reason})
-
-    for index, row in enumerate(payload["lessons"]):
+    for row in payload["lessons"]:
         if not isinstance(row, Mapping):
-            reject(f"lesson_{index}", "", "lesson result is not an object")
             continue
         topic = str(row.get("topic") or "").strip()
         claim = str(row.get("claim") or "").strip()
+        if not topic or not claim:
+            continue
+        raw_type = str(row.get("okf_type") or "fact").strip().casefold()
+        okf_type = raw_type if raw_type in allowed_types else "fact"
         raw_turns = row.get("evidence_turns")
-        raw_quotes = row.get("evidence_quotes")
-        if not topic or not claim or not isinstance(raw_turns, list) or not isinstance(raw_quotes, list):
-            reject(topic or f"lesson_{index}", "", "lesson requires topic, claim, evidence_turns, and evidence_quotes")
-            continue
-        declared_turns = list(dict.fromkeys(str(turn).strip() for turn in raw_turns if str(turn).strip()))
-        eligible_turns = [turn for turn in declared_turns if turn in eligible_evidence]
-        for turn in declared_turns:
-            if turn not in eligible_evidence:
-                reject(topic, turn, "turn is not an eligible user body or tool result")
-
-        quotes: list[EvidenceEntry] = []
-        for quote in raw_quotes:
-            if not isinstance(quote, Mapping):
-                reject(topic, "", "evidence quote is not an object")
-                continue
-            turn = str(quote.get("turn") or "").strip()
-            text = str(quote.get("quote") or "").strip()
-            if not turn or turn not in eligible_turns:
-                reject(topic, turn, "evidence quote turn is not listed as eligible for this lesson")
-                continue
-            if not text or len(text) > EVIDENCE_QUOTE_MAX_CHARS:
-                reject(topic, turn, "evidence quote is empty or exceeds 200 characters")
-                continue
-            quotes.append(EvidenceEntry(turn=turn, quote=text))
-
-        verified, unverified = verify_evidence(quotes, turns=eligible_evidence)
-        for quote in unverified:
-            reject(topic, quote.turn, "evidence quote is not a verbatim substring of eligible source text")
-        verified_turns = list(dict.fromkeys(quote.turn for quote in verified))
-        for turn in eligible_turns:
-            if turn not in verified_turns:
-                reject(topic, turn, "no verified evidence quote for declared turn")
-        if not verified:
-            reject(topic, "", "lesson has no verifiable eligible evidence")
-            continue
-        result.append(Lesson(topic, claim, verified_turns, verified))
+        evidence_turns = (
+            list(dict.fromkeys(str(turn).strip() for turn in raw_turns if str(turn).strip()))
+            if isinstance(raw_turns, list)
+            else []
+        )
+        result.append(Lesson(topic=topic, claim=claim, evidence_turns=evidence_turns, okf_type=okf_type))
     return result
-
-
 def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("ops"), list):
         raise ValueError("Integrate response must contain an ops array")
@@ -798,12 +916,21 @@ def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
         if action == "none":
             result.append(EpisodeOp(action="none", reason=str(row.get("reason") or ""), lesson_index=lesson_index))
             continue
-        evidence_raw = row.get("evidence")
         evidence: list[EvidenceEntry] = []
+        evidence_raw = row.get("evidence")
         if isinstance(evidence_raw, list):
             for item in evidence_raw:
-                if isinstance(item, Mapping) and item.get("turn") and item.get("quote"):
-                    evidence.append(EvidenceEntry(turn=str(item["turn"]).strip(), quote=str(item["quote"]).strip()))
+                if not isinstance(item, Mapping):
+                    continue
+                turn = str(item.get("turn") or "").strip()
+                quote = str(item.get("quote") or "").strip()
+                if turn and quote and len(quote) <= EVIDENCE_QUOTE_MAX_CHARS:
+                    evidence.append(EvidenceEntry(turn=turn, quote=quote))
+        verified = row.get("verified") if isinstance(row.get("verified"), bool) else None
+        reason = str(row.get("reason") or "").strip()
+        justification = str(row.get("justification") or "").strip()
+        if action == "create" and not justification:
+            justification = reason or "Gatekeeper approved new knowledge node"
         result.append(
             EpisodeOp(
                 action=action,
@@ -811,9 +938,10 @@ def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
                 okf_type=str(row.get("okf_type") or "").strip(),
                 content=str(row.get("content") or "").strip(),
                 target_id=str(row.get("target_id") or "").strip() or None,
-                justification=str(row.get("justification") or "").strip(),
+                justification=justification,
                 evidence=evidence,
-                reason=str(row.get("reason") or "").strip(),
+                verified=verified,
+                reason=reason,
                 lesson_index=lesson_index,
             )
         )
@@ -864,7 +992,14 @@ def _with_provenance(content: str, sources: list[str], evidence: list[EvidenceEn
     return body.strip() + "\n"
 
 
-def _item_from_op(op: EpisodeOp, content: str, sources: list[str], evidence: list[EvidenceEntry]) -> OkfItem:
+def _item_from_op(
+    op: EpisodeOp,
+    content: str,
+    sources: list[str],
+    evidence: list[EvidenceEntry],
+    *,
+    verified: bool,
+) -> OkfItem:
     takeaway = _takeaway(content)
     sections: dict[str, str] = {}
     for name in TYPE_REQUIRED_SECTIONS.get(op.okf_type, ()):
@@ -877,5 +1012,5 @@ def _item_from_op(op: EpisodeOp, content: str, sources: list[str], evidence: lis
         sections=sections,
         sources=sources,
         evidence=evidence,
-        verified=bool(evidence),
+        verified=verified,
     )

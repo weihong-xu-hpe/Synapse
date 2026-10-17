@@ -44,9 +44,12 @@ archive_path = "./.synapse/.archive"
     assert config.distiller.max_concurrency == 30
     assert config.distiller.transcript_concurrency == 4
     assert config.distiller.episode.endpoint.model == "gpt-6-luna"
-    assert config.distiller.episode.endpoint.extra_body == {"reasoning_effort": "medium"}
+    assert config.distiller.episode.endpoint.extra_body == {"reasoning_effort": "low"}
+    assert config.distiller.episode.gatekeeper_endpoint.model == "claude-haiku-5.5"
+    assert config.distiller.episode.endpoints is None
+    assert config.distiller.episode.scanner_endpoints is None
     assert config.distiller.episode.max_tokens == 200_000
-    assert config.distiller.episode.chunk_chars == 100_000
+    assert config.distiller.episode.chunk_chars == 400_000
     assert config.distiller.episode.integrate_lessons_per_call == 12
     assert config.distiller.episode.retrieval_top_k_per_lesson == 5
     assert config.distiller.episode.evidence_context_token_budget == 24_000

@@ -261,23 +261,30 @@ class EpisodePipelineSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # `endpoint` remains the single-endpoint fallback for older config files.
     endpoint: DeciderEndpointSettings = Field(
         default_factory=lambda: DeciderEndpointSettings(
             base_url="http://127.0.0.1:47870/v1",
             model="gpt-6-luna",
-            extra_body={"reasoning_effort": "medium"},
+            extra_body={"reasoning_effort": "low"},
+        )
+    )
+    endpoints: list[DeciderEndpointSettings] | None = None
+    scanner_endpoints: list[DeciderEndpointSettings] | None = None
+    gatekeeper_endpoint: DeciderEndpointSettings | None = Field(
+        default_factory=lambda: DeciderEndpointSettings(
+            base_url="http://127.0.0.1:47870/v1",
+            model="claude-haiku-5.5",
         )
     )
     timeout_seconds: int = Field(default=300, ge=1)
     max_tokens: int = Field(default=200_000, ge=1)
     temperature: float = 0.0
-    chunk_chars: int = Field(default=100_000, ge=1_000)
+    chunk_chars: int = Field(default=400_000, ge=1_000)
     integrate_lessons_per_call: int = Field(default=12, ge=1)
     retrieval_top_k_per_lesson: int = Field(default=5, ge=1)
     retrieval_body_token_budget: int = Field(default=24_000, ge=1)
-    # Conservative serialized-character/token proxy; batches split on overflow, evidence is never truncated.
     evidence_context_token_budget: int = Field(default=24_000, ge=1)
-
 
 class DistillerSettings(BaseModel):
     """Session-distiller configuration (spec: docs/okf.md)."""
@@ -286,7 +293,7 @@ class DistillerSettings(BaseModel):
 
     enabled: bool = True
     interval_minutes: int = Field(default=10, ge=1)
-    idle_minutes: int = Field(default=30, ge=1)
+    idle_minutes: int = Field(default=60, ge=1)
     retention_days: int = Field(default=45, ge=1)
     max_transcript_chars: int = Field(default=16_000, ge=1000)
     # P2c: per-segment budget for chunked distillation. Transcripts are split

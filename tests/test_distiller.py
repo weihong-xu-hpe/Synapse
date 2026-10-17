@@ -684,7 +684,7 @@ def test_distiller_settings_defaults_and_overrides(tmp_path: Path) -> None:
     config = _config(tmp_path)
     assert config.distiller.enabled is True
     assert config.distiller.interval_minutes == 10
-    assert config.distiller.idle_minutes == 30
+    assert config.distiller.idle_minutes == 60
     assert config.distiller.retention_days == 45
     assert config.distiller.max_transcript_chars == 16_000
     assert config.distiller.enforce_okf is False

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import fcntl
 import threading
+from datetime import UTC, datetime
 from typing import Any, Callable
 
 from synapse.config import SynapseConfig
-from synapse.lifecycle.distiller import Distiller
+from synapse.lifecycle.distiller import Distiller, DistillerReport
+from synapse.models.node import Node
 from synapse.utils.runtime import RuntimePaths
 
 
@@ -27,13 +29,11 @@ class DistillerScheduler:
         *,
         runtime_paths: RuntimePaths,
         logger: Any = None,
-        sampling_client: Any | None = None,
         timer_factory: Callable[..., Any] = threading.Timer,
     ) -> None:
         self.config = config
         self.runtime_paths = runtime_paths
         self._logger = logger or __import__("logging").getLogger("synapse.distiller")
-        self._sampling_client = sampling_client
         self._timer_factory = timer_factory
         self._state_lock = threading.RLock()
         self._timer: Any | None = None
@@ -95,16 +95,15 @@ class DistillerScheduler:
             except OSError:
                 self._logger.info("Distiller sweep skipped: another run holds the lock")
                 return
-            distiller = Distiller(
-                self.config,
-                runtime_paths=self.runtime_paths,
-                sampling_client=self._sampling_client,
-                logger=self._logger,
-            )
+            selector = Distiller(self.config, runtime_paths=self.runtime_paths, logger=self._logger)
             try:
-                distiller.run()
+                transcripts = selector.select_transcripts(limit=self.config.distiller.max_transcripts_per_run)
+                if transcripts:
+                    self._distill(transcripts)
+                now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                selector._archive_expired(DistillerReport(started_at=now, completed_at=now))
             finally:
-                distiller.close()
+                selector.close()
             # Observability snapshot piggybacks on the sweep cadence (no
             # separate timer): today's row if missing, plus yesterday when the
             # machine slept through a day boundary. Never breaks the sweep.
@@ -112,6 +111,33 @@ class DistillerScheduler:
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
+
+    def _distill(self, transcripts: list[Node]) -> None:
+        # Lazy import: episode_distiller pulls in the server service stack.
+        from synapse.lifecycle.episode_distiller import EpisodeDistiller
+
+        scanner_client = EpisodeDistiller.make_scanner_client(self.config)
+        gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(self.config)
+        runner = EpisodeDistiller(
+            self.config,
+            runtime_paths=self.runtime_paths,
+            sampling_client=scanner_client,
+            gatekeeper_client=gatekeeper_client,
+        )
+        try:
+            for transcript in transcripts:
+                try:
+                    runner.run(transcript.id)
+                except Exception:
+                    self._logger.exception("Episode sweep failed", extra={"transcript_id": transcript.id})
+        finally:
+            try:
+                runner.close()
+            finally:
+                for client in (scanner_client, gatekeeper_client):
+                    close_client = getattr(client, "close", None)
+                    if callable(close_client):
+                        close_client()
 
     def _write_metrics_snapshots(self) -> None:
         try:

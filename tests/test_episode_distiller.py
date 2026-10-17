@@ -1,17 +1,32 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
-from synapse.config import SynapseConfig
-from synapse.lifecycle.episode_distiller import EpisodeDistiller, EpisodeOp, EpisodeRun, Lesson, _parse_lessons, _parse_ops, _turn_evidence_records, build_episode_chunks
+from synapse.config import DeciderEndpointSettings, SynapseConfig
+from synapse.lifecycle import episode_distiller as episode_module
+from synapse.lifecycle.episode_distiller import (
+    EpisodeDistiller,
+    EpisodeOp,
+    EpisodeRun,
+    Lesson,
+    _dehydrate_turn,
+    _parse_lessons,
+    _parse_ops,
+    build_episode_chunks,
+)
 from synapse.models import Node, NodeMetadata, NodeType
 from synapse.okf import EvidenceEntry
 from synapse.okf.episode import render_episode_map_prompt
 from synapse.okf.transcript_format import TranscriptTurn, V2_MARKER, parse_transcript
+from synapse.server.app import create_app
 from synapse.storage import SQLiteNodeStore, write_node_file
 from synapse.sync import SyncManager
 from synapse.utils.runtime import RuntimePaths, bootstrap_runtime_directories
@@ -22,6 +37,7 @@ class FakeClient:
         self.response = response
         self.error = error
         self.prompts: list[str] = []
+        self.closed = False
 
     def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, **kwargs: Any) -> Any:
         self.prompts.append(prompt)
@@ -29,8 +45,26 @@ class FakeClient:
             raise self.error
         return self.response
 
+    def close(self) -> None:
+        self.closed = True
 
-def _setup(tmp_path: Path) -> tuple[SynapseConfig, RuntimePaths, Node]:
+
+def _transcript_content(*, user_chars: int = 40, assistant_chars: int = 40) -> str:
+    return (
+        V2_MARKER
+        + "\n\n## T1 User\nThe cache key remains stable for retried writes. "
+        + "u" * user_chars
+        + "\n\n## T2 Assistant\nThe implementation preserves the same key. "
+        + "a" * assistant_chars
+    )
+
+
+def _setup(
+    tmp_path: Path,
+    *,
+    content: str | None = None,
+    watermark: int | None = None,
+) -> tuple[SynapseConfig, RuntimePaths, Node]:
     config = SynapseConfig.with_defaults(tmp_path)
     base = tmp_path / "copy"
     config.memory.base_path = base
@@ -40,17 +74,14 @@ def _setup(tmp_path: Path) -> tuple[SynapseConfig, RuntimePaths, Node]:
     paths = bootstrap_runtime_directories(config)
     transcript = Node(
         metadata=NodeMetadata(
-            id="mem_session_test_fixture",
+            id="mem_fixture_session_test",
             title="Session summary — test",
             type=NodeType.TRANSIENT,
             session_key="test-session-key",
+            distilled_turn=watermark,
         ),
-        content=(
-            V2_MARKER
-            + "\n\n## T1 User\nThe cache key remains stable for retried writes."
-            + "\n\n## T2 Assistant\nThe implementation preserves the same key."
-        ),
-        file_path=Path("active") / "mem_session_test_fixture.md",
+        content=content if content is not None else _transcript_content(),
+        file_path=Path("active") / "mem_fixture_session_test.md",
     )
     write_node_file(transcript, base_path=paths.base)
     manager = SyncManager(config, runtime_paths=paths, debounce_seconds=0.0)
@@ -61,11 +92,46 @@ def _setup(tmp_path: Path) -> tuple[SynapseConfig, RuntimePaths, Node]:
     return config, paths, transcript
 
 
-def _runner(config: SynapseConfig, paths: RuntimePaths, client: FakeClient) -> EpisodeDistiller:
-    return EpisodeDistiller(config, runtime_paths=paths, sampling_client=client)
+def _runner(
+    config: SynapseConfig,
+    paths: RuntimePaths,
+    scanner: FakeClient,
+    gatekeeper: FakeClient | None = None,
+) -> EpisodeDistiller:
+    return EpisodeDistiller(
+        config,
+        runtime_paths=paths,
+        sampling_client=scanner,
+        gatekeeper_client=gatekeeper,
+    )
 
 
-def test_map_chunks_preserve_turn_boundaries() -> None:
+
+def test_episode_pipeline_settings_build_scanner_pool_and_gatekeeper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import synapse.server.decider as decider_module
+
+    config = SynapseConfig.with_defaults(tmp_path)
+    config.distiller.episode.scanner_endpoints = [
+        DeciderEndpointSettings(base_url="http://scanner-a/v1", model="scan-a"),
+        DeciderEndpointSettings(base_url="http://scanner-b/v1", model="scan-b"),
+    ]
+    captured: list[Any] = []
+    monkeypatch.setattr(decider_module, "LocalLLMDecider", lambda settings: captured.append(settings) or settings)
+
+    scanner_settings = EpisodeDistiller.make_scanner_client(config)
+    config.distiller.episode.gatekeeper_endpoint = None
+    gatekeeper_settings = EpisodeDistiller.make_gatekeeper_client(config)
+
+    assert len(scanner_settings.endpoints) == 2
+    assert [endpoint.extra_body["reasoning_effort"] for endpoint in scanner_settings.endpoints] == ["low", "low"]
+    expected_concurrency = max(16, config.decider.endpoint_max_concurrency)
+    assert scanner_settings.endpoint_max_concurrency == expected_concurrency
+    assert gatekeeper_settings.endpoint_max_concurrency == expected_concurrency
+    assert config.distiller.episode.chunk_chars == 400_000
+    assert len(captured) == 2
+
+
+def test_episode_chunks_preserve_turn_boundaries() -> None:
     turns = [
         TranscriptTurn(number=1, role="User", body="a" * 30),
         TranscriptTurn(number=2, role="Assistant", body="b" * 30),
@@ -81,230 +147,554 @@ def test_map_chunks_preserve_turn_boundaries() -> None:
         reconstructed.extend(turn.id for turn in parsed.turns)
     assert reconstructed == ["T1", "T2", "T3"]
 
-def test_map_prompt_marks_only_contract_eligible_turns() -> None:
-    turns = [
-        TranscriptTurn(number=1, role="User", body="The selected scope is constrained by membership."),
-        TranscriptTurn(number=2, role="User", body="Why is the scope constrained?"),
-        TranscriptTurn(number=3, role="Assistant", body="Assistant prose is context, not evidence."),
-        TranscriptTurn(
-            number=4,
-            role="Assistant",
-            body="Tool call context.",
-            tool_sections=["### Tool T4.1 read\ncall: {}\nresult [ok]: scope membership is checked before allow"],
-        ),
+
+def test_dehydration_strips_noise_and_drops_empty_assistant_turns() -> None:
+    noise_only = TranscriptTurn(
+        number=1,
+        role="Assistant",
+        body="",
+        tool_sections=[
+            "### Tool T1.1 todo\nresult [ok]: todo marker",
+            '### Tool T1.2 hub\ncall: {"op":"wait"}\nresult [ok]: poll marker',
+        ],
+    )
+    assert _dehydrate_turn(noise_only) is None
+
+    mixed = TranscriptTurn(
+        number=2,
+        role="Assistant",
+        body="Durable assistant analysis",
+        tool_sections=[
+            "### Tool T2.1 vibe_wait\nresult [ok]: transient polling marker",
+            '### Tool T2.2 hub\ncall: {"op":"status"}\nresult [ok]: transient hub marker',
+            '### Tool T2.3 hub\ncall: {"op":"search"}\nresult [ok]: durable query result',
+        ],
+    )
+    dehydrated = _dehydrate_turn(mixed)
+    assert dehydrated is not None
+    assert len(dehydrated.tool_sections) == 1
+    assert "durable query result" in dehydrated.tool_sections[0]
+
+
+def test_short_episode_stamps_watermark_without_llm_calls(tmp_path: Path) -> None:
+    config, paths, transcript = _setup(tmp_path)
+    scanner = FakeClient()
+    gatekeeper = FakeClient()
+    runner = _runner(config, paths, scanner, gatekeeper)
+    try:
+        result = runner.run(transcript.id)
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            stored = store.get_node(transcript.id)
+        assert result.stamped is True
+        assert result.stages == {}
+        assert scanner.prompts == []
+        assert gatekeeper.prompts == []
+        assert stored is not None and stored.metadata.distilled_turn == 2
+    finally:
+        runner.close()
+
+def test_extract_episode_defers_transcript_stamp_until_integration(tmp_path: Path) -> None:
+    content = V2_MARKER + "\n\n## T1 User\n" + "u" * 350 + "\n\n## T2 Assistant\n" + "a" * 350
+    config, paths, transcript = _setup(tmp_path, content=content)
+    scanner = FakeClient(response={"lessons": []})
+    runner = _runner(config, paths, scanner)
+    try:
+        extracted = runner.extract_episode(transcript.id)
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            after_extraction = store.get_node(transcript.id)
+        assert extracted[0].id == transcript.id
+        assert len(extracted[1]) == 2
+        assert len(extracted[2]) == 2
+        assert after_extraction is not None
+        assert after_extraction.metadata.distilled_turn is None
+        assert after_extraction.metadata.distilled_hash is None
+
+        result = runner.integrate_episode(*extracted)
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            after_integration = store.get_node(transcript.id)
+        assert result.stamped is True
+        assert after_integration is not None and after_integration.metadata.distilled_turn == 2
+    finally:
+        runner.close()
+
+
+def test_stage_one_dehydrates_noise_and_scans_full_user_spine(tmp_path: Path) -> None:
+    user_one = "Initial request: map the cache ownership boundary. " + "u" * 300
+    assistant_body = "The cache is owned by the persistence component. " + "a" * 330
+    user_two = "No, change the boundary to the retry adapter. " + "v" * 120
+    noise = [
+        "todo",
+        "vibe_wait",
+        "vibe_list",
+        "vibe_kill",
+        "vibe_send",
+        "wait",
     ]
-    records = _turn_evidence_records(turns)
-    by_turn = {record["turn"]: record for record in records}
-    assert by_turn["T1"]["eligible"] is True
-    assert by_turn["T2"]["eligible"] is False
-    assert by_turn["T3"]["eligible"] is False
-    assert by_turn["T4"]["eligible"] is True
+    sections = [
+        f"### Tool T2.{index} {name}\ncall: {{}}\nresult [ok]: NOISE_{name.upper()}_MARKER_{'n' * 80}"
+        for index, name in enumerate(noise, 1)
+    ]
+    sections.extend(
+        f'### Tool T2.{index} hub\ncall: {{"op":"{operation}"}}\nresult [ok]: NOISE_HUB_{operation.upper()}_MARKER'
+        for index, operation in enumerate(("wait", "list", "status", "poll", "kill"), 10)
+    )
+    sections.append(
+        '### Tool T2.20 hub\ncall: {"op":"search","query":"cache owner"}\nresult [ok]: '
+        "RETAINED_TOOL_EVIDENCE"
+    )
+    content = (
+        V2_MARKER
+        + f"\n\n## T1 User\n{user_one}"
+        + f"\n\n## T2 Assistant\n{assistant_body}\n" + "\n".join(sections)
+        + f"\n\n## T3 User\n{user_two}"
+        + "\n\n## T4 Assistant\n### Tool T4.1 wait\ncall: {}\nresult [ok]: DROP_EMPTY_ASSISTANT"
+    )
+    config, paths, updated = _setup(tmp_path, content=content)
+    scanner = FakeClient(response={"lessons": []})
+    gatekeeper = FakeClient()
+    runner = _runner(config, paths, scanner, gatekeeper)
+    try:
+        result = runner.run(updated.id)
+        prompt = scanner.prompts[0]
+        assert result.turns == 3
+        assert "T1: Initial request" in prompt
+        assert "T3: No, change the boundary" in prompt
+        assert "NOISE_" not in prompt
+        assert "DROP_EMPTY_ASSISTANT" not in prompt
+        assert "RETAINED_TOOL_EVIDENCE" in prompt
+        assert "Do NOT filter or reject lessons based on `turn_eligibility`" in prompt
+        assert gatekeeper.prompts == []
+    finally:
+        runner.close()
+
+
+def test_incremental_global_user_spine_includes_old_and_corrective_turns(tmp_path: Path) -> None:
+    old_intent = "Original intent: keep the old route. " + "o" * 380
+    correction = "不对，改成让 retry adapter owns the route. " + "c" * 330
+    content = (
+        V2_MARKER
+        + f"\n\n## T1 User\n{old_intent}"
+        + "\n\n## T2 Assistant\n" + "b" * 350
+        + f"\n\n## T3 User\n{correction}"
+        + "\n\n## T4 Assistant\n" + "d" * 350
+    )
+    config, paths, transcript = _setup(tmp_path, content=content, watermark=2)
+    scanner = FakeClient(response={"lessons": []})
+    runner = _runner(config, paths, scanner)
+    try:
+        result = runner.run(transcript.id)
+        prompt = scanner.prompts[0]
+        spine = prompt.split("Global User Spine (all User turns in the complete transcript, chronological):\n", 1)[1]
+        spine = spine.split("\nDehydrated episode turns:", 1)[0]
+        old_line = next(line for line in spine.splitlines() if line.startswith("T1: "))
+        assert result.turns == 2
+        assert len(old_line.removeprefix("T1: ")) == 350
+        assert "T3: 不对，改成" in spine
+        assert "T1 User" not in prompt.split("Dehydrated episode turns:", 1)[1]
+    finally:
+        runner.close()
+
+
+def test_stage_one_lessons_are_not_rejected_for_turn_eligibility() -> None:
+    parsed = _parse_lessons(
+        {
+            "lessons": [
+                {
+                    "okf_type": "pitfall",
+                    "topic": "Assistant Source Analysis",
+                    "claim": "助手从源代码分析确认契约边界。",
+                    "evidence_turns": ["T2", "T999"],
+                }
+            ]
+        }
+    )
+    assert parsed == [
+        Lesson(
+            topic="Assistant Source Analysis",
+            claim="助手从源代码分析确认契约边界。",
+            evidence_turns=["T2", "T999"],
+            okf_type="pitfall",
+        )
+    ]
     prompt = render_episode_map_prompt(
-        turns="\n\n".join(f"## {turn.id} {turn.role}\n{turn.body}" for turn in turns),
-        turn_eligibility=records,
+        turns="## T2 Assistant\nAssistant analysis and a Tool result",
+        global_user_spine="T1: user intent",
         chunk_index=1,
         chunk_count=1,
     )
-    assert '"turn":"T3","role":"Assistant","eligible":false' in prompt
+    assert "Do NOT filter or reject lessons based on `turn_eligibility`" in prompt
     assert "assistant_prose_is_not_evidence" in prompt
-    assert "scope membership is checked before allow" in prompt
+    assert "T1: user intent" in prompt
 
-    rejected: list[dict[str, str]] = []
-    invalid_turn_lessons = _parse_lessons(
-        {"lessons": [{"topic": "scope", "claim": "claim", "evidence_turns": ["T3"], "evidence_quotes": [{"turn": "T3", "quote": "Assistant prose is context, not evidence."}]}]},
-        {"T1": "The selected scope is constrained by membership.", "T4": "scope membership is checked before allow"},
-        rejected=rejected,
+
+def test_evidence_context_includes_assistant_body_and_tool_sections() -> None:
+    turn = TranscriptTurn(
+        number=12,
+        role="Assistant",
+        body="Source analysis points to exact error ROOT_CAUSE_TOKEN.",
+        tool_sections=["### Tool T12.1 read\nresult [ok]: file path src/service.py"],
     )
-    assert invalid_turn_lessons == []
-    assert any(item["turn"] == "T3" and "not an eligible" in item["reason"] for item in rejected)
+    lesson = Lesson("Service Error", "服务根因来自 source analysis。", ["T12"], "pitfall")
+    context = EpisodeDistiller._evidence_context([turn], [lesson])
+    excerpt = context[0]["evidence"][0]
+    assert excerpt["role"] == "Assistant"
+    assert "ROOT_CAUSE_TOKEN" in excerpt["text"]
+    assert "src/service.py" in excerpt["text"]
 
-    source = "The selected scope is constrained by membership."
-    parsed = _parse_lessons(
-        {
-            "lessons": [{
-                "topic": "scope",
-                "claim": "membership constrains the scope",
-                "evidence_turns": ["T1"],
-                "evidence_quotes": [{"turn": "T1", "quote": "scope is constrained by membership"}],
-            }]
-        },
-        {"T1": source},
+    long_turn = TranscriptTurn(number=13, role="Assistant", body="x" * 2000)
+    long_context = EpisodeDistiller._evidence_context(
+        [long_turn], [Lesson("Long", "long claim", ["T13"])]
     )
-    assert parsed[0].evidence_quotes == [EvidenceEntry("T1", "scope is constrained by membership")]
-    rejected = []
-    invalid_quote_lessons = _parse_lessons(
-        {
-            "lessons": [{
-                "topic": "scope",
-                "claim": "unverified",
-                "evidence_turns": ["T1"],
-                "evidence_quotes": [{"turn": "T1", "quote": "a fabricated quote"}],
-            }]
-        },
-        {"T1": source},
-        rejected=rejected,
+    assert len(long_context[0]["evidence"][0]["text"]) == 1500
+
+    mixed_turn = TranscriptTurn(
+        number=14,
+        role="Assistant",
+        body="ASSISTANT_BODY_TOKEN " + "a" * 1200,
+        tool_sections=["### Tool T14.1 read\nresult [ok]: TOOL_RESULT_TOKEN " + "t" * 1200],
     )
-    assert invalid_quote_lessons == []
-    assert any("not a verbatim substring" in item["reason"] for item in rejected)
+    mixed_context = EpisodeDistiller._evidence_context(
+        [mixed_turn], [Lesson("Mixed", "mixed claim", ["T14"])]
+    )
+    mixed_excerpt = mixed_context[0]["evidence"][0]["text"]
+    assert len(mixed_excerpt) == 1500
+    assert "ASSISTANT_BODY_TOKEN" in mixed_excerpt
+    assert "TOOL_RESULT_TOKEN" in mixed_excerpt
 
 
-def test_integrate_evidence_overflow_splits_batches_without_dropping_excerpts(tmp_path: Path) -> None:
-    config, paths, _transcript = _setup(tmp_path)
-    runner = _runner(config, paths, FakeClient())
-    turns = [
-        TranscriptTurn(number=1, role="User", body="First exact evidence quote supports a durable rule."),
-        TranscriptTurn(number=2, role="User", body="Second exact evidence quote supports another durable rule."),
-    ]
-    lessons = [
-        Lesson("first topic", "first claim", ["T1"], [EvidenceEntry("T1", turns[0].body)]),
-        Lesson("second topic", "second claim", ["T2"], [EvidenceEntry("T2", turns[1].body)]),
-    ]
+def test_gatekeeper_receives_stage_two_context_and_owns_integrate_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = (
+        V2_MARKER
+        + "\n\n## T1 User\nInitial question about ownership. " + "u" * 300
+        + "\n\n## T2 Assistant\nAssistant source analysis: exact root cause is in service/cache.py. " + "a" * 260
+        + "\n### Tool T2.1 read\ncall: {\"path\":\"service/cache.py\"}\nresult [ok]: retry token is reused."
+        + "\n\n## T3 User\nNo, preserve the token only across the same request. " + "c" * 120
+    )
+    config, paths, transcript = _setup(tmp_path, content=content)
+    scanner = FakeClient(
+        response={
+            "lessons": [
+                {
+                    "okf_type": "pitfall",
+                    "topic": "Retry Token Ownership",
+                    "claim": "`service/cache.py` 通过复用同一 retry token 保持幂等；不同请求必须使用新 token。",
+                    "evidence_turns": ["T2", "T3"],
+                }
+            ]
+        }
+    )
+    gatekeeper = FakeClient(
+        response={"ops": [{"action": "none", "lesson_index": 0, "reason": "test gate"}]}
+    )
+
+    class EmptyRetrieval:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def search(self, query: str, *, top_k: int, update_access: bool, result_filter):
+            assert top_k == 5
+            assert "Retry Token Ownership" in query
+            return SimpleNamespace(results=[])
+
+    monkeypatch.setattr(episode_module, "RetrievalPipeline", lambda *args, **kwargs: EmptyRetrieval())
+    runner = _runner(config, paths, scanner, gatekeeper)
+    monkeypatch.setattr(runner, "_same_session_nodes", lambda _transcript: [])
     try:
-        one_sizes = [
-            len(json.dumps(runner._evidence_context(turns, [lesson]), ensure_ascii=False))
-            for lesson in lessons
-        ]
-        combined_size = len(json.dumps(runner._evidence_context(turns, lessons), ensure_ascii=False))
-        runner.settings.evidence_context_token_budget = max(one_sizes) + 1
-        assert combined_size > runner.settings.evidence_context_token_budget
-        batches = runner._integrate_lesson_batches(turns, lessons)
-        assert [[lesson.topic for lesson in batch] for batch in batches] == [["first topic"], ["second topic"]]
-        excerpt_texts = [
-            record["text"]
-            for batch in batches
-            for block in runner._evidence_context(turns, batch)
-            for record in block["evidence"]
-        ]
-        assert excerpt_texts == [turns[0].body, turns[1].body]
+        result = runner.run(transcript.id)
+        assert result.lessons[0]["okf_type"] == "pitfall"
+        assert len(scanner.prompts) == 1
+        assert len(gatekeeper.prompts) == 1
+        gate_prompt = gatekeeper.prompts[0]
+        assert "Assistant source analysis" in gate_prompt
+        assert "service/cache.py" in gate_prompt
+        assert "retry token is reused" in gate_prompt
+        assert result.ops[0]["action"] == "none"
     finally:
         runner.close()
 
 
-def test_failed_summary_does_not_advance_watermark(tmp_path: Path) -> None:
+def test_gatekeeper_verified_false_is_written_without_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config, paths, transcript = _setup(tmp_path)
-    runner = _runner(config, paths, FakeClient(error=RuntimeError("temporary model error")))
-    try:
-        with pytest.raises(RuntimeError, match="temporary model error"):
-            runner.run(transcript.id)
-        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
-            stored = store.get_node(transcript.id)
-        assert stored is not None
-        assert stored.metadata.distilled_turn is None
-        assert stored.metadata.distilled_hash is None
-    finally:
-        runner.close()
-
-
-def test_unknown_update_target_is_quarantined(tmp_path: Path) -> None:
-    config, paths, transcript = _setup(tmp_path)
-    runner = _runner(config, paths, FakeClient())
-    turn = TranscriptTurn(number=1, role="User", body="The cache key remains stable for retried writes.")
-    op = EpisodeOp(
-        action="update",
-        title="Stable Cache Key Behavior",
-        okf_type="fact",
-        target_id="mem_20261017_missing_target",
-        content=(
-            "## Takeaway\n\nRetrying a write preserves its cache key.\n\n"
-            "## Details\n\nThe same key is reused on retry.\n\n## Sources\n\n- source"
+    runner = _runner(config, paths, FakeClient(), FakeClient())
+    node_id = "mem_fixture_stable_cache_behavior"
+    stored_node = Node(
+        metadata=NodeMetadata(
+            id=node_id,
+            title="Stable Cache Behavior",
+            type=NodeType.PERSISTENT,
+            okf_type="fact",
+            sources=[transcript.id],
         ),
-        evidence=[EvidenceEntry(turn="T1", quote="The cache key remains stable for retried writes.")],
+        content="## Takeaway\n\n重试继续使用原有 cache key。\n\n## Details\n\n同一写入的 retry 会复用 key。\n",
+        file_path=Path("active") / f"{node_id}.md",
     )
-    run = EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-test", 60, 1, 1)
+    captured: dict[str, Any] = {}
+
+    def integrate_knowledge(**kwargs: Any) -> dict[str, str]:
+        captured.update(kwargs)
+        return {"action": "created"}
+
+    monkeypatch.setattr(runner, "_stable_create_id", lambda *_args: node_id)
+    monkeypatch.setattr(runner, "_load_node_or_none", lambda _node_id: None)
+    monkeypatch.setattr(runner, "_load_node", lambda _node_id: stored_node)
+    monkeypatch.setattr(runner, "_repair_takeaway_only", lambda _op, content, _sources, _run: (content, None))
+    monkeypatch.setattr(runner.service, "integrate_knowledge", integrate_knowledge)
+    op = EpisodeOp(
+        action="create",
+        title="Stable Cache Behavior",
+        okf_type="fact",
+        justification="",
+        content=(
+            "## Takeaway\n\n重试继续使用原有 cache key。\n\n"
+            "## Details\n\n同一写入的 retry 会复用 key。\n"
+        ),
+        evidence=[EvidenceEntry(turn="T1", quote="not a verbatim excerpt")],
+        verified=False,
+        reason="",
+    )
+    run = EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-test", 50, 1, 1)
     try:
         result = runner._apply_op(
             transcript,
-            [turn],
+            [TranscriptTurn(number=1, role="User", body="The actual user source differs.")],
             op,
             run,
-            allowed_target_ids={op.target_id},
-            allowed_evidence_turns={"T1"},
-        )
-        assert result["action"] == "quarantined"
-        assert result["target_id"] == op.target_id
-        quarantine = list((paths.base / ".distiller-quarantine").glob("*.jsonl"))
-        assert len(quarantine) == 1
-        record = json.loads(quarantine[0].read_text(encoding="utf-8").splitlines()[0])
-        assert record["target_node_ids"] == [op.target_id]
-        assert record["failure_reason"] == f"Unknown or inactive update target: {op.target_id}"
-        assert record["evidence"] == [{"turn": "T1", "quote": "The cache key remains stable for retried writes."}]
-    finally:
-        runner.close()
-
-def test_malformed_integrate_operation_is_quarantined(tmp_path: Path) -> None:
-    config, paths, transcript = _setup(tmp_path)
-    runner = _runner(config, paths, FakeClient())
-    op = _parse_ops({"ops": [None]}, lesson_count=1)[0]
-    run = EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-invalid-op", 0, 0, 1)
-    try:
-        result = runner._apply_op(
-            transcript, [], op, run, allowed_target_ids=set(), allowed_evidence_turns=set()
-        )
-        assert result["action"] == "quarantined"
-        quarantine = list((paths.base / ".distiller-quarantine").glob("*.jsonl"))
-        record = json.loads(quarantine[0].read_text(encoding="utf-8").splitlines()[0])
-        assert record["failure_reason"] == "Integrate operation 0 must be a JSON object"
-        assert record["evidence"] == []
-    finally:
-        runner.close()
-
-
-def test_create_retry_uses_canonical_id_and_is_idempotent(tmp_path: Path) -> None:
-    config, paths, transcript = _setup(tmp_path)
-    runner = _runner(config, paths, FakeClient())
-    turn = TranscriptTurn(number=1, role="User", body="The cache key remains stable for retried writes.")
-    op = EpisodeOp(
-        action="create",
-        title="Stable Cache Key Behavior",
-        okf_type="fact",
-        justification="No existing node describes this retry invariant.",
-        content=(
-            "## Takeaway\n\nRetrying a write preserves its cache key.\n\n"
-            "## Details\n\nThe same key is reused on retry.\n\n## Sources\n\n- source"
-        ),
-        evidence=[EvidenceEntry(turn="T1", quote="The cache key remains stable for retried writes.")],
-    )
-    run = EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-test", 60, 1, 1)
-    try:
-        first = runner._apply_op(
-            transcript, [turn], op, run, allowed_target_ids=set(), allowed_evidence_turns={"T1"}
-        )
-        second = runner._apply_op(
-            transcript, [turn], op, run, allowed_target_ids=set(), allowed_evidence_turns={"T1"}
-        )
-        assert first["action"] == "created"
-        assert second["action"] == "unchanged"
-        assert first["node_id"] == second["node_id"]
-        assert first["node_id"].startswith("mem_2026")
-    finally:
-        runner.close()
-
-def test_overlong_takeaway_uses_focused_repair_before_write(tmp_path: Path) -> None:
-    config, paths, transcript = _setup(tmp_path)
-    repaired = "Retry writes with the same cache key."
-    client = FakeClient(response={"takeaway": repaired})
-    runner = _runner(config, paths, client)
-    turn = TranscriptTurn(number=1, role="User", body="The cache key remains stable for retried writes.")
-    op = EpisodeOp(
-        action="create",
-        title="Stable Cache Key Behavior",
-        okf_type="fact",
-        justification="No matching node describes this retry invariant.",
-        content=(
-            "## Takeaway\n\n" + "A durable retry statement " + "x" * 210 + "\n\n"
-            "## Details\n\nThe same key is reused on retry.\n\n## Sources\n\n- source"
-        ),
-        evidence=[EvidenceEntry(turn="T1", quote="The cache key remains stable for retried writes.")],
-    )
-    run = EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-repair-test", 60, 1, 1)
-    try:
-        result = runner._apply_op(
-            transcript, [turn], op, run, allowed_target_ids=set(), allowed_evidence_turns={"T1"}
+            allowed_target_ids=set(),
         )
         assert result["action"] == "created"
-        assert len(client.prompts) == 1
-        assert "Rewrite only the supplied OKF Takeaway line" in client.prompts[0]
-        assert "Retry writes with the same cache key." in runner._load_node(result["node_id"]).content
-        assert run.stages["takeaway_repair"].calls == 1
+        assert op.justification == "Gatekeeper approved new knowledge node"
+        assert result["verified"] is False
+        assert captured["verified"] is False
+        assert not list((paths.base / ".distiller-quarantine").glob("*.jsonl"))
+    finally:
+        runner.close()
+
+
+def test_gatekeeper_verified_flag_is_parsed_and_assistant_quotes_verify() -> None:
+    op = _parse_ops(
+        {
+            "ops": [
+                {
+                    "action": "create",
+                    "lesson_index": 0,
+                    "title": "Verified Source Anchor",
+                    "okf_type": "fact",
+                    "verified": False,
+                    "content": "body",
+                    "justification": "",
+                    "evidence": [{"turn": "T2", "quote": "src/authz/handler.go"}],
+                    "reason": "new knowledge",
+                }
+            ]
+        },
+        lesson_count=1,
+    )[0]
+    assert op.justification == "new knowledge"
+    turns = [TranscriptTurn(number=2, role="Assistant", body="Source analysis found src/authz/handler.go handles the error.")]
+    verified, unverified = episode_module.verify_evidence(
+        op.evidence,
+        turns={"T2": episode_module._turn_verification_text(turns[0])},
+    )
+    assert verified == op.evidence
+    assert unverified == []
+
+
+def test_integrate_prompt_defines_gatekeeper_policy_and_chinese_okf_contract() -> None:
+    prompt = episode_module.render_episode_integrate_prompt(
+        lessons=[Lesson("API Boundary", "接口返回 404 时代表 group 不存在。", ["T1"], "pitfall").as_dict()],
+        same_session_nodes=[],
+        retrieved_nodes=[],
+        evidence_context=[{"lesson_index": 0, "evidence": [{"turn": "T1", "role": "User", "text": "404"}]}],
+        global_user_spine="T1: user later corrected the 404 hypothesis",
+    )
+    for required in (
+        "Strict Gatekeeper",
+        "refuted by later turns",
+        "default to update",
+        "specific English title",
+        "verified=true",
+        "evidence",
+        "Sources",
+        "Global User Spine",
+    ):
+        assert required in prompt
+
+
+def test_rest_episode_close_returns_disabled_without_starting_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, paths, _transcript = _setup(tmp_path)
+    config.distiller.enabled = False
+    scanner = FakeClient()
+    factory_called = threading.Event()
+
+    def forbidden_factory(_config: SynapseConfig) -> FakeClient:
+        factory_called.set()
+        return FakeClient()
+
+    monkeypatch.setattr(EpisodeDistiller, "make_scanner_client", staticmethod(forbidden_factory))
+    monkeypatch.setattr(EpisodeDistiller, "make_gatekeeper_client", staticmethod(forbidden_factory))
+    app = create_app(config, runtime_paths=paths, sampling_client=scanner)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/episode/close",
+            json={"session_key": "test-session-key", "reason": "idle"},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"status": "disabled", "session_key": "test-session-key"}
+    assert scanner.prompts == []
+    assert not factory_called.wait(timeout=0.1)
+
+
+def test_rest_episode_close_runs_in_background_and_serializes_same_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, paths, _transcript = _setup(tmp_path)
+    config.distiller.enabled = True
+    scanner_clients: list[FakeClient] = []
+    gatekeeper_clients: list[FakeClient] = []
+
+    def make_scanner(_config: SynapseConfig) -> FakeClient:
+        client = FakeClient()
+        scanner_clients.append(client)
+        return client
+
+    def make_gatekeeper(_config: SynapseConfig) -> FakeClient:
+        client = FakeClient()
+        gatekeeper_clients.append(client)
+        return client
+
+    monkeypatch.setattr(EpisodeDistiller, "make_scanner_client", staticmethod(make_scanner))
+    monkeypatch.setattr(EpisodeDistiller, "make_gatekeeper_client", staticmethod(make_gatekeeper))
+    lock = threading.Lock()
+    completed = threading.Event()
+    active = 0
+    max_active = 0
+    completed_count = 0
+
+    def fake_run(_runner: EpisodeDistiller, _session_key: str) -> None:
+        nonlocal active, max_active, completed_count
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+            completed_count += 1
+            if completed_count == 2:
+                completed.set()
+
+    monkeypatch.setattr(EpisodeDistiller, "run", fake_run)
+    app = create_app(config, runtime_paths=paths, sampling_client=FakeClient())
+    with TestClient(app) as client:
+        first = client.post("/api/episode/close", json={"session_key": "same-key", "reason": "shutdown"})
+        second = client.post("/api/episode/close", json={"session_key": "same-key", "reason": "switch"})
+        assert first.status_code == second.status_code == 200
+        assert first.json() == {"status": "accepted", "session_key": "same-key", "reason": "shutdown"}
+        assert second.json() == {"status": "accepted", "session_key": "same-key", "reason": "switch"}
+        assert completed.wait(timeout=3)
+    assert max_active == 1
+    assert len(scanner_clients) == 2
+    assert len(gatekeeper_clients) == 2
+    assert all(client.closed for client in scanner_clients + gatekeeper_clients)
+
+
+def test_single_large_pending_turn_short_skips_and_stamps(tmp_path: Path) -> None:
+    content = V2_MARKER + "\n\n## T1 User\n" + "one turn is not enough " + "x" * 700
+    config, paths, transcript = _setup(tmp_path, content=content)
+    scanner = FakeClient()
+    runner = _runner(config, paths, scanner)
+    try:
+        result = runner.run(transcript.id)
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            stored = store.get_node(transcript.id)
+        assert result.turns == 1
+        assert result.stages == {}
+        assert scanner.prompts == []
+        assert stored is not None and stored.metadata.distilled_turn == 1
+    finally:
+        runner.close()
+
+
+def test_large_episode_uses_map_then_lesson_reduce(tmp_path: Path) -> None:
+    bodies = ["u" * 420, "a" * 420, "v" * 420, "b" * 420]
+    content = V2_MARKER + "\n\n" + "\n\n".join(
+        f"## T{index} {role}\n{body}"
+        for index, (role, body) in enumerate(zip(("User", "Assistant", "User", "Assistant"), bodies), 1)
+    )
+    config, paths, transcript = _setup(tmp_path, content=content)
+    config.distiller.episode.chunk_chars = 1_000
+    scanner = FakeClient(response={"lessons": []})
+    runner = _runner(config, paths, scanner)
+    try:
+        result = runner.run(transcript.id)
+        assert result.chunks == 2
+        assert len(scanner.prompts) == 3
+        assert "inspect chunk 1 of 2" in scanner.prompts[0]
+        assert "inspect chunk 2 of 2" in scanner.prompts[1]
+        assert "Stage 1 lesson_reduce" in scanner.prompts[2]
+        assert result.stages["map"].calls == 2
+        assert result.stages["lesson_reduce"].calls == 1
+    finally:
+        runner.close()
+
+
+def test_evidence_budget_splits_batches_without_omitting_turns(tmp_path: Path) -> None:
+    config, paths, _transcript = _setup(tmp_path)
+    runner = _runner(config, paths, FakeClient())
+    turns = [
+        TranscriptTurn(number=1, role="User", body="first evidence " + "x" * 1400),
+        TranscriptTurn(number=2, role="Assistant", body="second evidence " + "y" * 1400),
+    ]
+    lessons = [
+        Lesson("First", "第一条。", ["T1"]),
+        Lesson("Second", "第二条。", ["T2"]),
+    ]
+    try:
+        single_sizes = [
+            len(json.dumps(runner._evidence_context(turns, [lesson]), ensure_ascii=False))
+            for lesson in lessons
+        ]
+        runner.settings.evidence_context_token_budget = max(single_sizes) + 1
+        batches = runner._integrate_lesson_batches(turns, lessons)
+        assert [[lesson.topic for lesson in batch] for batch in batches] == [["First"], ["Second"]]
+        excerpt_turns = [
+            excerpt["turn"]
+            for batch in batches
+            for item in runner._evidence_context(turns, batch)
+            for excerpt in item["evidence"]
+        ]
+        assert excerpt_turns == ["T1", "T2"]
+    finally:
+        runner.close()
+
+
+def test_takeaway_only_warning_uses_gatekeeper_repair_before_write(tmp_path: Path) -> None:
+    config, paths, _transcript = _setup(tmp_path)
+    scanner = FakeClient()
+    gatekeeper = FakeClient(response={"takeaway": "重试保留同一请求的 cache key。"})
+    runner = _runner(config, paths, scanner, gatekeeper)
+    op = EpisodeOp(action="create", title="Stable Retry Key", okf_type="fact")
+    content = (
+        "## Takeaway\n\n" + "x" * 201 + "\n\n"
+        "## Details\n\n同一请求的重试沿用原有 cache key。\n\n"
+        "## Sources\n\n- [[mem_fixture_session_test]]\n"
+    )
+    run = EpisodeRun("mem_fixture_session_test", "test-session-key", "episode-repair", 0, 0, 0)
+    try:
+        repaired, error = runner._repair_takeaway_only(
+            op, content, ["mem_fixture_session_test"], run
+        )
+        assert error is None
+        assert "重试保留同一请求的 cache key。" in repaired
+        assert len(gatekeeper.prompts) == 1
+        assert scanner.prompts == []
     finally:
         runner.close()

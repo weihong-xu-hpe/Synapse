@@ -272,7 +272,7 @@ Controls the session distiller — the server-side pipeline that converts sessio
 
 - `enabled` (bool, default `true`) — whether the in-process sweep scheduler auto-starts when the server runs
 - `interval_minutes` (int, ≥1, default `10`) — sweep interval; short enough that macOS sleep drift is harmless
-- `idle_minutes` (int, ≥1, default `30`) — a transcript must be untouched this long before it is distilled (avoids distilling mid-pause). The idle and retention clocks both use the transcript **file mtime**: stamping (distillation write-back) and failure backoff rewrite the file and thus reset the clock.
+- `idle_minutes` (int, ≥1, default `60`) — a transcript must be untouched this long before it is distilled (avoids distilling mid-pause). The idle and retention clocks both use the transcript **file mtime**: stamping (distillation write-back) and failure backoff rewrite the file and thus reset the clock.
 - `retention_days` (int, ≥1, default `45`) — transcripts distilled at their **current** content revision are archived this many days after their last content update (file mtime); **undistilled or stale-distilled transcripts are never archived**. A transcript that yielded zero knowledge items counts as distilled-current (the LLM judged nothing durable) and is archived after retention like any other.
 - `max_transcript_chars` (int, default `16000`) — prompt cap per transcript (head + tail split)
 - `max_concurrency` (int, 1–30, default `30`) — extraction-call concurrency within each transcript
@@ -284,6 +284,18 @@ Controls the session distiller — the server-side pipeline that converts sessio
 - `max_transcripts_per_run` (int, 1–5000, default `500`) — bounded per-sweep safety cap; freed transcript slots refill from the pending backlog until this cap or exhaustion
 - `backoff_sweeps` (int, default `3`) — sweeps a failing transcript is skipped before retry
 - A failed or partial transcript may be retried once within the same sweep after a 10-minute cooldown; the sweep waits for that retry if it is still eligible. Each transcript task logs its duration, and each item commit logs lock wait/hold time.
+
+#### `[distiller.episode]` two-stage pipeline
+
+The episode close path dehydrates tool-polling noise, carries a Global User Spine across incremental runs, scans with a low-effort endpoint pool, and passes candidate lessons to a separate gatekeeper/integrator.
+
+- `scanner_endpoints` (optional list) selects the Stage 1 endpoint pool; `endpoints` is also accepted for the pool, while legacy `endpoint` remains the single-endpoint fallback. Missing `reasoning_effort` defaults to `low` for scanner endpoints.
+- `gatekeeper_endpoint` defaults to `http://127.0.0.1:47870/v1` with model `claude-haiku-5.5`; it may be set to `null` to use that default.
+- `chunk_chars` (int, ≥1,000, default `400000`) controls turn-boundary chunking for large transcripts.
+- `integrate_lessons_per_call` (int, default `12`), `retrieval_top_k_per_lesson` (int, default `5`), and `evidence_context_token_budget` (int, default `24000`) bound gatekeeper batches and retrieved evidence.
+- Pending episodes with fewer than two dehydrated turns or fewer than 600 dehydrated characters are stamped without LLM calls.
+
+`POST /api/episode/close` accepts `{"session_key":"…","reason":"idle|shutdown|switch"}`. It returns `status=disabled` when `[distiller].enabled` is false; otherwise it returns `status=accepted` and schedules per-session serialized background distillation.
 
 Maintenance commands: `python -m synapse distill status | run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`.
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from threading import Thread
+from threading import Lock, Thread
 from time import perf_counter
 from typing import Any
 
@@ -328,7 +328,7 @@ def _create_root_handler():
             "name": "synapse",
             "version": __version__,
             "mcp": "/mcp",
-            "rest": {"search": "/api/search", "write": "/api/write"},
+            "rest": {"search": "/api/search", "write": "/api/write", "episode_close": "/api/episode/close"},
             "transport": STREAMABLE_TRANSPORT_NAME,
             "session_header": STREAMABLE_SESSION_HEADER,
             "architecture_doc": ACTIVE_ARCHITECTURE_DOC,
@@ -421,6 +421,71 @@ def _create_rest_write_handler(service: SynapseServerService):
         return JSONResponse(status_code=200, content=result)
 
     return write_memory
+
+
+def _create_episode_close_handler(config, runtime_paths, logger):
+    locks_guard = Lock()
+    session_locks: dict[str, Lock] = {}
+
+    async def close_episode(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return JSONResponse(status_code=400, content={"error": "Request body must be valid JSON"})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"error": "Request body must be a JSON object"})
+        session_key = str(body.get("session_key") or "").strip()
+        reason = str(body.get("reason") or "").strip()
+        if not session_key:
+            return JSONResponse(status_code=400, content={"error": "session_key must not be blank"})
+        if reason not in {"idle", "shutdown", "switch"}:
+            return JSONResponse(status_code=400, content={"error": "reason must be idle, shutdown, or switch"})
+        if not config.distiller.enabled:
+            return JSONResponse(status_code=200, content={"status": "disabled", "session_key": session_key})
+
+        with locks_guard:
+            session_lock = session_locks.setdefault(session_key, Lock())
+
+        def distill_in_background() -> None:
+            with session_lock:
+                from synapse.lifecycle.episode_distiller import EpisodeDistiller
+
+                scanner_client = None
+                gatekeeper_client = None
+                runner = None
+                try:
+                    scanner_client = EpisodeDistiller.make_scanner_client(config)
+                    gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(config)
+                    runner = EpisodeDistiller(
+                        config,
+                        runtime_paths=runtime_paths,
+                        sampling_client=scanner_client,
+                        gatekeeper_client=gatekeeper_client,
+                    )
+                    runner.run(session_key)
+                except Exception:
+                    if logger is not None:
+                        logger.exception(
+                            "Episode close distillation failed",
+                            extra={"session_key": session_key, "reason": reason},
+                        )
+                finally:
+                    try:
+                        if runner is not None:
+                            runner.close()
+                    finally:
+                        for client in (scanner_client, gatekeeper_client):
+                            close_client = getattr(client, "close", None)
+                            if callable(close_client):
+                                close_client()
+
+        Thread(target=distill_in_background, name="episode-close", daemon=True).start()
+        return JSONResponse(
+            status_code=200,
+            content={"status": "accepted", "session_key": session_key, "reason": reason},
+        )
+
+    return close_episode
 
 
 def _create_auth_logging_middleware(config, service: SynapseServerService, logger):
@@ -540,5 +605,8 @@ def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None,
     app.get("/health")(_create_health_handler())
     app.post("/api/search")(_create_rest_search_handler(service))
     app.post("/api/write")(_create_rest_write_handler(service))
+    app.post("/api/episode/close")(
+        _create_episode_close_handler(config, service.runtime_paths, logger or service.logger)
+    )
 
     return app

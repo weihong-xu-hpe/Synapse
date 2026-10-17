@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,7 +117,7 @@ def main_callback(
     episode_pilot = ctx.invoked_subcommand == "distill" and "episode" in command_tokens
     if episode_pilot:
         # Episode command replaces every runtime path from its explicit --base before opening storage.
-        placeholder = Path("/tmp/synapse-episode-cli-unbound")
+        placeholder = Path("/var/empty/synapse-episode-cli-unbound")
         runtime_paths = RuntimePaths(placeholder, placeholder / "active", placeholder / ".archive", placeholder / ".logs", placeholder / ".audit")
         loggers = {}
     else:
@@ -304,13 +306,19 @@ def run_episode_distiller(
     ctx: typer.Context,
     db: Annotated[Path, typer.Option("--db", exists=True, dir_okay=False, help="SQLite copy to mutate; must be BASE/synapse.db.")],
     base: Annotated[Path, typer.Option("--base", exists=True, file_okay=False, help="Copied Synapse base containing active/ and .archive/.")],
-    session: Annotated[list[str], typer.Option("--session", help="Transcript node id or session_key; repeat to run sequentially.")],
     report_path: Annotated[Path, typer.Option("--report", help="Markdown report path including full changed node bodies.")],
+    session: Annotated[list[str], typer.Option("--session", help="Transcript node id or session_key; repeat to run.")] = [],
     comparison_db: Annotated[Path | None, typer.Option("--comparison-db", help="Read-only old-pipeline database for citation counts.")] = None,
     selection_note: Annotated[list[str], typer.Option("--selection-note", help="NODE_ID=reason; repeated notes are included in the report.")] = [],
+    all_pending: Annotated[bool, typer.Option("--all-pending", help="Select active session transcripts with no distillation watermark or hash.")] = False,
+    workers: Annotated[int, typer.Option("--workers", min=1, help="Parallel Stage-1 extraction workers.")] = 1,
+    allow_live: Annotated[bool, typer.Option("--allow-live", help="Explicitly allow running against ~/synapse live data.")] = False,
 ) -> None:
-    """Run the episode pipeline sequentially against an explicit copied database."""
+    """Run episode extraction and serialized integration against the selected database."""
     from synapse.lifecycle.episode_distiller import EpisodeDistiller
+    from synapse.models import NodeStatus, NodeType
+    from synapse.okf.transcripts import is_session_transcript
+    from synapse.storage import SQLiteNodeStore
     from synapse.utils.runtime import bootstrap_runtime_directories
 
     state = _state_from_context(ctx)
@@ -318,25 +326,42 @@ def run_episode_distiller(
     db_path = db.expanduser().resolve()
     forbidden = (Path.home() / "synapse").resolve()
     report_path = report_path.expanduser().resolve()
-    for path in (base_path, db_path, report_path, base_path / "active", base_path / ".archive", base_path / ".logs"):
-        resolved = path.resolve()
-        if resolved == forbidden or forbidden in resolved.parents:
-            raise typer.BadParameter(f"Pilot path resolves inside forbidden live data: {resolved}")
+    if not allow_live:
+        for path in (base_path, db_path, report_path, base_path / "active", base_path / ".archive", base_path / ".logs"):
+            resolved = path.resolve()
+            if resolved == forbidden or forbidden in resolved.parents:
+                raise typer.BadParameter(f"Pilot path resolves inside forbidden live data: {resolved}")
     if db_path != (base_path / "synapse.db").resolve():
         raise typer.BadParameter("--db must be exactly --base/synapse.db so all writes stay in the selected copy")
     if not (base_path / "active").is_dir() or not (base_path / ".archive").is_dir():
         raise typer.BadParameter("--base must contain copied active/ and .archive/ directories")
     old_db = comparison_db.expanduser().resolve() if comparison_db is not None else None
-    if old_db is not None and (old_db == forbidden or forbidden in old_db.parents):
+    if not allow_live and old_db is not None and (old_db == forbidden or forbidden in old_db.parents):
         raise typer.BadParameter("--comparison-db must not resolve inside ~/synapse")
+    if all_pending and session:
+        raise typer.BadParameter("--all-pending cannot be combined with --session")
 
     config = state.config.model_copy(deep=True)
     config.memory.base_path = base_path
     config.memory.archive_path = base_path / ".archive"
     config.logging.log_dir = base_path / ".logs"
     paths = bootstrap_runtime_directories(config)
-    if paths.base != base_path or paths.base == forbidden or forbidden in paths.base.parents:
+    if paths.base != base_path or (not allow_live and (paths.base == forbidden or forbidden in paths.base.parents)):
         raise typer.BadParameter("Resolved pilot runtime path is not the supplied safe copy")
+
+    if all_pending:
+        with SQLiteNodeStore(db_path, embedding_dimension=config.embedding.dimension or 0) as store:
+            session_ids = [
+                node.id
+                for node in store.list_nodes({"type": NodeType.TRANSIENT, "status": NodeStatus.ACTIVE})
+                if is_session_transcript(node)
+                and node.metadata.distilled_turn is None
+                and node.metadata.distilled_hash is None
+            ]
+    else:
+        session_ids = list(session)
+    if not session_ids:
+        raise typer.BadParameter("Specify --session or select at least one transcript with --all-pending")
 
     notes = {}
     for note in selection_note:
@@ -345,19 +370,49 @@ def run_episode_distiller(
             raise typer.BadParameter("--selection-note must be NODE_ID=reason")
         notes[node_id.strip()] = reason.strip()
 
-    client = EpisodeDistiller.make_sampling_client(config)
-    runner = EpisodeDistiller(config, runtime_paths=paths, sampling_client=client)
+    scanner_client = EpisodeDistiller.make_scanner_client(config)
+    gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(config)
+    runner = EpisodeDistiller(
+        config,
+        runtime_paths=paths,
+        sampling_client=scanner_client,
+        gatekeeper_client=gatekeeper_client,
+    )
     runs = []
     failures = []
     try:
-        for session_id in session:
-            try:
-                runs.append(runner.run(session_id))
-            except Exception as exc:  # preserve successful earlier/later sessions in the report
-                failures.append({"session": session_id, "error": f"{type(exc).__name__}: {exc}"})
+        if workers > 1 and len(session_ids) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                started_at: dict[str, float] = {}
+                futures = {}
+                for session_id in session_ids:
+                    started_at[session_id] = time.perf_counter()
+                    futures[executor.submit(runner.run, session_id)] = session_id
+                completed = 0
+                for future in as_completed(futures):
+                    session_id = futures[future]
+                    completed += 1
+                    try:
+                        result = future.result()
+                        runs.append(result)
+                        _echo_episode_progress(completed, len(session_ids), session_id, result, started_at[session_id])
+                    except Exception as exc:  # preserve successful sessions in the report
+                        failures.append({"session": session_id, "error": f"{type(exc).__name__}: {exc}"})
+                        typer.echo(f"[{completed}/{len(session_ids)}] {session_id}: failed, {time.perf_counter() - started_at[session_id]:.1f}s")
+        else:
+            for index, session_id in enumerate(session_ids, 1):
+                started = time.perf_counter()
+                try:
+                    result = runner.run(session_id)
+                    runs.append(result)
+                    _echo_episode_progress(index, len(session_ids), session_id, result, started)
+                except Exception as exc:  # preserve successful earlier/later sessions in the report
+                    failures.append({"session": session_id, "error": f"{type(exc).__name__}: {exc}"})
+                    typer.echo(f"[{index}/{len(session_ids)}] {session_id}: failed, {time.perf_counter() - started:.1f}s")
     finally:
         runner.close()
-        client.close()
+        scanner_client.close()
+        gatekeeper_client.close()
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
@@ -370,8 +425,17 @@ def run_episode_distiller(
         raise typer.Exit(code=1)
 
 
+def _echo_episode_progress(index: int, total: int, session_id: str, run: Any, started: float) -> None:
+    created = sum(operation.get("action") == "created" for operation in run.ops)
+    updated = sum(operation.get("action") == "updated" for operation in run.ops)
+    elapsed = time.perf_counter() - started
+    typer.echo(
+        f"[{index}/{total}] {session_id}: {len(run.lessons)} lessons, "
+        f"{created} created, {updated} updated, {elapsed:.1f}s"
+    )
+
 def _render_episode_pilot_report(runs: list[Any], *, notes: dict[str, str], comparison_db: Path | None, failures: list[dict[str, str]]) -> str:
-    lines = ["# Episode distiller pilot", "", "Runs are sequential on the selected copy; stage usage comes from the proxy response when available.", ""]
+    lines = ["# Episode distiller pilot", "", "Stage 1 extraction may run in parallel; Stage 2 integration is serialized on the selected copy. Stage usage comes from the proxy response when available.", ""]
     if comparison_db is not None:
         lines.append(f"Read-only old-pipeline comparison DB: `{comparison_db}`")
         lines.append("")
@@ -399,13 +463,6 @@ def _render_episode_pilot_report(runs: list[Any], *, notes: dict[str, str], comp
                 lines.append(f"{index}. **{lesson['topic']}** — {lesson['claim']} (evidence: {', '.join(lesson['evidence_turns'])})")
         else:
             lines.append("No durable lessons.")
-
-        if run.evidence_rejections:
-            lines.extend(["", "### Evidence rejected", ""])
-            for rejection in run.evidence_rejections:
-                lines.append(
-                    f"- {rejection.get('topic', 'lesson')} ({rejection.get('turn', 'no turn')}): {rejection['reason']}"
-                )
         lines.extend(["", "### Stage calls, tokens, and latency", "", "| Stage | Calls | Prompt tokens | Completion tokens | Reasoning tokens | Latency ms |", "|---|---:|---:|---:|---:|---:|"])
         for stage, metrics in run.stages.items():
             data = metrics.as_dict()

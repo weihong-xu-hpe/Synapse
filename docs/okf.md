@@ -274,19 +274,9 @@ Owner decision C — **annotate, never auto-inject**. Distilled items carry an
 {"evidence": [{"turn": "T12", "quote": "<verbatim excerpt, <= 200 chars>"}]}
 ```
 
-- **Accepted evidence sources by type**: `fact` / `procedure` / `pitfall` cite a
-  tool result line or a user turn; `decision` cites a user turn or a tool result.
-- **Server verification is deterministic (no LLM, no code execution)**: the quote,
-  whitespace-collapsed and case-insensitive, must appear in the named turn's
-  **eligible evidence text** — (a) the body of a User turn, (b) the
-  `result [...]:` lines of attached tool blocks (including their wrapped
-  continuation lines), and (c) for `procedure` additionally the `call:` lines
-  of tool blocks whose result status is `ok`. Tool-result text counts in both
-  raw form and with read-tool per-line numbering prefixes (`12:`, `12-`,
-  `12-18:`) stripped, so a quote that drops the numbering still verifies.
-  Assistant prose never counts for any type; in v1 transcripts (no tool blocks)
-  only User turns are eligible. Quotes from any other text stay unverified.
-- A User turn containing only an interrogative cannot verify an answer/hypothesis by itself; its quote is retained as unverified unless another assertive eligible source supports the claim.
+- The scheduled segment distiller accepts User bodies and eligible Tool output under its deterministic evidence contract. For episode distillation, Stage 1 considers every User, Assistant, and Tool turn; Stage 2 supplies verbatim excerpts from the cited turns, including Assistant bodies and surviving Tool sections.
+- Episode writes honor the gatekeeper's `verified` boolean when present. Without it, the server deterministically checks evidence quotes against all named turn bodies and Tool sections, including Assistant source-code/log analysis. Verification is an annotation, not a write gate: speculative or ungrounded lessons remain writable with `verified: false` and are excluded from auto-injection.
+- A User turn containing only an interrogative is not independently sufficient grounding for the scheduled segment distiller. Episode gatekeeper decisions instead use the supplied excerpts and full Global User Spine to assess grounding and later refutations.
 - Verified items get frontmatter `verified: true` and a `## Evidence` section
   (`- T12: "quote"`). Unverifiable items are still written with `verified: false`
   and their (unverifiable) evidence listed.
@@ -347,35 +337,38 @@ legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
 ## 11. Episode pipeline pilot
 
 The opt-in `synapse distill episode` command runs the episode-based pipeline on an explicitly
-selected database/base copy. It is currently separate from the existing scheduled distiller and
-does not change bridge retention or add the episode REST API. The command accepts repeated
+selected database/base copy. It remains distinct from the scheduled segment distiller. The REST
+fallback `POST /api/episode/close` accepts `session_key` and a reason of `idle`, `shutdown`, or
+`switch`; with `[distiller].enabled=false` it returns `status=disabled`, otherwise it queues a
+per-session serialized background run and returns `status=accepted`. The CLI accepts repeated
 `--session` values and processes them sequentially so later sessions can retrieve earlier writes.
 
-```sh
-synapse --config /copy/pilot.toml distill episode \
-  --db /copy/synapse.db --base /copy \
-  --session <transcript-node-id> --report /copy/report.md
-```
+The Stage 1 scanner uses `[distiller.episode.scanner_endpoints]` (or `endpoints`); legacy
+`[distiller.episode.endpoint]` remains the single-endpoint fallback. Missing scanner
+`reasoning_effort` defaults to `low`. Stage 2 uses `gatekeeper_endpoint`, defaulting to the local
+`claude-haiku-5.5` endpoint. The episode client timeout is 300 seconds by default, the model token
+budget is 200,000, and temperature is 0.
 
-The pilot uses the dedicated `[distiller.episode.endpoint]` config, not `[decider].endpoints`;
-the default endpoint targets a local proxy and forwards `reasoning_effort=medium`. Configure the
-dedicated endpoint explicitly in a private pilot config as needed (documentation examples use
-placeholder hosts such as `http://llm-proxy.example/v1`). The default model token budget remains
-200,000 and temperature 0.
+Stage 0 strips the configured polling/status tool sections and empty Assistant turns, then builds a
+chronological Global User Spine from every User turn in the transcript, clipping each body to 350
+characters. Pending episodes with fewer than two dehydrated turns or fewer than 600 dehydrated
+characters advance the watermark without making an LLM call. Stage 1 summarizes a complete episode
+or maps turn-boundary chunks of up to 400,000 characters and reduces the candidates; it keeps only
+durable ownership/topology, API contract, infrastructure/auth pitfall, and confirmed-decision
+knowledge. It considers all turn roles and carries cited turn IDs without evidence-eligibility
+filtering.
 
-Small episodes use one summary call. Larger episodes map complete turns into approximately
-100,000-character chunks, then make one lesson-reduce call to merge duplicates and let later
-corrections replace earlier claims. Map/reduce citations are limited to assertive user bodies and
-eligible tool results; assistant prose remains context only. Integrate retrieves five candidates per
-lesson, includes verbatim eligible evidence excerpts per lesson under a separate 24,000-character
-conservative budget, and splits lesson batches on overflow without dropping excerpts. Retrieved
-node bodies have a separate 24,000-character conservative budget; each call handles at most 12
-lessons. Integrate Takeaways target at most 160 characters (hard limit 200); a takeaway-only
-finding receives a focused repair before the existing final-body gate. Updates target only retrieved
-active persistent nodes; creates require justification; empty operations are valid.
+Stage 2 retrieves up to five active persistent candidates per lesson plus nodes already produced in
+the same session. The gatekeeper receives the Global User Spine and verbatim excerpts from each
+cited turn (User body, Assistant body, and surviving Tool sections) under a separate 24,000-character
+conservative evidence budget. It filters ephemeral or refuted lessons, defaults to updating a fitting
+node, and creates only with justification. Each call handles at most 12 lessons; retrieved node
+bodies have a separate 24,000-character conservative budget. Takeaways are Chinese single lines
+targeting at most 160 characters (hard limit 200), with the required OKF sections and a focused
+takeaway-only repair when needed. A gatekeeper `verified` annotation is honored at write time; false
+verification never blocks a valid node write.
 
-The pilot report records stage latency and proxy usage tokens when supplied, lesson decisions,
-old-pipeline source-citation counts when `--comparison-db` is provided, and full bodies of changed
-nodes. A failed stage does not advance `distilled_turn`; rerunning an already-applied create uses
-the canonical title/date node ID and becomes a no-op. The pilot writes no data outside `--base`
-except the explicitly selected report file.
+The pilot report records stage latency and proxy usage tokens when supplied, lesson decisions, and
+full bodies of changed nodes. A failed stage does not advance `distilled_turn`; rerunning an
+already-applied create uses the canonical title/date node ID and becomes a no-op. The pilot writes no
+data outside `--base` except the explicitly selected report file.

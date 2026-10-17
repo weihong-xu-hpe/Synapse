@@ -101,18 +101,10 @@ class StreamableRuntime:
             lifespan_context = dreamer_lifespan
 
         if self.config.distiller.enabled:
-            # The distiller shares this endpoint pool for both extraction and
-            # write decisions. Per-stage call contexts use the long distiller
-            # timeout for extraction and [decider].timeout_seconds for writes.
-            distiller_settings = self.config.decider.model_copy(
-                update={"timeout_seconds": self.config.distiller.llm_timeout_seconds}
-            )
-            distiller_client = app_sampling_client or (LocalLLMDecider(distiller_settings) if self.config.decider.provider == "local_llm" else None)
             distiller_scheduler = DistillerScheduler(
                 self.config,
                 runtime_paths=self.runtime_paths,
                 logger=self.logger,
-                sampling_client=distiller_client,
             )
             self._distiller_scheduler = distiller_scheduler
 
