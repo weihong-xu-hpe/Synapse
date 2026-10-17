@@ -76,6 +76,7 @@ class EpisodeRun:
     lessons: list[dict[str, Any]] = field(default_factory=list)
     ops: list[dict[str, Any]] = field(default_factory=list)
     node_bodies: list[dict[str, str]] = field(default_factory=list)
+    evidence_rejections: list[dict[str, str]] = field(default_factory=list)
     stages: dict[str, StageMetrics] = field(default_factory=dict)
     retrieval_calls: int = 0
     stamped: bool = False
@@ -90,6 +91,7 @@ class EpisodeRun:
             "chunks": self.chunks,
             "lessons": self.lessons,
             "ops": self.ops,
+            "evidence_rejections": self.evidence_rejections,
             "node_bodies": self.node_bodies,
             "stages": {name: metrics.as_dict() for name, metrics in self.stages.items()},
             "retrieval_calls": self.retrieval_calls,
@@ -205,7 +207,7 @@ class EpisodeDistiller:
                 "summarize",
                 render_episode_summary_prompt(turns=text, turn_eligibility=eligible_rows),
             )
-            lesson_rows = _parse_lessons(payload, eligible_chunk)
+            lesson_rows = _parse_lessons(payload, eligible_chunk, rejected=run.evidence_rejections)
         else:
             mapped: list[Lesson] = []
             for index, (text, ids) in enumerate(chunks, 1):
@@ -221,7 +223,7 @@ class EpisodeDistiller:
                         chunk_count=len(chunks),
                     ),
                 )
-                mapped.extend(_parse_lessons(payload, eligible_chunk))
+                mapped.extend(_parse_lessons(payload, eligible_chunk, rejected=run.evidence_rejections))
             eligible_role_rows = [
                 {key: row[key] for key in ("turn", "role", "eligible", "source", "reason") if key in row}
                 for row in turn_evidence
@@ -234,7 +236,7 @@ class EpisodeDistiller:
                     eligible_turns=eligible_role_rows,
                 ),
             )
-            lesson_rows = _parse_lessons(reduced, eligible_text_by_id)
+            lesson_rows = _parse_lessons(reduced, eligible_text_by_id, rejected=run.evidence_rejections)
 
         run.lessons = [lesson.as_dict() for lesson in lesson_rows]
         try:
@@ -720,38 +722,63 @@ def _turn_evidence_records(turns: list[TranscriptTurn]) -> list[dict[str, Any]]:
             row["reason"] = reason
         records.append(row)
     return records
-def _parse_lessons(payload: Any, eligible_evidence: Mapping[str, str]) -> list[Lesson]:
+def _parse_lessons(
+    payload: Any,
+    eligible_evidence: Mapping[str, str],
+    *,
+    rejected: list[dict[str, str]] | None = None,
+) -> list[Lesson]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("lessons"), list):
         raise ValueError("Episode stage response must contain a lessons array")
+    rejected = rejected if rejected is not None else []
     result: list[Lesson] = []
-    for row in payload["lessons"]:
+
+    def reject(topic: str, turn: str, reason: str) -> None:
+        rejected.append({"topic": topic, "turn": turn, "reason": reason})
+
+    for index, row in enumerate(payload["lessons"]):
         if not isinstance(row, Mapping):
-            raise ValueError("Lesson must be a JSON object")
+            reject(f"lesson_{index}", "", "lesson result is not an object")
+            continue
         topic = str(row.get("topic") or "").strip()
         claim = str(row.get("claim") or "").strip()
         raw_turns = row.get("evidence_turns")
         raw_quotes = row.get("evidence_quotes")
         if not topic or not claim or not isinstance(raw_turns, list) or not isinstance(raw_quotes, list):
-            raise ValueError("Lesson requires topic, claim, evidence_turns, and evidence_quotes")
-        turn_ids = list(dict.fromkeys(str(turn).strip() for turn in raw_turns if str(turn).strip()))
-        if any(turn not in eligible_evidence for turn in turn_ids):
-            raise ValueError("Lesson cites a turn outside its supplied eligible-turn set")
+            reject(topic or f"lesson_{index}", "", "lesson requires topic, claim, evidence_turns, and evidence_quotes")
+            continue
+        declared_turns = list(dict.fromkeys(str(turn).strip() for turn in raw_turns if str(turn).strip()))
+        eligible_turns = [turn for turn in declared_turns if turn in eligible_evidence]
+        for turn in declared_turns:
+            if turn not in eligible_evidence:
+                reject(topic, turn, "turn is not an eligible user body or tool result")
+
         quotes: list[EvidenceEntry] = []
         for quote in raw_quotes:
             if not isinstance(quote, Mapping):
-                raise ValueError("Lesson evidence quote must be an object")
+                reject(topic, "", "evidence quote is not an object")
+                continue
             turn = str(quote.get("turn") or "").strip()
             text = str(quote.get("quote") or "").strip()
-            if not turn or turn not in eligible_evidence or not text or len(text) > EVIDENCE_QUOTE_MAX_CHARS:
-                raise ValueError("Lesson evidence quote must cite an eligible turn and be at most 200 characters")
+            if not turn or turn not in eligible_turns:
+                reject(topic, turn, "evidence quote turn is not listed as eligible for this lesson")
+                continue
+            if not text or len(text) > EVIDENCE_QUOTE_MAX_CHARS:
+                reject(topic, turn, "evidence quote is empty or exceeds 200 characters")
+                continue
             quotes.append(EvidenceEntry(turn=turn, quote=text))
+
         verified, unverified = verify_evidence(quotes, turns=eligible_evidence)
-        if not verified or unverified:
-            raise ValueError("Lesson evidence quotes must appear verbatim in eligible source text")
-        quote_turns = list(dict.fromkeys(quote.turn for quote in verified))
-        if not turn_ids or set(turn_ids) != set(quote_turns):
-            raise ValueError("Lesson evidence_turns must exactly match evidence quote turn IDs")
-        result.append(Lesson(topic, claim, turn_ids, verified))
+        for quote in unverified:
+            reject(topic, quote.turn, "evidence quote is not a verbatim substring of eligible source text")
+        verified_turns = list(dict.fromkeys(quote.turn for quote in verified))
+        for turn in eligible_turns:
+            if turn not in verified_turns:
+                reject(topic, turn, "no verified evidence quote for declared turn")
+        if not verified:
+            reject(topic, "", "lesson has no verifiable eligible evidence")
+            continue
+        result.append(Lesson(topic, claim, verified_turns, verified))
     return result
 
 

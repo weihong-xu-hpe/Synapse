@@ -109,11 +109,14 @@ def test_map_prompt_marks_only_contract_eligible_turns() -> None:
     assert "assistant_prose_is_not_evidence" in prompt
     assert "scope membership is checked before allow" in prompt
 
-    with pytest.raises(ValueError, match="outside its supplied eligible-turn set"):
-        _parse_lessons(
-            {"lessons": [{"topic": "scope", "claim": "claim", "evidence_turns": ["T3"], "evidence_quotes": [{"turn": "T3", "quote": "Assistant prose is context, not evidence."}]}]},
-            {"T1": "The selected scope is constrained by membership.", "T4": "scope membership is checked before allow"},
-        )
+    rejected: list[dict[str, str]] = []
+    invalid_turn_lessons = _parse_lessons(
+        {"lessons": [{"topic": "scope", "claim": "claim", "evidence_turns": ["T3"], "evidence_quotes": [{"turn": "T3", "quote": "Assistant prose is context, not evidence."}]}]},
+        {"T1": "The selected scope is constrained by membership.", "T4": "scope membership is checked before allow"},
+        rejected=rejected,
+    )
+    assert invalid_turn_lessons == []
+    assert any(item["turn"] == "T3" and "not an eligible" in item["reason"] for item in rejected)
 
     source = "The selected scope is constrained by membership."
     parsed = _parse_lessons(
@@ -128,18 +131,21 @@ def test_map_prompt_marks_only_contract_eligible_turns() -> None:
         {"T1": source},
     )
     assert parsed[0].evidence_quotes == [EvidenceEntry("T1", "scope is constrained by membership")]
-    with pytest.raises(ValueError, match="appear verbatim"):
-        _parse_lessons(
-            {
-                "lessons": [{
-                    "topic": "scope",
-                    "claim": "unverified",
-                    "evidence_turns": ["T1"],
-                    "evidence_quotes": [{"turn": "T1", "quote": "a fabricated quote"}],
-                }]
-            },
-            {"T1": source},
-        )
+    rejected = []
+    invalid_quote_lessons = _parse_lessons(
+        {
+            "lessons": [{
+                "topic": "scope",
+                "claim": "unverified",
+                "evidence_turns": ["T1"],
+                "evidence_quotes": [{"turn": "T1", "quote": "a fabricated quote"}],
+            }]
+        },
+        {"T1": source},
+        rejected=rejected,
+    )
+    assert invalid_quote_lessons == []
+    assert any("not a verbatim substring" in item["reason"] for item in rejected)
 
 
 def test_integrate_evidence_overflow_splits_batches_without_dropping_excerpts(tmp_path: Path) -> None:

@@ -399,6 +399,13 @@ def _render_episode_pilot_report(runs: list[Any], *, notes: dict[str, str], comp
                 lines.append(f"{index}. **{lesson['topic']}** — {lesson['claim']} (evidence: {', '.join(lesson['evidence_turns'])})")
         else:
             lines.append("No durable lessons.")
+
+        if run.evidence_rejections:
+            lines.extend(["", "### Evidence rejected", ""])
+            for rejection in run.evidence_rejections:
+                lines.append(
+                    f"- {rejection.get('topic', 'lesson')} ({rejection.get('turn', 'no turn')}): {rejection['reason']}"
+                )
         lines.extend(["", "### Stage calls, tokens, and latency", "", "| Stage | Calls | Prompt tokens | Completion tokens | Reasoning tokens | Latency ms |", "|---|---:|---:|---:|---:|---:|"])
         for stage, metrics in run.stages.items():
             data = metrics.as_dict()
