@@ -367,7 +367,7 @@ Small episodes use one summary call. Larger episodes map complete turns into app
 100,000-character chunks, then make one lesson-reduce call to merge duplicates and let later
 corrections replace earlier claims. Map/reduce citations are limited to assertive user bodies and
 eligible tool results; assistant prose remains context only. Integrate retrieves five candidates per
-lesson, includes verbatim eligible evidence excerpts per lesson under a separate 12,000-character
+lesson, includes verbatim eligible evidence excerpts per lesson under a separate 24,000-character
 conservative budget, and splits lesson batches on overflow without dropping excerpts. Retrieved
 node bodies have a separate 24,000-character conservative budget; each call handles at most 12
 lessons. Integrate Takeaways target at most 160 characters (hard limit 200); a takeaway-only

@@ -276,7 +276,7 @@ class EpisodePipelineSettings(BaseModel):
     retrieval_top_k_per_lesson: int = Field(default=5, ge=1)
     retrieval_body_token_budget: int = Field(default=24_000, ge=1)
     # Conservative serialized-character/token proxy; batches split on overflow, evidence is never truncated.
-    evidence_context_token_budget: int = Field(default=12_000, ge=1)
+    evidence_context_token_budget: int = Field(default=24_000, ge=1)
 
 
 class DistillerSettings(BaseModel):
