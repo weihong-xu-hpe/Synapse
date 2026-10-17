@@ -255,6 +255,28 @@ class DreamerSettings(BaseModel):
     thresholds: DreamerThresholdSettings = Field(default_factory=DreamerThresholdSettings)
 
 
+
+class EpisodePipelineSettings(BaseModel):
+    """Dedicated LLM and bounded retrieval settings for episode distillation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: DeciderEndpointSettings = Field(
+        default_factory=lambda: DeciderEndpointSettings(
+            base_url="http://127.0.0.1:47870/v1",
+            model="gpt-6-luna",
+            extra_body={"reasoning_effort": "medium"},
+        )
+    )
+    timeout_seconds: int = Field(default=300, ge=1)
+    max_tokens: int = Field(default=200_000, ge=1)
+    temperature: float = 0.0
+    chunk_chars: int = Field(default=100_000, ge=1_000)
+    integrate_lessons_per_call: int = Field(default=12, ge=1)
+    retrieval_top_k_per_lesson: int = Field(default=5, ge=1)
+    retrieval_body_token_budget: int = Field(default=24_000, ge=1)
+
+
 class DistillerSettings(BaseModel):
     """Session-distiller configuration (spec: docs/okf.md)."""
 
@@ -285,6 +307,7 @@ class DistillerSettings(BaseModel):
     # persistent node is downgraded to complement (backfill safety; default ON
     # for backfill/CLI --apply over legacy groups, OFF for the live sweep).
     downgrade_supersede: bool = True
+    episode: EpisodePipelineSettings = Field(default_factory=EpisodePipelineSettings)
     # Rejection timeline flag (NOT active in this change): when true, fatal
     # okf_* codes reject persistent writes instead of warning. Default off.
     enforce_okf: bool = False

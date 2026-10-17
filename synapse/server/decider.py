@@ -47,6 +47,7 @@ class LocalLLMDecider:
 
     def __init__(self, settings: DeciderSettings, *, client: httpx.Client | None = None) -> None:
         self.settings = settings
+        self._owns_client = client is None
         self._client = client or httpx.Client(timeout=settings.timeout_seconds)
         endpoints: dict[tuple[str, str, str, str], tuple[str, str, str, dict[str, Any]]] = {}
         for endpoint in settings.endpoints:
@@ -64,6 +65,10 @@ class LocalLLMDecider:
         self._call_context: ContextVar[dict[str, Any] | None] = ContextVar(
             f"synapse_llm_call_context_{id(self)}", default=None
         )
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
 
     def sample_json(
         self,
@@ -104,6 +109,7 @@ class LocalLLMDecider:
             "stage": stage,
             "timeout_seconds": timeout_seconds,
             "endpoints": {},
+            "usage": {"available": False, "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},
         }
         token = self._call_context.set(context)
         try:
@@ -222,6 +228,22 @@ class LocalLLMDecider:
         stats["latency_total_ms"] += elapsed_ms
         stats["latency_max_ms"] = max(stats["latency_max_ms"], elapsed_ms)
 
+    @staticmethod
+    def _record_usage(raw_usage: Any, context: dict[str, Any] | None) -> None:
+        if context is None or not isinstance(raw_usage, dict):
+            return
+        prompt = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens", 0))
+        completion = raw_usage.get("completion_tokens", raw_usage.get("output_tokens", 0))
+        details = raw_usage.get("completion_tokens_details")
+        reasoning = raw_usage.get("reasoning_tokens", 0)
+        if isinstance(details, dict):
+            reasoning = details.get("reasoning_tokens", reasoning)
+        usage = context["usage"]
+        usage["available"] = True
+        usage["prompt_tokens"] += int(prompt or 0)
+        usage["completion_tokens"] += int(completion or 0)
+        usage["reasoning_tokens"] += int(reasoning or 0)
+
     def _complete(
         self,
         *,
@@ -258,6 +280,7 @@ class LocalLLMDecider:
                             timeout_seconds=timeout_seconds,
                             extra_body=extra_body,
                         )
+                        self._record_usage(response_payload.get("usage"), call_context)
                         parsing_response = True
                         result = parser(response_payload)
                     except Exception as exc:

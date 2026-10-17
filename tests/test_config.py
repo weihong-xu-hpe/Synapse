@@ -43,6 +43,12 @@ archive_path = "./.synapse/.archive"
     assert config.decider.temperature == 0.0
     assert config.distiller.max_concurrency == 30
     assert config.distiller.transcript_concurrency == 4
+    assert config.distiller.episode.endpoint.model == "gpt-6-luna"
+    assert config.distiller.episode.endpoint.extra_body == {"reasoning_effort": "medium"}
+    assert config.distiller.episode.max_tokens == 200_000
+    assert config.distiller.episode.chunk_chars == 100_000
+    assert config.distiller.episode.integrate_lessons_per_call == 12
+    assert config.distiller.episode.retrieval_top_k_per_lesson == 5
     assert config.distiller.max_transcripts_per_run == 500
     assert config.dreamer.enabled is True
     assert config.dreamer.interval_hours == 12
