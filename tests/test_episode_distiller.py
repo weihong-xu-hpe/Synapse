@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from synapse.config import SynapseConfig
-from synapse.lifecycle.episode_distiller import EpisodeDistiller, EpisodeOp, EpisodeRun, Lesson, _parse_lessons, _turn_evidence_records, build_episode_chunks
+from synapse.lifecycle.episode_distiller import EpisodeDistiller, EpisodeOp, EpisodeRun, Lesson, _parse_lessons, _parse_ops, _turn_evidence_records, build_episode_chunks
 from synapse.models import Node, NodeMetadata, NodeType
 from synapse.okf import EvidenceEntry
 from synapse.okf.episode import render_episode_map_prompt
@@ -196,6 +196,23 @@ def test_unknown_update_target_is_quarantined(tmp_path: Path) -> None:
         assert record["target_node_ids"] == [op.target_id]
         assert record["failure_reason"] == f"Unknown or inactive update target: {op.target_id}"
         assert record["evidence"] == [{"turn": "T1", "quote": "The cache key remains stable for retried writes."}]
+    finally:
+        runner.close()
+
+def test_malformed_integrate_operation_is_quarantined(tmp_path: Path) -> None:
+    config, paths, transcript = _setup(tmp_path)
+    runner = _runner(config, paths, FakeClient())
+    op = _parse_ops({"ops": [None]}, lesson_count=1)[0]
+    run = EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-invalid-op", 0, 0, 1)
+    try:
+        result = runner._apply_op(
+            transcript, [], op, run, allowed_target_ids=set(), allowed_evidence_turns=set()
+        )
+        assert result["action"] == "quarantined"
+        quarantine = list((paths.base / ".distiller-quarantine").glob("*.jsonl"))
+        record = json.loads(quarantine[0].read_text(encoding="utf-8").splitlines()[0])
+        assert record["failure_reason"] == "Integrate operation 0 must be a JSON object"
+        assert record["evidence"] == []
     finally:
         runner.close()
 

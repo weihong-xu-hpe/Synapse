@@ -513,6 +513,8 @@ class EpisodeDistiller:
     ) -> dict[str, Any]:
         if op.action == "none":
             return {"action": "none", "reason": op.reason, "lesson_index": op.lesson_index}
+        if op.action == "invalid":
+            return self._quarantine(transcript, op, op.reason or "Malformed Integrate operation", run)
         if not op.title or not slugify_english_title(op.title):
             return self._quarantine(transcript, op, "Operation title must be an English knowledge title", run)
         if op.okf_type not in TYPE_REQUIRED_SECTIONS:
@@ -736,12 +738,13 @@ def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("ops"), list):
         raise ValueError("Integrate response must contain an ops array")
     result: list[EpisodeOp] = []
-    for row in payload["ops"]:
+    for op_index, row in enumerate(payload["ops"]):
         if not isinstance(row, Mapping):
-            raise ValueError("Integrate operation must be an object")
+            result.append(EpisodeOp(action="invalid", reason=f"Integrate operation {op_index} must be a JSON object"))
+            continue
         action = str(row.get("action") or "").strip().lower()
-        index = row.get("lesson_index")
-        lesson_index = int(index) if isinstance(index, int) and not isinstance(index, bool) else None
+        raw_lesson_index = row.get("lesson_index")
+        lesson_index = int(raw_lesson_index) if isinstance(raw_lesson_index, int) and not isinstance(raw_lesson_index, bool) else None
         if lesson_index is not None and not 0 <= lesson_index < lesson_count:
             raise ValueError("Integrate operation lesson_index is outside this batch")
         if action == "none":
