@@ -109,7 +109,7 @@ class SynapseMCPServer:
                         "rationale, procedures, pitfalls): set type=persistent, follow the OKF template "
                         "(docs/okf.md) — okf_type decision|fact|procedure|pitfall, fixed English ## sections "
                         "(e.g. Symptom/Cause/Fix for pitfalls), a single-line ## Takeaway (<=200 chars), ## Sources "
-                        "listing where the knowledge came from, and an ENGLISH title (<= 90 chars, specific claim, "
+                        "listing where the knowledge came from, and an ENGLISH title (specific claim, "
                         "no type prefix). Omitting ``type`` defaults to persistent when the body already carries "
                         "OKF structure (okf_type or matching ## sections) and transient otherwise; persistent "
                         "writes without okf_type are auto-normalized (original text preserved under "

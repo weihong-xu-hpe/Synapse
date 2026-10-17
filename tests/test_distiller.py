@@ -1330,8 +1330,8 @@ def test_validator_title_rules() -> None:
     cjk = validate_okf_node(**base, title="会话蒸馏在服务端进行")
     assert any(w.code == "okf_title_non_english" for w in cjk)
 
-    long = validate_okf_node(**base, title="x" * 91)
-    assert any(w.code == "okf_title_too_long" for w in long)
+    long = validate_okf_node(**base, title="x" * 120)
+    assert not any(w.code.startswith("okf_title") for w in long)
 
     prefix = validate_okf_node(**base, title="Procedure: run the dedupe tool")
     assert any(w.code == "okf_title_type_prefix" for w in prefix)
@@ -3651,20 +3651,12 @@ def test_concurrent_merges_recheck_target_after_outside_lock_preparation(tmp_pat
         distiller.close()
 
 
-@pytest.mark.parametrize("repair_succeeds", [True, False])
-def test_final_gate_repairs_overlong_title_or_quarantines(tmp_path: Path, monkeypatch, repair_succeeds: bool) -> None:
-    long_title = "AuthZ V2 role assignment pagination uses one consistent stable email cursor across every workspace requested"
-    short_title = "AuthZ role pagination uses a stable email cursor"
-    body = (
-        "## Takeaway\nUse one stable email cursor.\n\n"
-        "## Symptom\nPages can repeat or skip users.\n\n"
-        "## Cause\nThe page ordering changes between requests.\n\n"
-        "## Fix\nRetain the same email cursor.\n\n"
-        "## Sources\n- mem_session_long_title"
-    )
+def test_distiller_persists_120_char_title_without_repair_or_quarantine(tmp_path: Path) -> None:
+    long_title = ("Long English title with useful identifiers " * 4)[:120]
+    assert len(long_title) == 120
 
-    class FinalTitleClient:
-        name = "final-title-repair"
+    class LongTitleClient:
+        name = "long-title-distiller"
 
         def __init__(self) -> None:
             self.repairs = 0
@@ -3672,41 +3664,44 @@ def test_final_gate_repairs_overlong_title_or_quarantines(tmp_path: Path, monkey
         def sample_json(self, *, prompt: str, **_kwargs):
             if "Repair this persistent OKF body" in prompt:
                 self.repairs += 1
-                return {"title": short_title if repair_succeeds else long_title, "content": body}
-            return {"items": [dict(_PITFALL_ITEM, title=long_title, takeaway="Use one stable email cursor.")]}
+                return {
+                    "title": long_title,
+                    "content": (
+                        "## Takeaway\nLong titles are allowed.\n\n"
+                        "## Symptom\nA useful title can carry several supported identifiers.\n\n"
+                        "## Cause\nThe title carries several supported identifiers.\n\n"
+                        "## Fix\nPersist the title without shortening or rejecting it.\n\n"
+                        "## Sources\n- mem_session_long_title"
+                    ),
+                }
+            return {"items": [dict(_PITFALL_ITEM, title=long_title)]}
 
         def decide_memory_write(self, _request):
             from synapse.server.sampling import MemoryWriteSamplingDecision
+
             return MemoryWriteSamplingDecision(action="create", target_node_ids=(), reasoning="new", confidence=0.9)
 
-    client = FinalTitleClient()
+    client = LongTitleClient()
     config = _config(tmp_path)
     paths = _runtime(tmp_path)
     distiller = Distiller(config, runtime_paths=paths, sampling_client=client)
-    # Exercise the final persisted-body gate rather than the earlier CJK/slug repair.
-    monkeypatch.setattr(distiller, "_title_needs_repair", lambda _title: False)
-    import synapse.server.write_normalize as write_normalize_module
-    monkeypatch.setattr(write_normalize_module, "title_needs_repair", lambda _title: False)
     transcript = _write_transcript(
         paths,
         "mem_session_long_title",
-        "## User\nThe endpoint uses a stable email cursor.\n\n## Assistant\nRecorded.",
-        session_key="final-title-repair",
+        "## User\nA stable, reusable lesson supports the long title.\n\n## Assistant\nRecorded.",
+        session_key="long-title",
     )
     old_ts = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
     os.utime(paths.active / f"{transcript.id}.md", (old_ts, old_ts))
     try:
         report = distiller.run(downgrade_supersede=False)
-        assert client.repairs == 1
         active = distiller._get_store().list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
-        if repair_succeeds:
-            assert any(node.title == short_title for node in active)
-            assert report.items_quarantined == 0
-        else:
-            assert report.items_quarantined == 1
-            assert not any(node.title == long_title for node in active)
-            quarantine = next((paths.base / ".distiller-quarantine").glob("*.jsonl"))
-            record = json.loads(quarantine.read_text(encoding="utf-8").splitlines()[0])
-            assert "okf_title_too_long" in {finding["code"] for finding in record["validator_findings"]}
+        stored = [node for node in active if node.title == long_title]
+        assert report.transcripts_distilled == 1
+        assert report.items_quarantined == 0
+        assert client.repairs == 0
+        assert len(stored) == 1
+        assert len(stored[0].title) == 120
+        assert not (paths.base / ".distiller-quarantine").exists()
     finally:
         distiller.close()

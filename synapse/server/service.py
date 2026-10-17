@@ -1604,7 +1604,6 @@ class SynapseServerService:
                 finding
                 for finding in items
                 if finding.code == "okf_takeaway_invalid"
-                or finding.code == "okf_title_too_long"
                 or finding.code.startswith("okf_missing_section:")
                 or finding.code.startswith("okf_duplicate_section:")
             ]
@@ -1618,8 +1617,7 @@ class SynapseServerService:
                 "You may also correct `okf_type` to one of `decision`, `fact`, `procedure`, or `pitfall`; if changed, make the body conform to that type. "
                 "There must be exactly one non-empty `## Takeaway` line of at most 200 characters. "
                 "Each required heading must occur exactly once and have a non-empty body. "
-                "Preserve every supported fact, number, path, model identifier, source, and evidence quote; "
-                "shorten any title over 90 characters without changing its meaning; do not add claims. Required headings: "
+                "Preserve every supported fact, number, path, model identifier, source, and evidence quote; do not add claims. Required headings: "
                 + ", ".join(f"## {heading}" for heading in required_headings)
                 + ".\n\n"
                 + json.dumps(
@@ -1658,13 +1656,6 @@ class SynapseServerService:
             if not isinstance(repaired_title, str) or not repaired_title.strip():
                 repaired_title = title
             repaired_content = repaired.get("content") if isinstance(repaired, dict) else None
-            if any(f.code == "okf_title_too_long" for f in errors) and repaired_title == title:
-                raise SynapseServiceError(
-                    "INVALID_OKF_FINAL_BODY",
-                    "Final distilled OKF title remained too long after repair",
-                    status_code=422,
-                    details={"warnings": [finding.as_dict() for finding in errors], "final_content": linked_content},
-                )
             if not isinstance(repaired_content, str) or not repaired_content.strip():
                 raise SynapseServiceError(
                     "INVALID_OKF_FINAL_BODY",

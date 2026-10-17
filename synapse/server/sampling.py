@@ -309,7 +309,7 @@ def build_synthesis_prompt(cluster: tuple[Node, ...]) -> str:
             "The typed knowledge nodes below cluster around one project/topic (high embedding similarity).",
             "Write ONE hub node that summarizes what these nodes collectively establish.",
             "Rules:",
-            "1. title: ENGLISH, <= 90 chars, a specific claim or noun phrase; no 'Summary:'/'Hub:' prefix, no date.",
+            "1. title: ENGLISH, a specific claim or noun phrase; no 'Summary:'/'Hub:' prefix, no date.",
             "2. okf_type must be \"fact\"; body must follow the fact template exactly:",
             "   '## Takeaway' (single line, <= 200 chars), '## Details' (what the members collectively establish),",
             "   '## Sources' (one '- <member node id>' line per member, verbatim ids from the list).",

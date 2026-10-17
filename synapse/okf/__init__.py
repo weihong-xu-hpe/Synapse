@@ -246,7 +246,7 @@ def _validate_universal_sections(content: str, *, sections: dict[str, str] | Non
 
 
 def _validate_title(title: str | None) -> list[OkfWarning]:
-    """Title rule (docs/okf.md §3): English, <= 90 chars, no type prefixes.
+    """Title rule (docs/okf.md §3): English, no type prefixes.
 
     Body/Takeaway keep the source language; only the title must be English so
     IDs stay meaningful and cross-session recall is consistent.
@@ -258,8 +258,6 @@ def _validate_title(title: str | None) -> list[OkfWarning]:
     title_text = str(title).strip()
     if any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in title_text):
         warnings.append(OkfWarning("okf_title_non_english", f"Title must be English (found CJK): {title_text[:60]!r}"))
-    if len(title_text) > 90:
-        warnings.append(OkfWarning("okf_title_too_long", f"Title exceeds 90 chars ({len(title_text)})."))
     for prefix in ("procedure:", "decision:", "fact:", "pitfall:", "note:", "summary:"):
         if title_text.casefold().startswith(prefix):
             warnings.append(
@@ -282,7 +280,7 @@ def validate_okf_node(
     Only warnings are produced here (transition period); the caller decides
     whether any code is fatal. Bilingual bodies never fire warnings — only
     fixed English headings are checked. ``title`` enables the title rules
-    (English, <= 90 chars, no type prefixes).
+    (English and no type prefixes).
     """
 
     warnings: list[OkfWarning] = []
@@ -452,8 +450,8 @@ def render_title_repair_prompt(*, title: str, takeaway: str, body_excerpt: str) 
     return "\n".join(
         [
             "The following knowledge item has an invalid title (not English, or a degenerate ID slug).",
-            "Write an ENGLISH title (<= 90 chars): a specific claim or noun phrase carrying the key",
-            "identifiers (service/component/error/file). No type prefix, no date unless date-bound.",
+            "Write an ENGLISH title: a specific claim or noun phrase carrying the key identifiers "
+            "(service/component/error/file). No type prefix, no date unless date-bound.",
             "Do not translate the body — only the title changes.",
             "",
             f"Original title: {title}",
@@ -473,7 +471,7 @@ def parse_title_repair(payload: object) -> str | None:
     if not isinstance(payload, Mapping):
         return None
     title = str(payload.get("title") or "").strip()
-    if not title or len(title) > 90:
+    if not title:
         return None
     if any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in title):
         return None
@@ -522,8 +520,8 @@ def render_distiller_prompt(
             *type_rules,
             "Every item must have a single-line '## Takeaway' (<= 200 chars) and a '## Sources' section listing",
             "where the knowledge came from (a transcript/session reference or URI).",
-            "The item TITLE must be in ENGLISH (<= 90 chars): a specific claim or noun phrase carrying the key",
-            "identifiers (service/component/error/file). Do NOT prefix titles with the type (no 'Procedure:',",
+            "The item TITLE must be in ENGLISH: a specific claim or noun phrase carrying the key identifiers "
+            "(service/component/error/file). Do NOT prefix titles with the type (no 'Procedure:',",
             "'Decision:' etc) and no dates unless the knowledge is date-bound. Body/Takeaway keep the source language.",
             "",
             "EVIDENCE (required per item): cite where the knowledge came from as",
@@ -582,9 +580,8 @@ def render_reduce_prompt(
             "   (same okf_type and shape, sections divided accordingly).",
             "3. Return EVERY other item unchanged — do not drop, summarize, compress, or rephrase.",
             "   There is NO item-count limit.",
-            "4. Preserve each item's shape exactly: okf_type, English title (<= 90 chars), single-line",
-            "   takeaway (<= 200 chars), sections, sources, and the evidence array (merge evidence",
-            "   lists when merging items). Do not invent new items and do not drop evidence entries.",
+            "4. Preserve each item's shape exactly: okf_type, English title, single-line takeaway (<= 200 chars),"
+            "   sections, sources, and the evidence array (merge evidence lists when merging items). Do not invent new items and do not drop evidence entries.",
             "5. Drop an item entirely ONLY if it is already covered by these known knowledge nodes:",
             known_block,
             "",

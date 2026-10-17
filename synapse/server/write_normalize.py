@@ -104,11 +104,9 @@ def infer_okf_type(content: str) -> str | None:
 
 
 def title_needs_repair(title: str) -> bool:
-    """CJK title or a degenerate/over-long one (same rule as the distiller)."""
+    """CJK title or degenerate title slug (same rule as the distiller)."""
 
-    if any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in title):
-        return True
-    return len(title) > 90
+    return any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in title)
 
 
 @dataclass(slots=True)
@@ -144,8 +142,8 @@ OKF templates (pick one okf_type):
 Every item must have a single-line '## Takeaway' (<= 200 chars) and a '## Sources'
 section listing where the knowledge came from (use "agent:note" when the note has
 no identifiable source).
-The item TITLE must be in ENGLISH (<= 90 chars): a specific claim or noun phrase
-carrying the key identifiers (service/component/error/file). No type prefix.
+The item TITLE must be in ENGLISH: a specific claim or noun phrase carrying the key
+identifiers (service/component/error/file). No type prefix.
 Body/Takeaway keep the note's source language; section headings are the fixed
 English strings above. Put anything you could not restructure into the 'Details'
 section (for okf_type "fact") rather than dropping it.

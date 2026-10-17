@@ -265,15 +265,15 @@ def test_distiller_final_repair_can_change_okf_type(tmp_path: Path) -> None:
     config = load_config(write_config(tmp_path))
     runtime_paths = bootstrap_runtime_directories(config)
 
+    long_title = "Final OKF repair keeps the full long title while correcting the node type and supported identifiers"
+
     class TypeRepairClient:
         name = "type-repair-test"
 
         def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, **_kwargs):
-            if "invalid title" in prompt.casefold() or "english title" in prompt.casefold():
-                return {"title": "Procedure preserves the required steps"}
             assert "You may also correct `okf_type`" in prompt
             return {
-                "title": "Procedure preserves the required steps",
+                "title": long_title,
                 "okf_type": "procedure",
                 "content": (
                     "## Takeaway\nKeep the final persisted body valid.\n\n"
@@ -289,7 +289,7 @@ def test_distiller_final_repair_can_change_okf_type(tmp_path: Path) -> None:
 
     service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=TypeRepairClient())
     result = service.write_memory(
-        title="Final OKF repair can correct the type and should shorten an overlong title with supported identifiers and details",
+        title=long_title,
         content="## Takeaway\nKeep the final persisted body valid.\n\n## Steps\n1. Apply the supported procedure.\n\n## Sources\n- mem_session_type_repair",
         node_type=NodeType.PERSISTENT,
         okf_type="fact",
@@ -301,7 +301,8 @@ def test_distiller_final_repair_can_change_okf_type(tmp_path: Path) -> None:
         node = store.get_node(node_payload["id"])
     assert node is not None
     assert node.metadata.okf_type == "procedure"
-    assert len(node.title) <= 90
+    assert node.title == long_title
+    assert len(node.title) > 90
     assert not validate_okf_node(
         node_type="persistent",
         content=node.content,

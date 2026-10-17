@@ -1155,8 +1155,6 @@ class Distiller:
 
         if any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in title):
             return True
-        if len(title) > 90:
-            return True
         return not slugify_english_title(title)
 
     def _repair_title(self, item: OkfItem) -> str | None:

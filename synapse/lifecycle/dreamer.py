@@ -499,7 +499,7 @@ class Dreamer:
     def _write_hub_node(self, title: str, takeaway: str, details: str, member_ids: set[str]) -> Node | None:
         from synapse.models import slugify_english_title
 
-        if not slugify_english_title(title) or len(title) > 90:
+        if not slugify_english_title(title):
             return None
         now = self._utc_now()
         hub_id = generate_node_id(title, now)

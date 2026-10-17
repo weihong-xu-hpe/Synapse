@@ -210,7 +210,6 @@ warnings; later: codes marked ⛔ reject):
 | `okf_heading_case` | required heading present but case/format deviates (auto-fixable) |
 | `okf_untyped` | persistent node with zero `##` sections (successor of `low_structure`) |
 | `okf_title_non_english` | title contains CJK (titles must be English; bodies stay bilingual) |
-| `okf_title_too_long` | title exceeds 90 chars |
 | `okf_title_type_prefix` | title starts with a type prefix like "Procedure:" |
 
 Rules are checked in order; a node conforming for its type produces zero warnings. Bilingual bodies
@@ -219,11 +218,8 @@ never fire warnings — only headings are checked (fixed English strings `## Tak
 `## Sources`).
 
 Non-distiller writes retain warning-only transition behavior. Distiller writes validate the
-final persisted body after link/merge construction and attempt one repair for structural errors
-or a title longer than 90 characters. The repair may return a shortened title, corrected body,
-and an optional valid `okf_type` change; the corrected body is revalidated against the final type
-before persistence.
-If it returns an empty or still-invalid body/title, the item is skipped and appended with its final
+final persisted body after link/merge construction and attempt one repair for structural errors.
+If repair returns an empty or still-invalid body, the item is skipped and appended with its final
 candidate, findings, action/targets, and sources to
 `~/synapse/.distiller-quarantine/YYYYMMDD.jsonl`; remaining items continue. The transcript is
 stamped after all non-quarantined items finish. Endpoint/transport failures are not quarantined
@@ -233,17 +229,15 @@ and leave the transcript retryable. Recorded warning codes are recomputed from t
 
 ### Title rule (knowledge nodes)
 
-- **English, ≤ 90 chars**: a specific claim or noun phrase carrying the key identifiers
-  (service/component/error/file). Body and Takeaway keep the source language — only the title
-  is English, so IDs stay meaningful and cross-session recall is consistent.
+- Titles must be non-empty English titles: specific claims or noun phrases carrying useful
+  identifiers (service/component/error/file). There is no title-length limit. Body and Takeaway
+  keep the source language.
 - No type prefixes ("Procedure:", "Decision:" …) — `okf_type` carries the type. No dates unless
   the knowledge is date-bound.
-- Validator warnings: `okf_title_non_english` (any CJK), `okf_title_too_long` (> 90),
-  `okf_title_type_prefix`.
+- Validator warnings: `okf_title_non_english` (any CJK), `okf_title_type_prefix`.
 - Agent writes (MCP/REST): warnings only — no auto-translation, no rejection.
-- Distiller: the prompt requires English titles; a CJK/degenerate title gets one short English-title
-  repair before decision sampling. The final persistence gate independently repairs a title over 90
-  chars together with any structural body error; if that repair still fails, the item is quarantined.
+- Distiller: a CJK/degenerate title gets one short English-title repair before decision sampling.
+  The persistence gate does not repair or reject titles based on length.
   Counters: `title_repairs` / `title_repair_failures` track the initial English-title repair.
 
 ### ID plan (knowledge nodes)
