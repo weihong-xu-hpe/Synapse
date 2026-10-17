@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -14,15 +15,18 @@ from synapse.models import Node, NodeStatus, NodeType, generate_node_id, slugify
 from synapse.okf import (
     EvidenceEntry,
     TYPE_REQUIRED_SECTIONS,
+    TAKEAWAY_MAX_CHARS,
     OkfItem,
     render_evidence_section,
     verify_evidence,
+    validate_okf_node,
 )
 from synapse.okf.episode import (
     render_episode_integrate_prompt,
     render_episode_lesson_reduce_prompt,
     render_episode_map_prompt,
     render_episode_summary_prompt,
+    render_episode_takeaway_repair_prompt,
 )
 from synapse.okf.transcript_format import TranscriptTurn, parse_transcript
 from synapse.okf.transcripts import is_session_transcript
@@ -181,36 +185,49 @@ class EpisodeDistiller:
             turns=len(pending),
             chunks=len(chunks),
         )
+        turn_evidence = _turn_evidence_records(pending)
+        eligible_by_id = {row["turn"]: row for row in turn_evidence}
         lesson_rows: list[Lesson] = []
         if len(chunks) == 1:
             text, ids = chunks[0]
+            eligible_rows = [eligible_by_id[turn_id] for turn_id in ids]
+            eligible_ids = {row["turn"] for row in eligible_rows if row["eligible"]}
             payload = self._call(
                 run,
                 "summarize",
-                render_episode_summary_prompt(turns=text, turn_ids=ids),
+                render_episode_summary_prompt(turns=text, turn_eligibility=eligible_rows),
             )
-            lesson_rows = _parse_lessons(payload, set(ids))
+            lesson_rows = _parse_lessons(payload, eligible_ids)
         else:
             mapped: list[Lesson] = []
             for index, (text, ids) in enumerate(chunks, 1):
+                eligible_rows = [eligible_by_id[turn_id] for turn_id in ids]
+                eligible_ids = {row["turn"] for row in eligible_rows if row["eligible"]}
                 payload = self._call(
                     run,
                     "map",
                     render_episode_map_prompt(
                         turns=text,
-                        turn_ids=ids,
+                        turn_eligibility=eligible_rows,
                         chunk_index=index,
                         chunk_count=len(chunks),
                     ),
                 )
-                mapped.extend(_parse_lessons(payload, set(ids)))
+                mapped.extend(_parse_lessons(payload, eligible_ids))
+            eligible_role_rows = [
+                {key: row[key] for key in ("turn", "role", "eligible", "source", "reason") if key in row}
+                for row in turn_evidence
+            ]
             reduced = self._call(
                 run,
                 "lesson_reduce",
-                render_episode_lesson_reduce_prompt(chunk_lessons=[lesson.as_dict() for lesson in mapped]),
+                render_episode_lesson_reduce_prompt(
+                    chunk_lessons=[lesson.as_dict() for lesson in mapped],
+                    eligible_turns=eligible_role_rows,
+                ),
             )
-            all_turn_ids = {turn.id for turn in pending}
-            lesson_rows = _parse_lessons(reduced, all_turn_ids)
+            all_eligible_turn_ids = {row["turn"] for row in turn_evidence if row["eligible"]}
+            lesson_rows = _parse_lessons(reduced, all_eligible_turn_ids)
 
         run.lessons = [lesson.as_dict() for lesson in lesson_rows]
         try:
@@ -315,8 +332,7 @@ class EpisodeDistiller:
         try:
             prior_nodes = self._same_session_nodes(transcript)
             with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as retrieval:
-                for offset in range(0, len(lessons), self.settings.integrate_lessons_per_call):
-                    batch = lessons[offset : offset + self.settings.integrate_lessons_per_call]
+                for batch in self._integrate_lesson_batches(turns, lessons):
                     candidates = self._retrieve_for_lessons(retrieval, batch, run)
                     evidence_context = self._evidence_context(turns, batch)
                     payload = self._call(
@@ -347,6 +363,31 @@ class EpisodeDistiller:
                                 run.node_bodies.append({"node_id": node.id, "title": node.title, "content": node.content})
         finally:
             self.service.reset_sampling_client(helper_token)
+
+    def _integrate_lesson_batches(
+        self, turns: list[TranscriptTurn], lessons: list[Lesson]
+    ) -> list[list[Lesson]]:
+        batches: list[list[Lesson]] = []
+        current: list[Lesson] = []
+        for lesson in lessons:
+            candidate = [*current, lesson]
+            excerpt_size = len(json.dumps(self._evidence_context(turns, candidate), ensure_ascii=False))
+            if current and (
+                len(candidate) > self.settings.integrate_lessons_per_call
+                or excerpt_size > self.settings.evidence_context_token_budget
+            ):
+                batches.append(current)
+                current = []
+                excerpt_size = len(json.dumps(self._evidence_context(turns, [lesson]), ensure_ascii=False))
+            if excerpt_size > self.settings.evidence_context_token_budget:
+                raise ValueError(
+                    f"Evidence excerpts for one lesson require {excerpt_size} tokens by conservative estimate; "
+                    f"budget is {self.settings.evidence_context_token_budget}; refusing to drop evidence"
+                )
+            current.append(lesson)
+        if current:
+            batches.append(current)
+        return batches
 
     def _same_session_nodes(self, transcript: Node) -> list[dict[str, Any]]:
         ids = transcript.metadata.distilled_node_ids
@@ -398,21 +439,67 @@ class EpisodeDistiller:
         return output
 
     @staticmethod
-    def _evidence_context(turns: list[TranscriptTurn], lessons: list[Lesson]) -> dict[str, str]:
-        eligible_ids = {turn_id for lesson in lessons for turn_id in lesson.evidence_turns}
-        result: dict[str, str] = {}
-        for turn in turns:
-            if turn.id not in eligible_ids:
-                continue
-            if turn.role == "User":
-                text, question_only = Distiller._user_turn_evidence(turn.body)
-                if question_only:
-                    continue
-            else:
-                text = turn.eligible_evidence_text()
-            if text:
-                result[turn.id] = text
+    def _evidence_context(turns: list[TranscriptTurn], lessons: list[Lesson]) -> list[dict[str, Any]]:
+        eligible_by_id = {
+            row["turn"]: row
+            for row in _turn_evidence_records(turns)
+            if row["eligible"]
+        }
+        result: list[dict[str, Any]] = []
+        for index, lesson in enumerate(lessons):
+            excerpts: list[dict[str, str]] = []
+            for turn_id in lesson.evidence_turns:
+                row = eligible_by_id.get(turn_id)
+                if row is None:
+                    raise ValueError(f"Lesson cites ineligible or unavailable evidence turn {turn_id}")
+                excerpts.append(
+                    {
+                        "turn": turn_id,
+                        "role": row["role"],
+                        "source": row["source"],
+                        "text": row["text"],
+                    }
+                )
+            result.append(
+                {
+                    "lesson_index": index,
+                    "topic": lesson.topic,
+                    "claim": lesson.claim,
+                    "evidence": excerpts,
+                }
+            )
         return result
+
+    def _repair_takeaway_only(
+        self,
+        op: EpisodeOp,
+        content: str,
+        sources: list[str],
+        run: EpisodeRun,
+    ) -> tuple[str, str | None]:
+        findings = validate_okf_node(
+            node_type="persistent",
+            content=content,
+            okf_type=op.okf_type,
+            sources=sources,
+            title=op.title,
+        )
+        if len(findings) != 1 or findings[0].code != "okf_takeaway_invalid":
+            return content, None
+        original = _takeaway_section(content)
+        payload = self._call(
+            run,
+            "takeaway_repair",
+            render_episode_takeaway_repair_prompt(
+                title=op.title,
+                okf_type=op.okf_type,
+                takeaway=original,
+            ),
+        )
+        takeaway = payload.get("takeaway") if isinstance(payload, Mapping) else None
+        if not isinstance(takeaway, str) or not _valid_takeaway(takeaway, hard_limit=TAKEAWAY_MAX_CHARS):
+            return content, "Takeaway-only repair did not return one non-empty line within the 200-character limit"
+        return _replace_takeaway(content, takeaway.strip()), None
 
     def _apply_op(
         self,
@@ -448,7 +535,7 @@ class EpisodeDistiller:
                 if is_question:
                     question_only.add(turn.id)
             else:
-                text = turn.eligible_evidence_text(okf_type=op.okf_type)
+                text = turn.eligible_evidence_text()
             evidence_turns[turn.id] = text
         verified, _unverified = verify_evidence(evidence, turns=evidence_turns, question_only_turns=question_only)
         if not verified:
@@ -464,6 +551,24 @@ class EpisodeDistiller:
                 return self._quarantine(transcript, op, f"Unknown or inactive update target: {op.target_id}", run)
             sources = list(dict.fromkeys([*target.metadata.sources, transcript.id]))
         final_content = _with_provenance(op.content, sources, verified)
+        final_content, repair_error = self._repair_takeaway_only(op, final_content, sources, run)
+        if repair_error:
+            warnings = validate_okf_node(
+                node_type="persistent",
+                content=final_content,
+                okf_type=op.okf_type,
+                sources=sources,
+                title=op.title,
+            )
+            error = SynapseServiceError(
+                "INVALID_OKF_FINAL_BODY",
+                repair_error,
+                status_code=422,
+                details={"warnings": [finding.as_dict() for finding in warnings], "final_content": final_content},
+            )
+            return self._quarantine(
+                transcript, op, repair_error, run, error=error, content=final_content, target_id=op.target_id
+            )
         try:
             if op.action == "update":
                 payload = self._commit_call(
@@ -537,6 +642,7 @@ class EpisodeDistiller:
                 "target_node_ids": [target_id or op.target_id] if (target_id or op.target_id) else [],
                 "candidate_content": body,
                 "merge_update_target": target_id or op.target_id,
+                "failure_reason": reason,
             },
         )
         return {"action": "quarantined", "title": op.title, "target_id": target_id or op.target_id, "reason": reason}
@@ -584,6 +690,27 @@ def _render_turn(turn: TranscriptTurn) -> str:
     return "\n".join(lines)
 
 
+
+def _turn_evidence_records(turns: list[TranscriptTurn]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for turn in turns:
+        if turn.role == "User":
+            text, question_only = Distiller._user_turn_evidence(turn.body)
+            eligible = bool(text) and not question_only
+            source = "user_body"
+            reason = "question_only_user_turn" if question_only else "empty_user_turn"
+        else:
+            text = turn.eligible_evidence_text()
+            eligible = bool(text)
+            source = "tool_result"
+            reason = "assistant_prose_is_not_evidence"
+        row: dict[str, Any] = {"turn": turn.id, "role": turn.role, "eligible": eligible}
+        if eligible:
+            row.update(source=source, text=text)
+        else:
+            row["reason"] = reason
+        records.append(row)
+    return records
 def _parse_lessons(payload: Any, eligible_turns: set[str]) -> list[Lesson]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("lessons"), list):
         raise ValueError("Episode stage response must contain a lessons array")
@@ -598,7 +725,7 @@ def _parse_lessons(payload: Any, eligible_turns: set[str]) -> list[Lesson]:
             raise ValueError("Lesson requires topic, claim, and evidence_turns")
         turn_ids = list(dict.fromkeys(str(turn).strip() for turn in raw_turns if str(turn).strip()))
         if any(turn not in eligible_turns for turn in turn_ids):
-            raise ValueError("Lesson cites a turn outside its supplied transcript range")
+            raise ValueError("Lesson cites a turn outside its supplied eligible-turn set")
         if not turn_ids:
             raise ValueError("Durable lesson requires at least one evidence turn")
         result.append(Lesson(topic, claim, turn_ids))
@@ -642,6 +769,20 @@ def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
     return result
 
 
+
+def _takeaway_section(content: str) -> str:
+    match = re.search(r"(?ms)^## Takeaway\s*\n(.*?)(?=^## |\Z)", content)
+    return match.group(1).strip() if match else ""
+
+
+def _valid_takeaway(value: str, *, hard_limit: int) -> bool:
+    nonempty = [line.strip() for line in value.splitlines() if line.strip()]
+    return len(nonempty) == 1 and len(nonempty[0]) <= hard_limit
+
+
+def _replace_takeaway(content: str, takeaway: str) -> str:
+    replacement = f"## Takeaway\n\n{takeaway.strip()}\n\n"
+    return re.sub(r"(?ms)^## Takeaway\s*\n.*?(?=^## |\Z)", replacement, content, count=1)
 def _takeaway(content: str) -> str:
     match = re.search(r"(?ms)^## Takeaway\s*\n(.*?)(?=^## |\Z)", content)
     return match.group(1).strip().splitlines()[0] if match and match.group(1).strip() else ""

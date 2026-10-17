@@ -49,6 +49,7 @@ archive_path = "./.synapse/.archive"
     assert config.distiller.episode.chunk_chars == 100_000
     assert config.distiller.episode.integrate_lessons_per_call == 12
     assert config.distiller.episode.retrieval_top_k_per_lesson == 5
+    assert config.distiller.episode.evidence_context_token_budget == 12_000
     assert config.distiller.max_transcripts_per_run == 500
     assert config.dreamer.enabled is True
     assert config.dreamer.interval_hours == 12

@@ -666,6 +666,11 @@ class Distiller:
             "final_candidate_body": final_body,
             "validator_findings": details.get("warnings") or [],
             "sources": list(prepared.get("sources") or item.sources),
+            "failure_reason": str(context.get("failure_reason") or exc),
+            "evidence": [
+                {"turn": entry.turn, "quote": entry.quote}
+                for entry in item.evidence
+            ],
         }
         directory = self.runtime_paths.base / ".distiller-quarantine"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)

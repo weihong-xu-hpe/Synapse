@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from synapse.config import SynapseConfig
-from synapse.lifecycle.episode_distiller import EpisodeDistiller, EpisodeOp, EpisodeRun, build_episode_chunks
+from synapse.lifecycle.episode_distiller import EpisodeDistiller, EpisodeOp, EpisodeRun, Lesson, _parse_lessons, _turn_evidence_records, build_episode_chunks
 from synapse.models import Node, NodeMetadata, NodeType
 from synapse.okf import EvidenceEntry
+from synapse.okf.episode import render_episode_map_prompt
 from synapse.okf.transcript_format import TranscriptTurn, V2_MARKER, parse_transcript
 from synapse.storage import SQLiteNodeStore, write_node_file
 from synapse.sync import SyncManager
@@ -79,6 +81,72 @@ def test_map_chunks_preserve_turn_boundaries() -> None:
         reconstructed.extend(turn.id for turn in parsed.turns)
     assert reconstructed == ["T1", "T2", "T3"]
 
+def test_map_prompt_marks_only_contract_eligible_turns() -> None:
+    turns = [
+        TranscriptTurn(number=1, role="User", body="The selected scope is constrained by membership."),
+        TranscriptTurn(number=2, role="User", body="Why is the scope constrained?"),
+        TranscriptTurn(number=3, role="Assistant", body="Assistant prose is context, not evidence."),
+        TranscriptTurn(
+            number=4,
+            role="Assistant",
+            body="Tool call context.",
+            tool_sections=["### Tool T4.1 read\ncall: {}\nresult [ok]: scope membership is checked before allow"],
+        ),
+    ]
+    records = _turn_evidence_records(turns)
+    by_turn = {record["turn"]: record for record in records}
+    assert by_turn["T1"]["eligible"] is True
+    assert by_turn["T2"]["eligible"] is False
+    assert by_turn["T3"]["eligible"] is False
+    assert by_turn["T4"]["eligible"] is True
+    prompt = render_episode_map_prompt(
+        turns="\n\n".join(f"## {turn.id} {turn.role}\n{turn.body}" for turn in turns),
+        turn_eligibility=records,
+        chunk_index=1,
+        chunk_count=1,
+    )
+    assert '"turn":"T3","role":"Assistant","eligible":false' in prompt
+    assert "assistant_prose_is_not_evidence" in prompt
+    assert "scope membership is checked before allow" in prompt
+
+    with pytest.raises(ValueError, match="outside its supplied eligible-turn set"): 
+        _parse_lessons(
+            {"lessons": [{"topic": "scope", "claim": "claim", "evidence_turns": ["T3"]}]},
+            {"T1", "T4"},
+        )
+
+
+def test_integrate_evidence_overflow_splits_batches_without_dropping_excerpts(tmp_path: Path) -> None:
+    config, paths, _transcript = _setup(tmp_path)
+    runner = _runner(config, paths, FakeClient())
+    turns = [
+        TranscriptTurn(number=1, role="User", body="First exact evidence quote supports a durable rule."),
+        TranscriptTurn(number=2, role="User", body="Second exact evidence quote supports another durable rule."),
+    ]
+    lessons = [
+        Lesson("first topic", "first claim", ["T1"]),
+        Lesson("second topic", "second claim", ["T2"]),
+    ]
+    try:
+        one_sizes = [
+            len(json.dumps(runner._evidence_context(turns, [lesson]), ensure_ascii=False))
+            for lesson in lessons
+        ]
+        combined_size = len(json.dumps(runner._evidence_context(turns, lessons), ensure_ascii=False))
+        runner.settings.evidence_context_token_budget = max(one_sizes) + 1
+        assert combined_size > runner.settings.evidence_context_token_budget
+        batches = runner._integrate_lesson_batches(turns, lessons)
+        assert [[lesson.topic for lesson in batch] for batch in batches] == [["first topic"], ["second topic"]]
+        excerpt_texts = [
+            record["text"]
+            for batch in batches
+            for block in runner._evidence_context(turns, batch)
+            for record in block["evidence"]
+        ]
+        assert excerpt_texts == [turns[0].body, turns[1].body]
+    finally:
+        runner.close()
+
 
 def test_failed_summary_does_not_advance_watermark(tmp_path: Path) -> None:
     config, paths, transcript = _setup(tmp_path)
@@ -124,7 +192,10 @@ def test_unknown_update_target_is_quarantined(tmp_path: Path) -> None:
         assert result["target_id"] == op.target_id
         quarantine = list((paths.base / ".distiller-quarantine").glob("*.jsonl"))
         assert len(quarantine) == 1
-        assert op.target_id in quarantine[0].read_text(encoding="utf-8")
+        record = json.loads(quarantine[0].read_text(encoding="utf-8").splitlines()[0])
+        assert record["target_node_ids"] == [op.target_id]
+        assert record["failure_reason"] == f"Unknown or inactive update target: {op.target_id}"
+        assert record["evidence"] == [{"turn": "T1", "quote": "The cache key remains stable for retried writes."}]
     finally:
         runner.close()
 
@@ -156,5 +227,35 @@ def test_create_retry_uses_canonical_id_and_is_idempotent(tmp_path: Path) -> Non
         assert second["action"] == "unchanged"
         assert first["node_id"] == second["node_id"]
         assert first["node_id"].startswith("mem_2026")
+    finally:
+        runner.close()
+
+def test_overlong_takeaway_uses_focused_repair_before_write(tmp_path: Path) -> None:
+    config, paths, transcript = _setup(tmp_path)
+    repaired = "Retry writes with the same cache key."
+    client = FakeClient(response={"takeaway": repaired})
+    runner = _runner(config, paths, client)
+    turn = TranscriptTurn(number=1, role="User", body="The cache key remains stable for retried writes.")
+    op = EpisodeOp(
+        action="create",
+        title="Stable Cache Key Behavior",
+        okf_type="fact",
+        justification="No matching node describes this retry invariant.",
+        content=(
+            "## Takeaway\n\n" + "A durable retry statement " + "x" * 210 + "\n\n"
+            "## Details\n\nThe same key is reused on retry.\n\n## Sources\n\n- source"
+        ),
+        evidence=[EvidenceEntry(turn="T1", quote="The cache key remains stable for retried writes.")],
+    )
+    run = EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-repair-test", 60, 1, 1)
+    try:
+        result = runner._apply_op(
+            transcript, [turn], op, run, allowed_target_ids=set(), allowed_evidence_turns={"T1"}
+        )
+        assert result["action"] == "created"
+        assert len(client.prompts) == 1
+        assert "Rewrite only the supplied OKF Takeaway line" in client.prompts[0]
+        assert "Retry writes with the same cache key." in runner._load_node(result["node_id"]).content
+        assert run.stages["takeaway_repair"].calls == 1
     finally:
         runner.close()
