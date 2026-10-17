@@ -15,6 +15,7 @@ from synapse.models import Node, NodeStatus, NodeType, generate_node_id, slugify
 from synapse.okf import (
     EvidenceEntry,
     TYPE_REQUIRED_SECTIONS,
+    EVIDENCE_QUOTE_MAX_CHARS,
     TAKEAWAY_MAX_CHARS,
     OkfItem,
     render_evidence_section,
@@ -101,9 +102,15 @@ class Lesson:
     topic: str
     claim: str
     evidence_turns: list[str]
+    evidence_quotes: list[EvidenceEntry]
 
     def as_dict(self) -> dict[str, Any]:
-        return {"topic": self.topic, "claim": self.claim, "evidence_turns": self.evidence_turns}
+        return {
+            "topic": self.topic,
+            "claim": self.claim,
+            "evidence_turns": self.evidence_turns,
+            "evidence_quotes": [{"turn": quote.turn, "quote": quote.quote} for quote in self.evidence_quotes],
+        }
 
 
 @dataclass(slots=True)
@@ -187,22 +194,23 @@ class EpisodeDistiller:
         )
         turn_evidence = _turn_evidence_records(pending)
         eligible_by_id = {row["turn"]: row for row in turn_evidence}
+        eligible_text_by_id = {row["turn"]: row["text"] for row in turn_evidence if row["eligible"]}
         lesson_rows: list[Lesson] = []
         if len(chunks) == 1:
             text, ids = chunks[0]
             eligible_rows = [eligible_by_id[turn_id] for turn_id in ids]
-            eligible_ids = {row["turn"] for row in eligible_rows if row["eligible"]}
+            eligible_chunk = {turn_id: eligible_text_by_id[turn_id] for turn_id in ids if turn_id in eligible_text_by_id}
             payload = self._call(
                 run,
                 "summarize",
                 render_episode_summary_prompt(turns=text, turn_eligibility=eligible_rows),
             )
-            lesson_rows = _parse_lessons(payload, eligible_ids)
+            lesson_rows = _parse_lessons(payload, eligible_chunk)
         else:
             mapped: list[Lesson] = []
             for index, (text, ids) in enumerate(chunks, 1):
                 eligible_rows = [eligible_by_id[turn_id] for turn_id in ids]
-                eligible_ids = {row["turn"] for row in eligible_rows if row["eligible"]}
+                eligible_chunk = {turn_id: eligible_text_by_id[turn_id] for turn_id in ids if turn_id in eligible_text_by_id}
                 payload = self._call(
                     run,
                     "map",
@@ -213,7 +221,7 @@ class EpisodeDistiller:
                         chunk_count=len(chunks),
                     ),
                 )
-                mapped.extend(_parse_lessons(payload, eligible_ids))
+                mapped.extend(_parse_lessons(payload, eligible_chunk))
             eligible_role_rows = [
                 {key: row[key] for key in ("turn", "role", "eligible", "source", "reason") if key in row}
                 for row in turn_evidence
@@ -226,8 +234,7 @@ class EpisodeDistiller:
                     eligible_turns=eligible_role_rows,
                 ),
             )
-            all_eligible_turn_ids = {row["turn"] for row in turn_evidence if row["eligible"]}
-            lesson_rows = _parse_lessons(reduced, all_eligible_turn_ids)
+            lesson_rows = _parse_lessons(reduced, eligible_text_by_id)
 
         run.lessons = [lesson.as_dict() for lesson in lesson_rows]
         try:
@@ -448,16 +455,16 @@ class EpisodeDistiller:
         result: list[dict[str, Any]] = []
         for index, lesson in enumerate(lessons):
             excerpts: list[dict[str, str]] = []
-            for turn_id in lesson.evidence_turns:
-                row = eligible_by_id.get(turn_id)
+            for quote in lesson.evidence_quotes:
+                row = eligible_by_id.get(quote.turn)
                 if row is None:
-                    raise ValueError(f"Lesson cites ineligible or unavailable evidence turn {turn_id}")
+                    raise ValueError(f"Lesson cites ineligible or unavailable evidence turn {quote.turn}")
                 excerpts.append(
                     {
-                        "turn": turn_id,
+                        "turn": quote.turn,
                         "role": row["role"],
                         "source": row["source"],
-                        "text": row["text"],
+                        "text": quote.quote,
                     }
                 )
             result.append(
@@ -713,7 +720,7 @@ def _turn_evidence_records(turns: list[TranscriptTurn]) -> list[dict[str, Any]]:
             row["reason"] = reason
         records.append(row)
     return records
-def _parse_lessons(payload: Any, eligible_turns: set[str]) -> list[Lesson]:
+def _parse_lessons(payload: Any, eligible_evidence: Mapping[str, str]) -> list[Lesson]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("lessons"), list):
         raise ValueError("Episode stage response must contain a lessons array")
     result: list[Lesson] = []
@@ -723,14 +730,28 @@ def _parse_lessons(payload: Any, eligible_turns: set[str]) -> list[Lesson]:
         topic = str(row.get("topic") or "").strip()
         claim = str(row.get("claim") or "").strip()
         raw_turns = row.get("evidence_turns")
-        if not topic or not claim or not isinstance(raw_turns, list):
-            raise ValueError("Lesson requires topic, claim, and evidence_turns")
+        raw_quotes = row.get("evidence_quotes")
+        if not topic or not claim or not isinstance(raw_turns, list) or not isinstance(raw_quotes, list):
+            raise ValueError("Lesson requires topic, claim, evidence_turns, and evidence_quotes")
         turn_ids = list(dict.fromkeys(str(turn).strip() for turn in raw_turns if str(turn).strip()))
-        if any(turn not in eligible_turns for turn in turn_ids):
+        if any(turn not in eligible_evidence for turn in turn_ids):
             raise ValueError("Lesson cites a turn outside its supplied eligible-turn set")
-        if not turn_ids:
-            raise ValueError("Durable lesson requires at least one evidence turn")
-        result.append(Lesson(topic, claim, turn_ids))
+        quotes: list[EvidenceEntry] = []
+        for quote in raw_quotes:
+            if not isinstance(quote, Mapping):
+                raise ValueError("Lesson evidence quote must be an object")
+            turn = str(quote.get("turn") or "").strip()
+            text = str(quote.get("quote") or "").strip()
+            if not turn or turn not in eligible_evidence or not text or len(text) > EVIDENCE_QUOTE_MAX_CHARS:
+                raise ValueError("Lesson evidence quote must cite an eligible turn and be at most 200 characters")
+            quotes.append(EvidenceEntry(turn=turn, quote=text))
+        verified, unverified = verify_evidence(quotes, turns=eligible_evidence)
+        if not verified or unverified:
+            raise ValueError("Lesson evidence quotes must appear verbatim in eligible source text")
+        quote_turns = list(dict.fromkeys(quote.turn for quote in verified))
+        if not turn_ids or set(turn_ids) != set(quote_turns):
+            raise ValueError("Lesson evidence_turns must exactly match evidence quote turn IDs")
+        result.append(Lesson(topic, claim, turn_ids, verified))
     return result
 
 

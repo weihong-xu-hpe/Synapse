@@ -109,10 +109,36 @@ def test_map_prompt_marks_only_contract_eligible_turns() -> None:
     assert "assistant_prose_is_not_evidence" in prompt
     assert "scope membership is checked before allow" in prompt
 
-    with pytest.raises(ValueError, match="outside its supplied eligible-turn set"): 
+    with pytest.raises(ValueError, match="outside its supplied eligible-turn set"):
         _parse_lessons(
-            {"lessons": [{"topic": "scope", "claim": "claim", "evidence_turns": ["T3"]}]},
-            {"T1", "T4"},
+            {"lessons": [{"topic": "scope", "claim": "claim", "evidence_turns": ["T3"], "evidence_quotes": [{"turn": "T3", "quote": "Assistant prose is context, not evidence."}]}]},
+            {"T1": "The selected scope is constrained by membership.", "T4": "scope membership is checked before allow"},
+        )
+
+    source = "The selected scope is constrained by membership."
+    parsed = _parse_lessons(
+        {
+            "lessons": [{
+                "topic": "scope",
+                "claim": "membership constrains the scope",
+                "evidence_turns": ["T1"],
+                "evidence_quotes": [{"turn": "T1", "quote": "scope is constrained by membership"}],
+            }]
+        },
+        {"T1": source},
+    )
+    assert parsed[0].evidence_quotes == [EvidenceEntry("T1", "scope is constrained by membership")]
+    with pytest.raises(ValueError, match="appear verbatim"):
+        _parse_lessons(
+            {
+                "lessons": [{
+                    "topic": "scope",
+                    "claim": "unverified",
+                    "evidence_turns": ["T1"],
+                    "evidence_quotes": [{"turn": "T1", "quote": "a fabricated quote"}],
+                }]
+            },
+            {"T1": source},
         )
 
 
@@ -124,8 +150,8 @@ def test_integrate_evidence_overflow_splits_batches_without_dropping_excerpts(tm
         TranscriptTurn(number=2, role="User", body="Second exact evidence quote supports another durable rule."),
     ]
     lessons = [
-        Lesson("first topic", "first claim", ["T1"]),
-        Lesson("second topic", "second claim", ["T2"]),
+        Lesson("first topic", "first claim", ["T1"], [EvidenceEntry("T1", turns[0].body)]),
+        Lesson("second topic", "second claim", ["T2"], [EvidenceEntry("T2", turns[1].body)]),
     ]
     try:
         one_sizes = [
