@@ -229,7 +229,7 @@ Controls the local OpenAI-compatible LLM pool used for sampling decisions (write
 - `provider` — currently `local_llm` (OpenAI-compatible HTTP)
 - `endpoints` — one or more `[[decider.endpoints]]` entries, each with `base_url`, `model`, optional `api_key_env`, and optional `extra_body`; `extra_body` is merged into only that endpoint's completion request, including after failover. It cannot override `model`, `messages`, `max_tokens`, or `response_format`.
 - `endpoint_max_concurrency` (int, 1–64, default `30`) — maximum simultaneous HTTP requests to each endpoint; the cap is independent per endpoint
-- `timeout_seconds` — HTTP timeout per endpoint for write-path decisions. Distiller extraction/reduce/title-repair use `[distiller].llm_timeout_seconds`; each distiller write decision returns to this timeout.
+- `timeout_seconds` — HTTP timeout per endpoint for write-path decisions. Dreamer calls use `[distiller].llm_timeout_seconds`; episode calls use `[distiller.episode].timeout_seconds`.
 - `max_tokens` (default `200000`) — generation token budget; keep it high enough for reasoning plus the structured answer rather than imposing a tight cap
 - `temperature` (default `0.0`) — sampling temperature; zero is preferred for deterministic structured decisions
 - `local_llm` transient failures (transport/disconnect/reset/timeout, HTTP 429/5xx, invalid JSON) get up to 3 attempts per endpoint with jittered 5s/20s backoff before endpoint failover; other 4xx and configuration errors are not retried.
@@ -272,21 +272,11 @@ Controls the server-side transcript pipeline that converts session transcripts i
 
 - `enabled` (bool, default `true`) — whether the in-process sweep scheduler auto-starts when the server runs
 - `interval_minutes` (int, ≥1, default `10`) — sweep interval; short enough that macOS sleep drift is harmless
-- `idle_minutes` (int, ≥1, default `60`) — a transcript must be untouched this long before it is distilled (avoids distilling mid-pause). The idle and retention clocks both use the transcript **file mtime**: stamping (distillation write-back) and failure backoff rewrite the file and thus reset the clock.
-- `retention_days` (int, ≥1, default `45`) — transcripts distilled at their **current** content revision are archived this many days after their last content update (file mtime); **undistilled or stale-distilled transcripts are never archived**. A transcript that yielded zero knowledge items counts as distilled-current (the LLM judged nothing durable) and is archived after retention like any other.
-
-The following options configure the legacy segment distiller used by manual `synapse distill run`; they do not configure the active episode pipeline:
-
-- `max_transcript_chars` (legacy `distill run`, default `16000`) — prompt cap per transcript (head + tail split)
-- `max_concurrency` (legacy `distill run`, 1–30, default `30`) — extraction-call concurrency within each transcript
-- `transcript_concurrency` (legacy `distill run`, 1–16, default `4`) — transcripts processed concurrently in one run
-- `segment_chars` (legacy `distill run`, default `16000`) — segment size at turn boundaries
-- `item_warn_threshold` (legacy `distill run`, default `40`) — log threshold only; no extracted items are dropped
-- `reasoning_effort` (legacy `distill run`, optional) — omitted by default; only sent when explicitly configured
-- `llm_timeout_seconds` (legacy `distill run`, ≥1, default `300`) — timeout for the segment-distiller LLM client
-- `max_transcripts_per_run` (int, 1–5000, default `500`) — cap on transcripts selected by one server sweep or manual run
-- `backoff_sweeps` (int, default `3`) — legacy segment-distiller sweeps a failing transcript is skipped before retry
-- A failed or partial legacy segment-distiller transcript may be retried once within the same run after a 10-minute cooldown. The episode pipeline uses its own `timeout_seconds` and does not use segment extraction concurrency.
+- `idle_minutes` (int, ≥1, default `60`) — a transcript must be untouched this long before it is distilled. The idle clock uses the transcript file mtime; stamping transcript state updates that mtime.
+- `retention_days` (int, ≥1, default `45`) — current-revision transcripts are archived this many days after their last content update; undistilled or stale transcripts are never archived.
+- `max_transcripts_per_run` (int, 1–5000, default `500`) — maximum idle transcripts selected by one scheduler sweep.
+- `llm_timeout_seconds` (int, ≥1, default `300`) — shared long-stage timeout for Dreamer calls outside the episode pipeline; episode calls use their own `timeout_seconds`.
+- `enforce_okf` (bool, default `false`) — reject persistent writes on fatal OKF validation codes instead of warning.
 
 #### `[distiller.episode]` two-stage pipeline
 
@@ -303,7 +293,7 @@ The active episode pipeline dehydrates tool-polling noise, carries a Global User
 
 `POST /api/episode/close` accepts `{"session_key":"…","reason":"idle|shutdown|switch"}`. It returns `status=disabled` when `[distiller].enabled` is false; otherwise it returns `status=accepted` and schedules per-session serialized background distillation. The fallback scheduler selects transcripts idle for `idle_minutes` (default 60) on the configured `interval_minutes` cadence.
 
-Commands: `python -m synapse distill status`, legacy `python -m synapse distill run [--dry-run|--apply] [--limit N] [--id <node>] [--legacy-groups groups.json] [--report out.json]`, and `python -m synapse distill episode` for an explicitly selected copy.
+Commands: `python -m synapse distill status` and `python -m synapse distill episode` for an explicitly selected copy.
 
 `distill status` prints the active scanner and gatekeeper models plus recent run creates, updates, and gatekeeper-filtered items.
 

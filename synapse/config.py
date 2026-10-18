@@ -295,39 +295,13 @@ class DistillerSettings(BaseModel):
     interval_minutes: int = Field(default=10, ge=1)
     idle_minutes: int = Field(default=60, ge=1)
     retention_days: int = Field(default=45, ge=1)
-    max_transcript_chars: int = Field(default=16_000, ge=1000)
-    # P2c: per-segment budget for chunked distillation. Transcripts are split
-    # at turn boundaries up to this many chars (one extraction call per
-    # segment, same call size as the old single-call flow); a single
-    # oversized turn is split by chars. Nothing is head/tail-truncated away.
-    segment_chars: int = Field(default=16_000, ge=1000)
-    # Concurrent segment extraction calls per transcript; endpoint pool caps total calls.
-    max_concurrency: int = Field(default=30, ge=1, le=30)
-    # Concurrent transcript workers inside one sweep.
-    transcript_concurrency: int = Field(default=4, ge=1, le=16)
-    # Owner 2026-10-12 rework: the fixed item-count concept is removed (the
-    # model extracts everything durable; reduce = dedupe only). No cap field.
-    # Warn (never drop) when a transcript yields more than this many items.
-    item_warn_threshold: int = Field(default=40, ge=1)
-    # Optional reasoning_effort for the distiller's OWN LLM calls only (never
-    # the write-path decider). None = field omitted (today's behavior).
-    reasoning_effort: str | None = Field(default=None)
-    # When true, a decider supersede targeting an existing non-distilled
-    # persistent node is downgraded to complement (backfill safety; default ON
-    # for backfill/CLI --apply over legacy groups, OFF for the live sweep).
-    downgrade_supersede: bool = True
     episode: EpisodePipelineSettings = Field(default_factory=EpisodePipelineSettings)
-    # Rejection timeline flag (NOT active in this change): when true, fatal
-    # okf_* codes reject persistent writes instead of warning. Default off.
+    # When true, fatal OKF validation codes reject persistent writes instead of warning.
     enforce_okf: bool = False
-    # Distiller-specific LLM HTTP timeout. Live sweeps timed out at the shared
-    # decider timeout (120 s) on 8.6k/16k-char transcripts; backfill succeeded
-    # at 300 s. Applied only to the distiller's own LLM client — the write-path
-    # decider keeps [decider] timeout_seconds.
+    # Shared long-stage timeout used by Dreamer calls outside the episode pipeline.
     llm_timeout_seconds: int = Field(default=300, ge=1)
-    # Per-sweep safety cap; candidates are refilled into free transcript slots until this limit or backlog exhaustion.
+    # Maximum number of idle transcripts selected for one scheduler sweep.
     max_transcripts_per_run: int = Field(default=500, ge=1, le=5000)
-    backoff_sweeps: int = Field(default=3, ge=0)
 
 
 class ObservabilitySettings(BaseModel):

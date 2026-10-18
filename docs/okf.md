@@ -274,9 +274,8 @@ Owner decision C — **annotate, never auto-inject**. Distilled items carry an
 {"evidence": [{"turn": "T12", "quote": "<verbatim excerpt, <= 200 chars>"}]}
 ```
 
-- The scheduled segment distiller accepts User bodies and eligible Tool output under its deterministic evidence contract. For episode distillation, Stage 1 considers every User, Assistant, and Tool turn; Stage 2 supplies verbatim excerpts from the cited turns, including Assistant bodies and surviving Tool sections.
+- Episode Stage 1 considers User, Assistant, and Tool turns. Stage 2 supplies verbatim excerpts from cited turns, including Assistant bodies and surviving Tool sections.
 - Episode writes honor the gatekeeper's `verified` boolean when present. Without it, the server deterministically checks evidence quotes against all named turn bodies and Tool sections, including Assistant source-code/log analysis. Verification is an annotation, not a write gate: speculative or ungrounded lessons remain writable with `verified: false` and are excluded from auto-injection.
-- A User turn containing only an interrogative is not independently sufficient grounding for the scheduled segment distiller. Episode gatekeeper decisions instead use the supplied excerpts and full Global User Spine to assess grounding and later refutations.
 - Verified items get frontmatter `verified: true` and a `## Evidence` section
   (`- T12: "quote"`). Unverifiable items are still written with `verified: false`
   and their (unverifiable) evidence listed.
@@ -292,52 +291,7 @@ Turn numbering follows the session transcript contract
 (`docs/transcript-format.md`): v2 transcripts number turns `T1..Tn` at submission;
 legacy `## User` / `## Assistant` transcripts get numbered in order when parsed.
 
-## 10. Legacy segment distillation (`synapse distill run`)
-
-This section describes only the legacy manual segment-distiller command, not the scheduled live
-path or `/api/episode/close`; both server triggers run the Two-Stage Episode Distiller in §11.
-
-- For the legacy `synapse distill run` path, transcripts are split into segments at turn boundaries
-  (`[distiller].segment_chars`, default 16 000 — same size as the old single-call
-  budget); a single oversized turn is split by characters. One extraction LLM call
-  runs per segment; nothing is head/tail-truncated away. **No item-count cap**:
-  the model extracts everything durable — one item per distinct claim, never
-  bundling unrelated topics.
-- Reduce = **dedupe only, never "compress to N"**: candidates whose normalized
-  titles are equal or prefix-related are grouped deterministically; only groups
-  with ≥2 members go to the LLM (in bounded batches, 12 groups per call), and the
-  reduce prompt may merge same-claim items and split composites — every other
-  item must be returned unchanged. Singletons pass through untouched. On reduce
-  failure: retry once, then deterministic exact-normalized-title dedupe keeping
-  ALL distinct items — no truncation. `[distiller].item_warn_threshold` (default
-  40) logs a warning when a transcript yields more items than that; nothing is
-  dropped. Known-titles / own-distilled-titles dedupe still applies.
-- `[distiller].reasoning_effort` (optional; `low`/`medium`/`high`) is passed as
-  the OpenAI `reasoning_effort` field on the distiller's OWN LLM calls only
-  (never the write-path decider). Unset = field omitted.
-- Segment extraction calls run concurrently up to `[distiller].max_concurrency` per transcript
-  (default 30); a sweep processes up to `[distiller].transcript_concurrency`
-  transcripts at once (default 4), refilling free slots from the pending idle
-  backlog up to `[distiller].max_transcripts_per_run` (default 500). Write
-  decisions are prepared concurrently, while each commit is serialized and
-  rechecks the latest corpus. After link embedding, merges, and typed-OKF repair,
-  the full normalized `## Takeaway` is checked again against active persistent
-  nodes; exact matches merge into the existing node (or remain unchanged if
-  identical), including complement/supersede decisions. Supersedes downgrade
-  when they omit factual anchors from any body section, including `## Evidence`
-  (but excluding `## Sources` and `## Related` link lists), or claim an existing
-  lineage pointer. The endpoint pool independently caps in-flight calls per endpoint.
-- A validation-quarantined item increments `items_quarantined` in the transcript
-  funnel, sweep summary, and `distiller_runs`; it is retained for the unified
-  quarantine repair pass rather than blocking other items in that transcript.
-- Progress watermark: `distilled_turn` on the transcript frontmatter records the
-  last turn covered; a re-distill after new turns arrive processes only later
-  turns (one previous turn as context). `distilled_hash` semantics are unchanged.
-  On a partial segment failure the watermark is held back to the turn before the
-  first failed segment and `distilled_hash` is left unset so the next sweep
-  retries the failed range.
-
-## 11. Two-Stage Episode Distiller
+## 10. Two-Stage Episode Distiller
 
 The active server-side pipeline is the Two-Stage Episode Distiller. Both bridge-triggered
 `POST /api/episode/close` calls and the `DistillerScheduler` idle fallback run this pipeline. The

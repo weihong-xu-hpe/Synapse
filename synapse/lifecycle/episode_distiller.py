@@ -149,11 +149,7 @@ class EpisodeDistiller:
             runtime_paths=runtime_paths,
             sampling_client=sampling_client,
         )
-        self._distiller_helpers = Distiller(
-            config,
-            runtime_paths=runtime_paths,
-            sampling_client=sampling_client,
-        )
+        self._distiller_helpers = Distiller(config, runtime_paths=runtime_paths)
         self._commit_lock = threading.Lock()
 
     @staticmethod

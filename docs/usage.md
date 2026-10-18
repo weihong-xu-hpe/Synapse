@@ -305,9 +305,6 @@ server's idle-transcript fallback scheduler:
   `distilled_node_ids`); fully-distilled transcripts are excluded from default search and archived after
   `distiller.retention_days` (default 45), never before they are distilled.
 
-The manual segment-distiller options `segment_chars`, `max_concurrency`, `transcript_concurrency`, and
-`item_warn_threshold` are legacy `synapse distill run` settings, not settings for the server or close-triggered
-episode pipeline.
 
 `synapse distill status` prints the active scanner and gatekeeper models and recent run creates, updates, and
 `gatekeeper_filtered` (`items_invalid`) counts. `synapse report --since 7d` shows new-node counts by verification
@@ -317,11 +314,8 @@ gatekeeper-filtered, quarantined, LLM failures, and archived transcripts.
 Maintenance commands:
 
 ```bash
-python -m synapse distill status                  # queue, active episode models, and recent run metrics
-python -m synapse distill run --dry-run           # legacy segment-distiller plan only; no writes
-python -m synapse distill run --apply --limit 5   # run the legacy segment distiller
-python -m synapse distill run --id <node-id>      # legacy segment-distill one transcript
-python -m synapse distill run --legacy-groups groups.json --report out.json   # legacy backfill mode
+python -m synapse distill status                  # idle queue, episode models, and recent run metrics
+python -m synapse distill episode --help           # run against an explicitly selected database/base copy
 ```
 
 ## Maintenance commands

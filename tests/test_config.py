@@ -41,8 +41,7 @@ archive_path = "./.synapse/.archive"
     assert config.decider.max_tokens == 200_000
     assert config.decider.endpoint_max_concurrency == 30
     assert config.decider.temperature == 0.0
-    assert config.distiller.max_concurrency == 30
-    assert config.distiller.transcript_concurrency == 4
+    assert config.distiller.llm_timeout_seconds == 300
     assert config.distiller.episode.endpoint.model == "gpt-6-luna"
     assert config.distiller.episode.endpoint.extra_body == {"reasoning_effort": "low"}
     assert config.distiller.episode.gatekeeper_endpoint.model == "claude-haiku-5.5"
