@@ -329,6 +329,8 @@ targeting at most 160 characters (hard limit 200), with the required OKF section
 takeaway-only repair when needed. A gatekeeper `verified` annotation is honored at write time; false
 verification never blocks a valid node write.
 
+Stage 2 may return an optional `related_ids` array (up to three IDs) on create/update operations. The IDs must come from the supplied same-session or retrieved candidates; the write path retains only active persistent knowledge nodes and excludes transcript IDs and the update target itself. Related links are rendered as a single `## Related` section immediately before `## Sources`; updates preserve existing persistent knowledge links and merge new related candidates, while creates persist the corresponding knowledge-to-knowledge graph edges.
+
 The CLI report records stage latency and proxy usage tokens when supplied, lesson decisions, and
 full bodies of changed nodes. A failed stage does not advance `distilled_turn`; rerunning an
 already-applied create uses the canonical title/date node ID and becomes a no-op. CLI runs write no

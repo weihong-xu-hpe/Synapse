@@ -124,6 +124,7 @@ class EpisodeOp:
     target_id: str | None = None
     justification: str = ""
     evidence: list[EvidenceEntry] = field(default_factory=list)
+    related_ids: list[str] = field(default_factory=list)
     verified: bool | None = None
     reason: str = ""
     lesson_index: int | None = None
@@ -674,7 +675,23 @@ class EpisodeDistiller:
             if target is None or target.metadata.type is not NodeType.PERSISTENT or target.metadata.status is not NodeStatus.ACTIVE:
                 return no_op(f"Unknown or inactive update target: {op.target_id}")
             sources = list(dict.fromkeys([*target.metadata.sources, transcript.id]))
-        final_content = _with_provenance(op.content, sources, op.evidence)
+
+        stable_id = self._stable_create_id(transcript, op) if op.action == "create" else None
+        own_id = op.target_id if op.action == "update" else stable_id
+        requested_related = [*op.related_ids, *_related_ids_in_sections(op.content)]
+        related_links = self._valid_related_ids(
+            requested_related,
+            allowed_target_ids=allowed_target_ids,
+            excluded_id=own_id,
+        )
+        if target is not None:
+            preserved_links = self._valid_related_ids(
+                _wiki_link_ids(target.content),
+                allowed_target_ids=None,
+                excluded_id=target.id,
+            )
+            related_links = list(dict.fromkeys([*preserved_links, *related_links]))
+        final_content = _with_provenance(op.content, sources, op.evidence, related_ids=related_links)
         final_content, repair_error = self._repair_takeaway_only(op, final_content, sources, run)
         if repair_error:
             warnings = validate_okf_node(
@@ -714,7 +731,7 @@ class EpisodeDistiller:
                     node = self._load_node(op.target_id or "")
                     action = str(payload.get("action", "updated"))
                 else:
-                    stable_id = self._stable_create_id(transcript, op)
+                    stable_id = stable_id or self._stable_create_id(transcript, op)
                     existing = self._load_node_or_none(stable_id)
                     if existing is not None:
                         if existing.metadata.sources and transcript.id in existing.metadata.sources:
@@ -729,6 +746,7 @@ class EpisodeDistiller:
                         lambda: self.service.integrate_knowledge(
                             title=op.title,
                             content=final_content,
+                            links=related_links,
                             node_type=NodeType.PERSISTENT,
                             action="create",
                             okf_type=op.okf_type,
@@ -810,6 +828,34 @@ class EpisodeDistiller:
     def _load_node_or_none(self, node_id: str) -> Node | None:
         with SQLiteNodeStore(self.runtime_paths.base / "synapse.db", embedding_dimension=self.config.embedding.dimension or 0) as store:
             return store.get_node(node_id)
+
+    def _valid_related_ids(
+        self,
+        node_ids: list[str],
+        *,
+        allowed_target_ids: set[str] | None,
+        excluded_id: str | None,
+    ) -> list[str]:
+        valid: list[str] = []
+        for node_id in dict.fromkeys(node_ids):
+            if (
+                not node_id.startswith("mem_")
+                or node_id.startswith("mem_session_")
+                or node_id == excluded_id
+                or (allowed_target_ids is not None and node_id not in allowed_target_ids)
+            ):
+                continue
+            node = self._load_node_or_none(node_id)
+            if (
+                node is None
+                or node.metadata.type is not NodeType.PERSISTENT
+                or node.metadata.status is not NodeStatus.ACTIVE
+                or is_session_transcript(node)
+            ):
+                continue
+            valid.append(node_id)
+        return valid
+
 
     def _load_node(self, node_id: str) -> Node:
         node = self._load_node_or_none(node_id)
@@ -963,6 +1009,16 @@ def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
                 quote = str(item.get("quote") or "").strip()
                 if turn and quote and len(quote) <= EVIDENCE_QUOTE_MAX_CHARS:
                     evidence.append(EvidenceEntry(turn=turn, quote=quote))
+        related_raw = row.get("related_ids")
+        related_ids = (
+            list(
+                dict.fromkeys(
+                    item.strip() for item in related_raw if isinstance(item, str) and item.strip()
+                )
+            )[:3]
+            if isinstance(related_raw, list)
+            else []
+        )
         verified = row.get("verified") if isinstance(row.get("verified"), bool) else None
         reason = str(row.get("reason") or "").strip()
         justification = str(row.get("justification") or "").strip()
@@ -977,6 +1033,7 @@ def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
                 target_id=str(row.get("target_id") or "").strip() or None,
                 justification=justification,
                 evidence=evidence,
+                related_ids=related_ids,
                 verified=verified,
                 reason=reason,
                 lesson_index=lesson_index,
@@ -1020,9 +1077,46 @@ def _upsert_prior_node(prior: list[dict[str, Any]], node: Node) -> list[dict[str
     return result
 
 
-def _with_provenance(content: str, sources: list[str], evidence: list[EvidenceEntry]) -> str:
-    sections = re.compile(r"(?ms)^## (?:Sources|Evidence)\s*\n.*?(?=^## |\Z)")
+_WIKI_LINK_RE = re.compile(r"\[\[(mem_[A-Za-z0-9_-]+)(?:\|[^\]]*)?\]\]")
+
+
+def _wiki_link_ids(content: str) -> list[str]:
+    return list(
+        dict.fromkeys(
+            match.group(1)
+            for match in _WIKI_LINK_RE.finditer(content)
+            if not match.group(1).startswith("mem_session_")
+        )
+    )
+
+
+def _related_ids_in_sections(content: str) -> list[str]:
+    related_bodies = (
+        match.group(2)
+        for match in re.finditer(r"(?ms)^## (Related|Sources|Evidence)\s*\n(.*?)(?=^## |\Z)", content, re.IGNORECASE)
+        if match.group(1).casefold() == "related"
+    )
+    return _wiki_link_ids("\n".join(related_bodies))
+
+
+def _with_provenance(
+    content: str,
+    sources: list[str],
+    evidence: list[EvidenceEntry],
+    *,
+    related_ids: list[str] | None = None,
+) -> str:
+    sections = re.compile(r"(?ms)^## (?:Related|Sources|Evidence)\s*\n.*?(?=^## |\Z)", re.IGNORECASE)
     body = sections.sub("", content).strip()
+    links = list(
+        dict.fromkeys(
+            node_id
+            for node_id in (related_ids if related_ids is not None else _related_ids_in_sections(content))
+            if node_id.startswith("mem_") and not node_id.startswith("mem_session_")
+        )
+    )
+    if links:
+        body += "\n\n## Related\n\n" + "\n".join(f"- [[{node_id}]]" for node_id in links)
     body += "\n\n## Sources\n\n" + "\n".join(f"- [[{source}]]" for source in sources)
     if evidence:
         body += "\n\n" + render_evidence_section(evidence).strip()

@@ -107,6 +107,30 @@ def _runner(
 
 
 
+def _write_persistent_fact(
+    runner: EpisodeDistiller,
+    transcript: Node,
+    *,
+    node_id: str,
+    title: str,
+) -> None:
+    runner.service.integrate_knowledge(
+        title=title,
+        content=(
+            "## Takeaway\n\n缓存键保持稳定。\n\n"
+            "## Details\n\n重试复用同一缓存键。\n\n"
+            f"## Sources\n\n- [[{transcript.id}]]\n"
+        ),
+        node_type=NodeType.PERSISTENT,
+        action="create",
+        okf_type="fact",
+        okf_version=1,
+        sources=[transcript.id],
+        node_id=node_id,
+        validate_okf=True,
+    )
+
+
 def test_episode_pipeline_settings_build_scanner_pool_and_gatekeeper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import synapse.server.decider as decider_module
 
@@ -485,6 +509,113 @@ def test_gatekeeper_verified_false_is_written_without_quarantine(
         runner.close()
 
 
+def test_update_preserves_and_merges_related_knowledge_links(tmp_path: Path) -> None:
+    config, paths, transcript = _setup(tmp_path)
+    runner = _runner(config, paths, FakeClient(), FakeClient())
+    old_related_id = "mem_fixture_related_old"
+    new_related_id = "mem_fixture_related_new"
+    target_id = "mem_fixture_related_target"
+    try:
+        _write_persistent_fact(runner, transcript, node_id=old_related_id, title="Original Cache Rule")
+        _write_persistent_fact(runner, transcript, node_id=new_related_id, title="Retry Cache Rule")
+        runner.service.integrate_knowledge(
+            title="Cache Ownership Rule",
+            content=(
+                "## Takeaway\n\n缓存归属保持稳定。\n\n"
+                "## Details\n\n更新会保留原有缓存归属。\n\n"
+                f"## Sources\n\n- [[{transcript.id}]]\n"
+            ),
+            node_type=NodeType.PERSISTENT,
+            links=[old_related_id],
+            action="create",
+            okf_type="fact",
+            okf_version=1,
+            sources=[transcript.id],
+            node_id=target_id,
+            validate_okf=True,
+        )
+        op = EpisodeOp(
+            action="update",
+            title="Cache Ownership Rule",
+            okf_type="fact",
+            content=(
+                "## Takeaway\n\n缓存归属继续保持稳定。\n\n"
+                "## Details\n\n更新内容不应清除相关知识链接。\n\n"
+                f"## Related\n\n- [[{old_related_id}]]\n- [[{old_related_id}]]\n\n"
+                f"## Related\n\n- [[{new_related_id}]]\n- [[{transcript.id}]]\n\n"
+                f"## Sources\n\n- [[{transcript.id}]]\n"
+            ),
+            target_id=target_id,
+            related_ids=[new_related_id, old_related_id, target_id, transcript.id, "mem_fixture_not_allowed"],
+        )
+        result = runner._apply_op(
+            transcript,
+            [],
+            op,
+            EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-test", 50, 1, 1),
+            allowed_target_ids={target_id, old_related_id, new_related_id, transcript.id},
+        )
+
+        assert result["action"] == "updated"
+        updated = runner._load_node(target_id)
+        assert updated.content.count("## Related") == 1
+        related_section = updated.content.split("## Related", 1)[1].split("## Sources", 1)[0]
+        assert related_section.count(f"- [[{old_related_id}]]") == 1
+        assert related_section.count(f"- [[{new_related_id}]]") == 1
+        assert target_id not in related_section
+        assert transcript.id not in related_section
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            related_edges = store.connection.execute(
+                "SELECT target_id FROM edges WHERE source_id = ? AND target_id IN (?, ?)",
+                (target_id, old_related_id, new_related_id),
+            ).fetchall()
+        assert {str(row["target_id"]) for row in related_edges} == {old_related_id, new_related_id}
+    finally:
+        runner.close()
+
+
+def test_create_related_ids_write_related_section_and_knowledge_edge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, paths, transcript = _setup(tmp_path)
+    runner = _runner(config, paths, FakeClient(), FakeClient())
+    related_id = "mem_fixture_create_related"
+    created_id = "mem_fixture_created_knowledge"
+    try:
+        _write_persistent_fact(runner, transcript, node_id=related_id, title="Stable Retry Contract")
+        monkeypatch.setattr(runner, "_stable_create_id", lambda *_args: created_id)
+        op = EpisodeOp(
+            action="create",
+            title="Retry Ownership Contract",
+            okf_type="fact",
+            content=(
+                "## Takeaway\n\n重试由同一组件继续负责。\n\n"
+                "## Details\n\n重试路径继续使用稳定缓存键。\n"
+            ),
+            related_ids=[related_id],
+        )
+        result = runner._apply_op(
+            transcript,
+            [],
+            op,
+            EpisodeRun(transcript.id, transcript.metadata.session_key, "episode-test", 50, 1, 1),
+            allowed_target_ids={related_id},
+        )
+
+        assert result["action"] == "created"
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            created = store.get_node(created_id)
+            edge = store.connection.execute(
+                "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ?",
+                (created_id, related_id),
+            ).fetchone()
+        assert created is not None
+        assert f"## Related\n\n- [[{related_id}]]" in created.content
+        assert edge is not None
+    finally:
+        runner.close()
+
+
 
 def test_episode_run_metrics_are_recorded_with_episode_funnel(tmp_path: Path) -> None:
     config, paths, _transcript = _setup(tmp_path)
@@ -548,12 +679,24 @@ def test_gatekeeper_verified_flag_is_parsed_and_assistant_quotes_verify() -> Non
                     "content": "body",
                     "justification": "",
                     "evidence": [{"turn": "T2", "quote": "src/authz/handler.go"}],
+                    "related_ids": [
+                        "mem_fixture_related_one",
+                        "mem_fixture_related_one",
+                        "mem_fixture_related_two",
+                        "mem_fixture_related_three",
+                        "mem_fixture_related_four",
+                    ],
                     "reason": "new knowledge",
                 }
             ]
         },
         lesson_count=1,
     )[0]
+    assert op.related_ids == [
+        "mem_fixture_related_one",
+        "mem_fixture_related_two",
+        "mem_fixture_related_three",
+    ]
     assert op.justification == "new knowledge"
     turns = [TranscriptTurn(number=2, role="Assistant", body="Source analysis found src/authz/handler.go handles the error.")]
     verified, unverified = episode_module.verify_evidence(
@@ -581,6 +724,9 @@ def test_integrate_prompt_defines_gatekeeper_policy_and_chinese_okf_contract() -
         "evidence",
         "Sources",
         "Global User Spine",
+        "related_ids",
+        "at most 3",
+        "mem_session_*",
     ):
         assert required in prompt
 
