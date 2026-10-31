@@ -879,7 +879,7 @@ def test_legacy_transcript_source_is_distiller_provenance(tmp_path: Path) -> Non
             node_type="persistent",
             okf_type="fact",
             okf_version=1,
-            sources=["mem_20260817_session_summary_authz_29"],
+            sources=["mem_20260817_session_summary_example_29"],
         )
         distilled_id = distilled["execution"]["result"]["node"]["id"]
 
@@ -925,11 +925,11 @@ def test_supersede_of_legacy_sourced_node_not_downgraded(tmp_path: Path) -> None
     # Pre-existing distilled node with legacy-transcript provenance.
     existing = service.integrate_knowledge(
         title="Legacy-sourced knowledge",
-        content="## Takeaway\nold version\n\n## Details\nold\n\n## Sources\n- mem_20260817_session_summary_authz_29",
+        content="## Takeaway\nold version\n\n## Details\nold\n\n## Sources\n- mem_20260817_session_summary_example_29",
         node_type="persistent",
         okf_type="fact",
         okf_version=1,
-        sources=["mem_20260817_session_summary_authz_29"],
+        sources=["mem_20260817_session_summary_example_29"],
         action="create",
     )
     existing_id = existing["node"]["id"]
@@ -942,7 +942,7 @@ def test_supersede_of_legacy_sourced_node_not_downgraded(tmp_path: Path) -> None
         title="Legacy-sourced knowledge",
         takeaway="newer version",
         sections={"Symptom": "s", "Cause": "c", "Fix": "f"},
-        sources=["mem_20260817_session_summary_authz_29"],
+        sources=["mem_20260817_session_summary_example_29"],
     )
     result = service.write_memory(
         title=item.title,
