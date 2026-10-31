@@ -20,8 +20,16 @@ from typing import Callable, Iterable, Mapping
 
 from synapse.config import SynapseConfig, ensure_background_model_allowed
 from synapse.lifecycle.condensation import CondensationDraft, DeterministicArchiveCondenser
-from synapse.models import Node, NodeMetadata, NodeStatus, NodeType, generate_node_id, slugify_english_title
-from synapse.okf import TYPE_REQUIRED_SECTIONS, validate_okf_node
+from synapse.models import (
+    Node,
+    NodeMetadata,
+    NodeStatus,
+    NodeType,
+    format_utc_datetime,
+    generate_node_id,
+    slugify_english_title,
+)
+from synapse.okf import TYPE_REQUIRED_SECTIONS, _split_sections, validate_okf_node
 from synapse.security import purge_expired_archive_files
 from synapse.server.sampling import (
     SamplingClient,
@@ -45,7 +53,7 @@ from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 
 
 LOGGER = logging.getLogger("synapse.dreamer")
-UTC_SUFFIX = "+00:00"
+
 
 # ---------------------------------------------------------------------------
 # Report dataclasses
@@ -254,7 +262,7 @@ class Dreamer:
         self._logger.info(
             "Dreamer pipeline started",
             extra={
-                "started_at": started_at.isoformat().replace(UTC_SUFFIX, "Z"),
+                "started_at": format_utc_datetime(started_at),
                 "active_path": str(self.runtime_paths.active),
                 "archive_path": str(self.runtime_paths.archive),
             },
@@ -336,8 +344,8 @@ class Dreamer:
         # Stage 6: Report
         completed_at = self._utc_now()
         report = DreamerReport(
-            started_at=started_at.isoformat().replace(UTC_SUFFIX, "Z"),
-            completed_at=completed_at.isoformat().replace(UTC_SUFFIX, "Z"),
+            started_at=format_utc_datetime(started_at),
+            completed_at=format_utc_datetime(completed_at),
             scanned=scanned,
             triage=tuple(triage_decisions),
             links_added=tuple(link_decisions),
@@ -612,20 +620,14 @@ class Dreamer:
                 "",
             ]
         )
-        metadata = NodeMetadata.model_validate(
-            {
-                "id": hub_id,
-                "title": title,
-                "type": NodeType.PERSISTENT.value,
-                "status": NodeStatus.ACTIVE.value,
-                "okf_type": "fact",
-                "okf_version": 1,
-                "sources": sorted(member_ids),
-                "tags": ["dreamer-hub"],
-                "created_at": now.isoformat().replace(UTC_SUFFIX, "Z"),
-                "last_accessed": now.isoformat().replace(UTC_SUFFIX, "Z"),
-                "access_count": 0,
-            }
+        metadata = self._knowledge_metadata(
+            node_id=hub_id,
+            title=title,
+            okf_type="fact",
+            okf_version=1,
+            sources=sorted(member_ids),
+            tags=["dreamer-hub"],
+            now_iso=format_utc_datetime(now),
         )
         hub = Node(metadata=metadata, content=content)
         return self._store_written_path(hub)
@@ -809,44 +811,34 @@ class Dreamer:
             )
             return None
 
-        now_iso = now.isoformat().replace(UTC_SUFFIX, "Z")
-        metadata = NodeMetadata.model_validate(
-            {
-                "id": winner_id,
-                "title": title,
-                "type": NodeType.PERSISTENT.value,
-                "status": NodeStatus.ACTIVE.value,
-                "okf_type": okf_type,
-                "okf_version": 1,
-                "sources": sources,
-                "project": members[0].metadata.project,
-                "tags": sorted({tag for member in members for tag in member.metadata.tags} | {"dreamer-merged"}),
-                "created_at": now_iso,
-                "last_accessed": now_iso,
-                "access_count": 0,
-                "t_valid": now_iso,
-            }
+        now_iso = format_utc_datetime(now)
+        metadata = self._knowledge_metadata(
+            node_id=winner_id,
+            title=title,
+            okf_type=okf_type,
+            okf_version=1,
+            sources=sources,
+            tags=sorted({tag for member in members for tag in member.metadata.tags} | {"dreamer-merged"}),
+            now_iso=now_iso,
+            project=members[0].metadata.project,
+            t_valid=now_iso,
         )
         winner = Node(
             metadata=metadata,
             content=content,
         )
-        winner = self._store_written_path(winner)
-        store.upsert_node(winner)
+        self._persist(store, winner)
 
         superseded: list[str] = []
         for member in members:
             fresh = store.get_node(member.id) or member
-            updated_meta = fresh.metadata.model_copy(
-                update={
-                    "status": NodeStatus.SUPERSEDED,
-                    "superseded_by": winner_id,
-                    "t_invalid": now_iso,
-                }
+            updated = self._with_metadata(
+                fresh,
+                status=NodeStatus.SUPERSEDED,
+                superseded_by=winner_id,
+                t_invalid=now_iso,
             )
-            updated = Node(metadata=updated_meta, content=fresh.content, file_path=fresh.file_path)
-            updated = self._store_written_path(updated)
-            store.upsert_node(updated)
+            self._persist(store, updated)
             superseded.append(member.id)
         self._archive_nodes(members, reason="semantic_merge", warnings=warnings)
 
@@ -968,24 +960,15 @@ class Dreamer:
             if verified is None:
                 continue
             bytes_before = len(node.content.encode("utf-8"))
-            keeper_updated = self._store_written_path(
-                Node(metadata=keeper.metadata, content=verified, file_path=keeper.file_path)
+            self._persist(store, Node(metadata=keeper.metadata, content=verified, file_path=keeper.file_path))
+            now_iso = format_utc_datetime(self._utc_now())
+            superseded = self._with_metadata(
+                node,
+                status=NodeStatus.SUPERSEDED,
+                superseded_by=keeper.id,
+                t_invalid=now_iso,
             )
-            store.upsert_node(keeper_updated)
-            now_iso = self._utc_now().isoformat().replace(UTC_SUFFIX, "Z")
-            superseded = Node(
-                metadata=node.metadata.model_copy(
-                    update={
-                        "status": NodeStatus.SUPERSEDED,
-                        "superseded_by": keeper.id,
-                        "t_invalid": now_iso,
-                    }
-                ),
-                content=node.content,
-                file_path=node.file_path,
-            )
-            superseded = self._store_written_path(superseded)
-            store.upsert_node(superseded)
+            self._persist(store, superseded)
             self._archive_nodes([node], reason="oversized_dedupe", warnings=warnings)
             self._logger.info(
                 "Deduped oversized node into keeper",
@@ -1039,7 +1022,7 @@ class Dreamer:
             return None
 
         now = self._utc_now()
-        now_iso = now.isoformat().replace(UTC_SUFFIX, "Z")
+        now_iso = format_utc_datetime(now)
         sources = sorted({*node.metadata.sources, node.id})
         parts: list[Node] = []
         used_ids: set[str] = set()
@@ -1056,54 +1039,35 @@ class Dreamer:
                 base_part_id = re.sub(r"(?:_part)+$", "", part_id)
                 part_id = f"{base_part_id}_part_{index}"
             used_ids.add(part_id)
-            metadata = NodeMetadata.model_validate(
-                {
-                    "id": part_id,
-                    "title": labeled_title,
-                    "type": NodeType.PERSISTENT.value,
-                    "status": NodeStatus.ACTIVE.value,
-                    "okf_type": part_type,
-                    "sources": sources,
-                    "project": node.metadata.project,
-                    "tags": sorted({*node.metadata.tags, "dreamer-split"}),
-                    "created_at": now_iso,
-                    "last_accessed": now_iso,
-                    "access_count": 0,
-                    "t_valid": now_iso,
-                }
+            metadata = self._knowledge_metadata(
+                node_id=part_id,
+                title=labeled_title,
+                okf_type=part_type,
+                sources=sources,
+                tags=sorted({*node.metadata.tags, "dreamer-split"}),
+                now_iso=now_iso,
+                project=node.metadata.project,
+                t_valid=now_iso,
             )
             parts.append(Node(metadata=metadata, content=chunk))
 
-        written_parts: list[Node] = []
-        for part in parts:
-            written_parts.append(self._store_written_path(part))
-        parts = written_parts
-
-        for part in parts:
-            store.upsert_node(part)
+        parts = [self._persist(store, part) for part in parts]
 
         bytes_after = 0
         for part in parts:
             siblings = [other.id for other in parts if other.id != part.id]
             content = part.content.rstrip("\n") + "\n\n" + "\n".join(f"[[{sibling}]]" for sibling in siblings) + "\n"
-            linked = self._store_written_path(Node(metadata=part.metadata, content=content, file_path=part.file_path))
-            store.upsert_node(linked)
+            self._persist(store, Node(metadata=part.metadata, content=content, file_path=part.file_path))
             store.upsert_edges(part.id, siblings)
             bytes_after += len(content.encode("utf-8"))
 
-        superseded = Node(
-            metadata=node.metadata.model_copy(
-                update={
-                    "status": NodeStatus.SUPERSEDED,
-                    "superseded_by": parts[0].id,
-                    "t_invalid": now_iso,
-                }
-            ),
-            content=node.content,
-            file_path=node.file_path,
+        superseded = self._with_metadata(
+            node,
+            status=NodeStatus.SUPERSEDED,
+            superseded_by=parts[0].id,
+            t_invalid=now_iso,
         )
-        superseded = self._store_written_path(superseded)
-        store.upsert_node(superseded)
+        self._persist(store, superseded)
         self._archive_nodes([node], reason="oversized_split", warnings=warnings)
 
         bytes_before = len(node.content.encode("utf-8"))
@@ -1236,12 +1200,9 @@ class Dreamer:
             return None
 
         updated = Node(
-            metadata=node.metadata.model_copy(update={"title": title}),
-            content=content,
-            file_path=node.file_path,
+            metadata=node.metadata.model_copy(update={"title": title}), content=content, file_path=node.file_path
         )
-        updated = self._store_written_path(updated)
-        store.upsert_node(updated)
+        self._persist(store, updated)
         self._logger.info(
             "Compacted oversized node",
             extra={"node_id": node.id, "bytes_before": bytes_before, "bytes_after": bytes_after},
@@ -1258,11 +1219,7 @@ class Dreamer:
     def _missing_required_sections(body: str, okf_type: str) -> list[str]:
         """Required OKF section names absent from *body* (case-insensitive)."""
 
-        present = {
-            line.strip()[3:].strip().casefold()
-            for line in body.splitlines()
-            if line.strip().startswith("## ")
-        }
+        present = {name.casefold() for name in _split_sections(body)}
         return [name for name in TYPE_REQUIRED_SECTIONS.get(okf_type, ()) if name.casefold() not in present]
 
     @staticmethod
@@ -1459,6 +1416,7 @@ class Dreamer:
         condensed_results: list[CondensationResult] = []
         if to_condense:
             now = self._utc_now()
+            now_iso = format_utc_datetime(now)
             # Dreamer 2.0 (§3.4): synthesize the condensed set with the LLM
             # first; the deterministic condenser is only the fallback (it used
             # to be the only path and produced zero-information ': User' bodies).
@@ -1471,26 +1429,19 @@ class Dreamer:
             new_id = generate_node_id(draft.title, now)
 
             new_node = Node(
-                metadata=NodeMetadata.model_validate(
-                    {
-                        "id": new_id,
-                        "title": draft.title,
-                        "type": NodeType.PERSISTENT.value,
-                        "status": NodeStatus.ACTIVE.value,
-                        "tags": list(draft.tags),
-                        "okf_type": okf_type,
-                        "okf_version": 1,
-                        "sources": list(draft.source_node_ids),
-                        "created_at": now.isoformat().replace(UTC_SUFFIX, "Z"),
-                        "last_accessed": now.isoformat().replace(UTC_SUFFIX, "Z"),
-                        "access_count": 0,
-                        "t_valid": now.isoformat().replace(UTC_SUFFIX, "Z"),
-                    }
+                metadata=self._knowledge_metadata(
+                    node_id=new_id,
+                    title=draft.title,
+                    okf_type=okf_type,
+                    okf_version=1,
+                    sources=list(draft.source_node_ids),
+                    tags=list(draft.tags),
+                    now_iso=now_iso,
+                    t_valid=now_iso,
                 ),
                 content=draft.content,
             )
-            new_node = self._store_written_path(new_node)
-            store.upsert_node(new_node)
+            self._persist(store, new_node)
             condensed_results.append(
                 CondensationResult(
                     source_ids=draft.source_node_ids,
@@ -1647,12 +1598,9 @@ class Dreamer:
 
     def _mark_superseded(self, loser: Node, winner: Node, store: SQLiteNodeStore) -> None:
         """Mark *loser* as superseded by *winner* and clear winner's disputed status."""
-        updated_loser_meta = loser.metadata.model_copy(
-            update={"status": NodeStatus.SUPERSEDED, "superseded_by": winner.id}
+        self._persist(
+            store, self._with_metadata(loser, status=NodeStatus.SUPERSEDED, superseded_by=winner.id)
         )
-        updated_loser = Node(metadata=updated_loser_meta, content=loser.content, file_path=loser.file_path)
-        updated_loser = self._store_written_path(updated_loser)
-        store.upsert_node(updated_loser)
 
         # The winner was part of a disputed pair; restore it to active so it is
         # not re-discovered as disputed on the next Dreamer cycle.
@@ -1661,10 +1609,7 @@ class Dreamer:
 
     def _clear_disputed(self, node: Node, store: SQLiteNodeStore) -> None:
         """Reset a disputed node back to active."""
-        updated_meta = node.metadata.model_copy(update={"status": NodeStatus.ACTIVE})
-        updated = Node(metadata=updated_meta, content=node.content, file_path=node.file_path)
-        updated = self._store_written_path(updated)
-        store.upsert_node(updated)
+        self._persist(store, self._with_metadata(node, status=NodeStatus.ACTIVE))
 
     def _resolve_supersession_chain(
         self, node: Node, store: SQLiteNodeStore, *, max_depth: int = 64
@@ -1816,6 +1761,52 @@ class Dreamer:
         written = write_node_file(node, base_path=base_path or self.runtime_paths.base)
         relative = written.relative_to(self.runtime_paths.base)
         return node.model_copy(update={"file_path": relative})
+
+    def _persist(self, store: SQLiteNodeStore, node: Node) -> Node:
+        """Write *node* to its canonical path and upsert it into the index."""
+
+        written = self._store_written_path(node)
+        store.upsert_node(written)
+        return written
+
+    @staticmethod
+    def _with_metadata(node: Node, **fields: object) -> Node:
+        """Copy *node* with *fields* applied to its metadata (content/path preserved)."""
+
+        return node.model_copy(update={"metadata": node.metadata.model_copy(update=fields)})
+
+    @staticmethod
+    def _knowledge_metadata(
+        *,
+        node_id: str,
+        title: str,
+        okf_type: str | None,
+        sources: list[str],
+        tags: list[str],
+        now_iso: str,
+        project: str | None = None,
+        okf_version: int | None = None,
+        t_valid: str | None = None,
+    ) -> NodeMetadata:
+        """Frontmatter for a Dreamer-produced ACTIVE persistent knowledge node."""
+
+        return NodeMetadata.model_validate(
+            {
+                "id": node_id,
+                "title": title,
+                "type": NodeType.PERSISTENT.value,
+                "status": NodeStatus.ACTIVE.value,
+                "okf_type": okf_type,
+                "okf_version": okf_version,
+                "sources": sources,
+                "project": project,
+                "tags": tags,
+                "created_at": now_iso,
+                "last_accessed": now_iso,
+                "access_count": 0,
+                "t_valid": t_valid,
+            }
+        )
 
     def _archive_nodes(
         self,

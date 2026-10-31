@@ -124,9 +124,6 @@ class SynapseMCPServer:
     def list_tools(self) -> list[dict[str, object]]:
         return [self._tools[name].to_payload() for name in sorted(self._tools)]
 
-    def allocate_client_request_id(self, session: MCPSession | None = None) -> int:
-        return self._get_session(session).allocate_request_id()
-
     def call_tool(
         self,
         name: str,

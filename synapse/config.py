@@ -158,9 +158,6 @@ class RetrievalSettings(BaseModel):
     # competitive with fresh session summaries at the injection gate.
     inject_ignore_persistent_penalty: bool = Field(default=True)
 
-    def anchor_limit(self) -> int:
-        return min(3, self.top_k)
-
 
 class DecaySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")

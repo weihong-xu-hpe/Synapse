@@ -20,7 +20,6 @@ from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 
 if TYPE_CHECKING:
     from synapse.lifecycle.dreamer import Dreamer
-    from synapse.server.sampling import SamplingClient
 
 
 LOGGER = logging.getLogger("synapse.dreamer.scheduler")

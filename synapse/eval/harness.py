@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from synapse.config import SynapseConfig
-from synapse.eval.golden import GoldenQuery, RelevantDoc, slice_of
+from synapse.eval.golden import GoldenQuery, RelevantDoc
 from synapse.retrieval import RetrievalPipeline
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 

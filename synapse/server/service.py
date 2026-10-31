@@ -17,7 +17,15 @@ from contextlib import nullcontext
 
 from synapse.embedding import create_embedding_engine
 from synapse.indexing import collect_health_status
-from synapse.models import Node, NodeMetadata, NodeStatus, NodeType, SensitivityLevel, generate_node_id
+from synapse.models import (
+    Node,
+    NodeMetadata,
+    NodeStatus,
+    NodeType,
+    SensitivityLevel,
+    format_utc_datetime,
+    generate_node_id,
+)
 from synapse.retrieval import RetrievalPipeline
 from synapse.server.sampling import (
     MemoryWriteSamplingDecision,
@@ -407,6 +415,14 @@ class SynapseServerService:
     def reset_sampling_client(self, token: object) -> None:
         self._sampling_client_var.reset(token)
 
+    @staticmethod
+    def _as_node_type(node_type: NodeType | str) -> NodeType:
+        return node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
+
+    @staticmethod
+    def _as_sensitivity(sensitivity: SensitivityLevel | str) -> SensitivityLevel:
+        return sensitivity if isinstance(sensitivity, SensitivityLevel) else SensitivityLevel(str(sensitivity))
+
     def _normalizer_sampling_client(self):
         """Sampling client for write-path OKF normalization.
 
@@ -491,7 +507,7 @@ class SynapseServerService:
             with self._store() as store:
                 store.record_search_event(
                     SearchEventMetrics(
-                        ts=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                        ts=format_utc_datetime(datetime.now(UTC)),
                         source=source,
                         session_hash=hashlib.sha1(exclude_session_key.strip().encode("utf-8")).hexdigest()[:12]
                         if exclude_session_key and exclude_session_key.strip()
@@ -597,10 +613,8 @@ class SynapseServerService:
         if not clean_title:
             raise SynapseServiceError("INVALID_TITLE", _INVALID_TITLE_MESSAGE)
 
-        normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
-        normalized_sensitivity = (
-            sensitivity if isinstance(sensitivity, SensitivityLevel) else SensitivityLevel(str(sensitivity))
-        )
+        normalized_type = self._as_node_type(node_type)
+        normalized_sensitivity = self._as_sensitivity(sensitivity)
         normalized_action = action if isinstance(action, IntegrateAction) else IntegrateAction(str(action))
         normalized_links = self._normalize_links(links or [])
         resolved_target_ids = self._normalize_links(target_node_ids or [])
@@ -1251,24 +1265,6 @@ class SynapseServerService:
         )
         return result
 
-    def run_dreamer(self, batch_size: int = 8) -> dict[str, Any]:
-        sampling_client = self._require_sampling_client()
-        from synapse.lifecycle import Dreamer
-
-        dreamer = Dreamer(
-            self.config,
-            runtime_paths=self.runtime_paths,
-            sampling_client=sampling_client,
-            logger=self.logger,
-        )
-        try:
-            report = dreamer.run(batch_size=batch_size)
-        finally:
-            dreamer.close()
-        payload = report.to_dict()
-        self._log_tool_call("run_dreamer", {"batch_size": batch_size}, payload)
-        return payload
-
     def _lock_for(self, locks: dict[str, threading.Lock], guard: threading.Lock, key: str) -> threading.Lock:
         with guard:
             lock = locks.get(key)
@@ -1331,10 +1327,8 @@ class SynapseServerService:
 
         node_id = self._session_node_id(clean_key)
         with transcript_lock(self.runtime_paths.base, node_id, scope="mutation"):
-            normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
-            normalized_sensitivity = (
-                sensitivity if isinstance(sensitivity, SensitivityLevel) else SensitivityLevel(str(sensitivity))
-            )
+            normalized_type = self._as_node_type(node_type)
+            normalized_sensitivity = self._as_sensitivity(sensitivity)
             normalized_links = self._normalize_links(links or [])
 
             existing_path = self._resolve_node_path(node_id)
@@ -1414,6 +1408,15 @@ class SynapseServerService:
     def _record_session_upsert_metric(self, node_id: str, node_type: str, action: str) -> None:
         self._record_route_write_event(node_id=node_id, node_type=node_type, action=action, route="session_upsert")
 
+    def _emit_write_event(self, metrics: WriteMemoryEventMetrics, *, label: str) -> None:
+        """Persist one write event; metrics must never break a write."""
+
+        try:
+            with self._store() as store:
+                store.record_write_memory_event(metrics)
+        except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+            self.logger.warning("Failed to record %s metrics", label, exc_info=exc)
+
     def _record_route_write_event(
         self,
         *,
@@ -1425,24 +1428,21 @@ class SynapseServerService:
     ) -> None:
         """Record a lightweight write event with route attribution (no decider evidence)."""
 
-        try:
-            with self._store() as store:
-                store.record_write_memory_event(
-                    WriteMemoryEventMetrics(
-                        created_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                        node_id=node_id,
-                        node_type=node_type,
-                        action=action,
-                        candidate_count=0,
-                        similarity_threshold=0.0,
-                        warning_codes=tuple(warning_codes),
-                        sampling_provider="",
-                        execution_succeeded=True,
-                        route=route,
-                    )
-                )
-        except (OSError, ValueError, sqlite3.DatabaseError) as exc:  # metrics must never break writes
-            self.logger.warning("Failed to record write-route metrics", exc_info=exc)
+        self._emit_write_event(
+            WriteMemoryEventMetrics(
+                created_at=format_utc_datetime(datetime.now(UTC)),
+                node_id=node_id,
+                node_type=node_type,
+                action=action,
+                candidate_count=0,
+                similarity_threshold=0.0,
+                warning_codes=tuple(warning_codes),
+                sampling_provider="",
+                execution_succeeded=True,
+                route=route,
+            ),
+            label="write-route",
+        )
 
     def write_node(
         self,
@@ -1456,10 +1456,8 @@ class SynapseServerService:
         if not clean_title:
             raise SynapseServiceError("INVALID_TITLE", _INVALID_TITLE_MESSAGE)
 
-        normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
-        normalized_sensitivity = (
-            sensitivity if isinstance(sensitivity, SensitivityLevel) else SensitivityLevel(str(sensitivity))
-        )
+        normalized_type = self._as_node_type(node_type)
+        normalized_sensitivity = self._as_sensitivity(sensitivity)
         normalized_links = self._normalize_links(links or [])
         node_id = self._allocate_node_id(clean_title)
         merged_content = self._embed_links(content, normalized_links)
@@ -1542,20 +1540,6 @@ class SynapseServerService:
         node = self._load_node(node_id)
         payload = self._serialize_node(node)
         self._log_tool_call("get_node", {"node_id": node_id}, payload)
-        return payload
-
-    def health(self) -> dict[str, Any]:
-        health = collect_health_status(
-            self.config,
-            runtime_paths=self.runtime_paths,
-            include_missing_link_diagnostics=False,
-        )
-        payload = {
-            "status": health.status,
-            "components": health.components,
-            "warnings": health.warnings,
-        }
-        self._log_tool_call("health", {}, payload)
         return payload
 
     def stats(self) -> dict[str, Any]:
@@ -1938,10 +1922,8 @@ class SynapseServerService:
         if not clean_title:
             raise SynapseServiceError("INVALID_TITLE", _INVALID_TITLE_MESSAGE)
 
-        normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
-        normalized_sensitivity = (
-            sensitivity if isinstance(sensitivity, SensitivityLevel) else SensitivityLevel(str(sensitivity))
-        )
+        normalized_type = self._as_node_type(node_type)
+        normalized_sensitivity = self._as_sensitivity(sensitivity)
         normalized_links = self._normalize_links(links or [])
 
         query, candidate_queries = self._build_sampling_candidate_queries(
@@ -2287,12 +2269,6 @@ class SynapseServerService:
         return normalized
 
     @staticmethod
-    def _normalize_fts_query(query: str) -> str:
-        tokens = re.findall(r"\w+", query, flags=re.UNICODE)
-        normalized = " ".join(tokens).strip()
-        return normalized or query.strip()
-
-    @staticmethod
     def merge_related_sections(content: str) -> str:
         """Merge every ``## Related`` section into one trailing section.
 
@@ -2382,21 +2358,18 @@ class SynapseServerService:
         execution_succeeded: bool,
         route: str | None = None,
     ) -> None:
-        try:
-            with self._store() as store:
-                store.record_write_memory_event(
-                    WriteMemoryEventMetrics(
-                        created_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                        node_id=node_id,
-                        node_type=node_type,
-                        action=str(decision_payload.get("action")) if decision_payload.get("action") else None,
-                        candidate_count=int(evidence.get("candidate_count") or 0),
-                        similarity_threshold=float(similarity_threshold),
-                        warning_codes=tuple(warning_codes),
-                        sampling_provider=str(evidence.get("sampling_provider") or ""),
-                        execution_succeeded=execution_succeeded,
-                        route=route,
-                    )
-                )
-        except (OSError, ValueError, sqlite3.DatabaseError) as exc:  # pragma: no cover - metrics must never break writes
-            self.logger.warning("Failed to record write_memory metrics", exc_info=exc)
+        self._emit_write_event(
+            WriteMemoryEventMetrics(
+                created_at=format_utc_datetime(datetime.now(UTC)),
+                node_id=node_id,
+                node_type=node_type,
+                action=str(decision_payload.get("action")) if decision_payload.get("action") else None,
+                candidate_count=int(evidence.get("candidate_count") or 0),
+                similarity_threshold=float(similarity_threshold),
+                warning_codes=tuple(warning_codes),
+                sampling_provider=str(evidence.get("sampling_provider") or ""),
+                execution_succeeded=execution_succeeded,
+                route=route,
+            ),
+            label="write_memory",
+        )

@@ -842,9 +842,7 @@ class SQLiteNodeStore:
                 connection.execute("DELETE FROM nodes_bi_content WHERE rowid = ?", (row["rowid"],))
 
     def delete_embedding(self, node_id: str) -> None:
-        with self.transaction() as connection:
-            self._invalidate_vector_cache()
-            connection.execute("DELETE FROM nodes_vec WHERE id = ?", (node_id,))
+        self.delete_embeddings([node_id])
 
     def delete_embeddings(self, node_ids: list[str]) -> int:
         """Delete vectors for the given ids; returns the number of rows removed."""
@@ -1167,26 +1165,6 @@ class SQLiteNodeStore:
         counts.setdefault(NodeStatus.SUPERSEDED.value, 0)
         counts.setdefault(NodeStatus.DISPUTED.value, 0)
         return counts
-
-    @staticmethod
-    def _sanitize_fts_query(query: str) -> str:
-        """Escape a raw query string for safe use in an FTS5 MATCH expression.
-
-        Wraps each whitespace-delimited token in double-quotes so that
-        special FTS5 operators (/, *, -, etc.) are treated as literals.
-        Returns an empty string when no usable tokens remain.
-        """
-        import re
-        # Strip characters that are problematic even inside FTS5 double-quotes
-        tokens = query.split()
-        safe_tokens: list[str] = []
-        for tok in tokens:
-            # Remove embedded double-quotes to prevent breaking out of quoting
-            tok = tok.replace('"', "")
-            # Keep only tokens that have at least one alphanumeric char
-            if re.search(r"\w", tok):
-                safe_tokens.append(f'"{tok}"')
-        return " ".join(safe_tokens)
 
     def fts_search(self, query: str, limit: int = 10) -> list[tuple[str, float]]:
         """Lexical leg: OR semantics over the CJK-bigram shadow index.
@@ -1739,9 +1717,9 @@ class SQLiteNodeStore:
         """Return aggregate Dreamer metrics for service stats payloads."""
         aggregate = self._dreamer_aggregate_row()
         windows = {
-            "last_24h": _utc_now_isoformat_offset(days=1),
-            "last_7d": _utc_now_isoformat_offset(days=7),
-            "last_30d": _utc_now_isoformat_offset(days=30),
+            "last_24h": _utc_cutoff(1),
+            "last_7d": _utc_cutoff(7),
+            "last_30d": _utc_cutoff(30),
         }
         window_counts = {
             name: self._count_rows_since("dreamer_runs", "started_at", cutoff)
@@ -2012,10 +1990,6 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
 
 def _utc_now_isoformat() -> str:
     return datetime.now(UTC).isoformat().replace(UTC_SUFFIX, "Z")
-
-
-def _utc_now_isoformat_offset(*, days: int) -> str:
-    return (datetime.now(UTC) - timedelta(days=days)).isoformat().replace(UTC_SUFFIX, "Z")
 
 
 def _utc_cutoff(days_threshold: int) -> str:

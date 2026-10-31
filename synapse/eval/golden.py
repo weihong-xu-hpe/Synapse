@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -92,9 +92,3 @@ def load_golden(path: str | Path) -> list[GoldenQuery]:
             )
         )
     return queries
-
-
-def slice_of(query: GoldenQuery) -> str:
-    """Slices reported in metrics: language plus the aggregate 'overall'."""
-
-    return query.language if query.language in {"zh", "en", "mixed", "code", "later-turn"} else "other"

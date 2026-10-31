@@ -29,30 +29,7 @@
 - 如何把唯一主路径做通
 - 如何做安全、审计和兼容性验收
 
-### 3. `TODO-sampling-only-cutover.md`
-
-当前执行跟踪文档。
-
-回答：
-
-- 在不修改 skill 文件的前提下，如何把正式执行面收口到 sampling 高层工具
-- 当前哪些收口动作已经完成
-- 检索一致性、public surface 与文档口径的剩余工作在哪里
-
-### 4. `TODO-agent-validation-followup.md`
-
-基于一次真实 agent 视角验收形成的跟进 TODO。
-
-回答：
-
-- 为什么服务端“已经能做”的能力，在 agent 侧仍可能表现为不可见或不可编排
-- 为什么 MCP tool result 需要收口到标准 `structuredContent` 语义
-- lifecycle 工具在 `no_op` / `keep_as_note` / `recommend_manual_review` 场景下还需要补哪些显式回执
-- 接下来优先修什么，怎样用回归测试把行为钉住
-
-> **2026-08-05 更新**: 本 TODO 主体已完成。决策路径变更后（本地 LLM 为默认），部分验收项需在新语境下复核。
-
-### 5. `TODO-local-llm-upgrade.md`
+### 3. `TODO-local-llm-upgrade.md`
 
 本地 LLM 升级执行计划（当前活跃）。
 
@@ -64,7 +41,7 @@
 - OKF 格式约束如何落地
 - 4 个子阶段的优先级与依赖关系
 
-### 6. `TODO-dreamer-stats-thresholds.md`
+### 4. `TODO-dreamer-stats-thresholds.md`
 
 Dreamer 观测指标与阈值配置化设计（待评审）。
 
@@ -75,7 +52,7 @@ Dreamer 观测指标与阈值配置化设计（待评审）。
 - 哪些 Dreamer 门槛应该优先配置化
 - 如何用实际运行数据微调 Mac 本地环境的阈值
 
-### 7. `synapse-v2-memory-consolidation-and-handbook-architecture.md`
+### 5. `synapse-v2-memory-consolidation-and-handbook-architecture.md`
 
 v2 记忆系统总设计（2026-10-31，待评审）。回答：
 
@@ -98,6 +75,12 @@ v2 记忆系统总设计（2026-10-31，待评审）。回答：
 
 这些文档可以参考，但**不能再作为当前实现依据**。
 
+目录约定：
+
+- `archive/completed-implementation-history/` — 已完成的初始实施拆分（TODO-00 … TODO-14）
+- `archive/completed-execution-history/` — 已完成或已被现行架构取代的执行型 TODO（sampling 收口、tool 收口、agent 验收跟进、lifecycle 简化草案）
+- `archive/superseded-pre-streamable-reset/` — 假设双线 / REST / stdio / HTTP-SSE 为现行方向的旧设计
+
 另外，根目录下的下列文件也只应视为历史注记，而不是当前架构说明：
 
 - `docs/http-sampling-compatibility.md`
@@ -112,9 +95,7 @@ v2 记忆系统总设计（2026-10-31，待评审）。回答：
 1. `streamable-mcp-single-path-architecture.md`
 2. `streamable-mcp-implementation-plan.md`
 3. `TODO-local-llm-upgrade.md`
-4. `TODO-sampling-only-cutover.md`
-5. `TODO-agent-validation-followup.md`
-6. `TODO-dreamer-stats-thresholds.md`
-7. `synapse-v2-memory-consolidation-and-handbook-architecture.md`
+4. `TODO-dreamer-stats-thresholds.md`
+5. `synapse-v2-memory-consolidation-and-handbook-architecture.md`
 
 读完这几份，再决定是否需要查看 `archive/` 里的历史材料。

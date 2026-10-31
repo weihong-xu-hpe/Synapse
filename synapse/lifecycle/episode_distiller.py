@@ -8,7 +8,6 @@ import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from synapse.config import DeciderEndpointSettings, SynapseConfig
@@ -20,6 +19,7 @@ from synapse.okf import (
     EVIDENCE_QUOTE_MAX_CHARS,
     TAKEAWAY_MAX_CHARS,
     OkfItem,
+    _split_sections,
     render_evidence_section,
     verify_evidence,
     validate_okf_node,
@@ -1439,10 +1439,8 @@ def _item_from_op(
     verified: bool,
 ) -> OkfItem:
     takeaway = _takeaway(content)
-    sections: dict[str, str] = {}
-    for name in TYPE_REQUIRED_SECTIONS.get(op.okf_type, ()):
-        match = re.search(rf"(?ms)^## {re.escape(name)}\s*\n(.*?)(?=^## |\Z)", content)
-        sections[name] = match.group(1).strip() if match else ""
+    split = _split_sections(content)
+    sections = {name: split.get(name, "") for name in TYPE_REQUIRED_SECTIONS.get(op.okf_type, ())}
     return OkfItem(
         okf_type=op.okf_type,
         title=op.title,

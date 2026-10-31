@@ -426,14 +426,6 @@ class HTTPJSONClient:
     default_headers: Mapping[str, str] = field(default_factory=dict)
     timeout_seconds: int = 30
 
-    def get_json(self, endpoint: str, *, timeout_seconds: int | None = None) -> Any:
-        request = urllib_request.Request(
-            _join_url(self.base_url, endpoint),
-            headers={"Accept": JSON_MIME_TYPE, **dict(self.default_headers)},
-            method="GET",
-        )
-        return _open_json_request(request, timeout_seconds or self.timeout_seconds)
-
     def post_json(self, endpoint: str, payload: Mapping[str, Any], *, timeout_seconds: int | None = None) -> Any:
         request = urllib_request.Request(
             _join_url(self.base_url, endpoint),
@@ -913,21 +905,6 @@ def _build_provider_headers(headers: Mapping[str, str], api_key_env: str | None 
                 resolved_headers[key] = value.replace(API_KEY_PLACEHOLDER, "")
 
     return resolved_headers
-
-
-def _candidate_model_names(model_name: str) -> list[str]:
-    base_model = model_name.split(":", 1)[0]
-    candidates = [model_name]
-    if base_model != model_name:
-        candidates.append(base_model)
-    else:
-        candidates.append(f"{base_model}:latest")
-
-    unique_candidates: list[str] = []
-    for candidate in candidates:
-        if candidate not in unique_candidates:
-            unique_candidates.append(candidate)
-    return unique_candidates
 
 
 def _open_json_request(request: urllib_request.Request, timeout_seconds: int) -> Any:
