@@ -5,11 +5,18 @@ format enforced by validation (see §6); the distiller produces OKF nodes per §
 
 ## 1. What OKF is
 
-An OKF node is a Markdown file in `~/synapse/active/` whose body follows one of four **typed
+An OKF node is a Markdown file under `~/synapse/active/` whose body follows one of four **typed
 templates** and whose frontmatter carries the type as first-class metadata. OKF supersedes the
 previous untyped notion ("persistent node with some `##` sections", synapse/server/sampling.py:140,
 synapse/lifecycle/condensation.py:62-65) and realizes the design intent recorded in
 docs/design/TODO-local-llm-upgrade.md:18 ("分节 + 来源 + takeaway" — sections + sources + takeaway).
+
+Files are organized for humans: `active/<project>/<kebab-slug>.md` (e.g.
+`active/payments-svc/helm-hook-timeout-cleanup.md`). The file name is derived
+from the node id (the `mem_YYYYMMDD_` prefix is stripped, underscores become hyphens); the node's
+**identity stays in the frontmatter `id`**, so frontmatter is authoritative and file names may
+change freely. `[[mem_…]]` wiki links, `sources`, and the SQLite `nodes.id` keys are all id-based
+and unaffected by the layout.
 
 Principles:
 - **Typed, small set, extensible.** Four types cover how coding-agent knowledge actually occurs:
@@ -224,6 +231,9 @@ candidate, findings, action/targets, and sources to
 `~/synapse/.distiller-quarantine/YYYYMMDD.jsonl`; remaining items continue. The transcript is
 stamped after all non-quarantined items finish. Endpoint/transport failures are not quarantined
 and leave the transcript retryable. Recorded warning codes are recomputed from the final body.
+Automatic distiller updates that omit existing substantive lines are quarantined
+as `okf_update_loss_risk` rather than overwriting the old node. This conservative
+guard can require manual review for intentional corrections or paraphrases.
 
 ## 7. Title rule & ID plan
 
@@ -275,7 +285,7 @@ Owner decision C — **annotate, never auto-inject**. Distilled items carry an
 ```
 
 - Episode Stage 1 considers User, Assistant, and Tool turns. Stage 2 supplies verbatim excerpts from cited turns, including Assistant bodies and surviving Tool sections.
-- Episode writes honor the gatekeeper's `verified` boolean when present. Without it, the server deterministically checks evidence quotes against all named turn bodies and Tool sections, including Assistant source-code/log analysis. Verification is an annotation, not a write gate: speculative or ungrounded lessons remain writable with `verified: false` and are excluded from auto-injection.
+- The server deterministically checks every evidence quote against the named turn bodies and Tool sections. The gatekeeper cannot set `verified: true` when evidence is missing or unmatched; it may still explicitly mark an otherwise matched item unverified. Verification is an annotation, not a write gate: ungrounded lessons remain writable with `verified: false` and are excluded from auto-injection.
 - Verified items get frontmatter `verified: true` and a `## Evidence` section
   (`- T12: "quote"`). Unverifiable items are still written with `verified: false`
   and their (unverifiable) evidence listed.
@@ -298,11 +308,12 @@ The active server-side pipeline is the Two-Stage Episode Distiller. Both bridge-
 fallback selects transcripts idle for `[distiller].idle_minutes` (60 minutes by default) on the
 configured sweep interval. The close endpoint accepts `session_key` and a reason of `idle`,
 `shutdown`, or `switch`; with `[distiller].enabled=false` it returns `status=disabled`, otherwise it
-queues a per-session serialized background run and returns `status=accepted`.
+queues a per-transcript serialized background run and returns `status=accepted` before completion.
+Short non-empty revisions are scanned on close. The idle sweep defers short revisions without
+advancing their watermark and retries them after their content changes.
 
 The `synapse distill episode` CLI runs the same pipeline against an explicitly selected database/base
-copy. It accepts repeated `--session` values and processes them sequentially so later sessions can
-retrieve earlier writes.
+copy. It accepts repeated `--session` values; `--workers` controls concurrent processing.
 
 The Stage 1 scanner uses `[distiller.episode.scanner_endpoints]` (or `endpoints`); legacy
 `[distiller.episode.endpoint]` remains the single-endpoint fallback. Missing scanner
@@ -328,6 +339,15 @@ bodies have a separate 24,000-character conservative budget. Takeaways are Chine
 targeting at most 160 characters (hard limit 200), with the required OKF sections and a focused
 takeaway-only repair when needed. A gatekeeper `verified` annotation is honored at write time; false
 verification never blocks a valid node write.
+
+Both stages carry a credential gate. The Stage 1 scanner and the Stage 2 gatekeeper are instructed to
+keep the config key, secret name, namespace, or rotation procedure instead of a credential value and
+to write `<redacted>` in its place, to return `none` (reason `credential only`) when the value is the
+lesson's only substance, and to quote evidence fragments that exclude the value rather than rewrite a
+quote. The write path then scrubs the assembled body — including the persisted evidence quotes — with
+the credential-only rules (password/client-secret/token/API-key assignments, private key blocks, URL
+userinfo, and Kubernetes `stringData:`/`data:` blocks). Verification runs against the raw operation
+fields before that scrub, so scrubbing never downgrades `verified`.
 
 Stage 2 may return an optional `related_ids` array (up to three IDs) on create/update operations. The IDs must come from the supplied same-session or retrieved candidates; the write path retains only active persistent knowledge nodes and excludes transcript IDs and the update target itself. Related links are rendered as a single `## Related` section immediately before `## Sources`; updates preserve existing persistent knowledge links and merge new related candidates, while creates persist the corresponding knowledge-to-knowledge graph edges.
 

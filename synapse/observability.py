@@ -110,29 +110,43 @@ def collect_daily_snapshot(
     *,
     day: date,
     store: SQLiteNodeStore | None = None,
+    include_stock_metrics: bool = True,
 ) -> dict[str, Any]:
-    """Build one day's metrics payload. Read-only; never mutates store state."""
+    """Build one day's metric payload. Read-only; never mutates store state."""
 
     start_utc, end_utc = local_day_window(day)
     owns_store = store is None
     if store is None:
         store = _open_store(config, runtime_paths)
     try:
-        payload: dict[str, Any] = {
-            "nodes": _node_counts(store),
-            "transcripts": _transcript_counts(store),
-            "writes": _day_write_mix(store, start_utc, end_utc),
-            "distiller": _day_distiller_yield(store, start_utc, end_utc),
-            "searches": _day_search_stats(store, start_utc, end_utc),
-            "dreamer": _day_dreamer_runs(store, start_utc, end_utc),
-            "storage": {
-                "db_bytes": (runtime_paths.base / "synapse.db").stat().st_size
-                if (runtime_paths.base / "synapse.db").exists()
-                else 0,
-                "active_bytes": _dir_size(runtime_paths.active),
-                "archive_bytes": _dir_size(runtime_paths.archive),
-            },
-        }
+        payload: dict[str, Any] = {}
+        if include_stock_metrics:
+            payload.update(
+                {
+                    "nodes": _node_counts(store),
+                    "transcripts": _transcript_counts(store),
+                    "storage": {
+                        "db_bytes": (runtime_paths.base / "synapse.db").stat().st_size
+                        if (runtime_paths.base / "synapse.db").exists()
+                        else 0,
+                        "active_bytes": _dir_size(runtime_paths.active),
+                        "transcripts_bytes": _dir_size(runtime_paths.transcripts),
+                        "archive_bytes": _dir_size(runtime_paths.archive),
+                    },
+                    # §6.5 north-star trend series ride the stock block: they
+                    # are stock metrics (current graph/usage state), so they
+                    # follow exactly the same captured-this-day semantics.
+                    "north_star": collect_north_star_metrics(store, runtime_paths=runtime_paths),
+                }
+            )
+        payload.update(
+            {
+                "writes": _day_write_mix(store, start_utc, end_utc),
+                "distiller": _day_distiller_yield(store, start_utc, end_utc),
+                "searches": _day_search_stats(store, start_utc, end_utc),
+                "dreamer": _day_dreamer_runs(store, start_utc, end_utc),
+            }
+        )
         return payload
     finally:
         if owns_store:
@@ -271,26 +285,91 @@ def _day_write_mix(store: SQLiteNodeStore, start_utc: str, end_utc: str) -> dict
 
 
 def _day_distiller_yield(store: SQLiteNodeStore, start_utc: str, end_utc: str) -> dict[str, Any]:
-    row = store.connection.execute(
+    rows = store.connection.execute(
         """
-        SELECT COUNT(*) AS runs,
-               COALESCE(SUM(transcripts_scanned), 0) AS transcripts_scanned,
-               COALESCE(SUM(transcripts_distilled), 0) AS transcripts_distilled,
-               COALESCE(SUM(transcripts_skipped), 0) AS transcripts_skipped,
-               COALESCE(SUM(items_extracted), 0) AS items_extracted,
-               COALESCE(SUM(items_invalid), 0) AS items_invalid,
-               COALESCE(SUM(decider_complements), 0) AS items_updated,
-               COALESCE(SUM(decider_creates), 0) AS items_created,
-               COALESCE(SUM(items_quarantined), 0) AS items_quarantined,
-               COALESCE(SUM(llm_failures), 0) AS llm_failures,
-               COALESCE(SUM(decider_downgrades), 0) AS decider_downgrades,
-               COALESCE(SUM(archived_transcripts), 0) AS archived_transcripts
+        SELECT transcripts_scanned, transcripts_distilled, transcripts_skipped,
+               items_extracted, items_invalid, decider_complements AS items_updated,
+               decider_creates AS items_created, items_quarantined, failures,
+               decider_downgrades, archived_transcripts, "trigger", attempts_json
         FROM distiller_runs WHERE started_at >= ? AND started_at < ?
         """,
         (start_utc, end_utc),
-    ).fetchone()
-    return {key: int(row[key] or 0) for key in row.keys()}
-
+    ).fetchall()
+    totals = {
+        "runs": len(rows),
+        "transcripts_scanned": 0,
+        "transcripts_distilled": 0,
+        "transcripts_skipped": 0,
+        "items_extracted": 0,
+        "items_invalid": 0,
+        "items_updated": 0,
+        "items_created": 0,
+        "items_quarantined": 0,
+        "failures": 0,
+        "decider_downgrades": 0,
+        "archived_transcripts": 0,
+    }
+    by_trigger: dict[str, int] = {}
+    attempts_by_outcome: dict[str, int] = {}
+    failure_stages: dict[str, int] = {}
+    observed_unique_sessions: set[str] = set()
+    attempts_observed = 0
+    unattributed_runs = 0
+    valid_stages = {"source_lookup", "scanner", "gatekeeper", "write", "extract", "integrate", "unknown"}
+    for row in rows:
+        for key in totals.keys() - {"runs"}:
+            totals[key] += int(row[key] or 0)
+        trigger = str(row["trigger"] or "legacy")
+        by_trigger[trigger] = by_trigger.get(trigger, 0) + 1
+        raw_attempts = row["attempts_json"]
+        try:
+            attempts = json.loads(str(raw_attempts)) if raw_attempts is not None else None
+        except (json.JSONDecodeError, TypeError):
+            attempts = None
+        failures = int(row["failures"] or 0)
+        if trigger == "legacy" or not isinstance(attempts, list):
+            unattributed_runs += 1
+            if failures:
+                failure_stages["unknown"] = failure_stages.get("unknown", 0) + failures
+            continue
+        attempt_failures = 0
+        malformed_attempt = False
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                malformed_attempt = True
+                continue
+            attempts_observed += 1
+            session = attempt.get("session")
+            if isinstance(session, str) and session:
+                observed_unique_sessions.add(session)
+            raw_outcome = attempt.get("outcome")
+            outcome = (
+                raw_outcome
+                if isinstance(raw_outcome, str) and raw_outcome in {"distilled", "skipped", "deferred", "failed"}
+                else "unknown"
+            )
+            attempts_by_outcome[outcome] = attempts_by_outcome.get(outcome, 0) + 1
+            if outcome == "failed":
+                attempt_failures += 1
+                raw_stage = attempt.get("stage")
+                stage = raw_stage if isinstance(raw_stage, str) and raw_stage in valid_stages else "unknown"
+                failure_stages[stage] = failure_stages.get(stage, 0) + 1
+        unattributed_failures = max(0, failures - attempt_failures)
+        if malformed_attempt or unattributed_failures:
+            unattributed_runs += 1
+        if unattributed_failures:
+            failure_stages["unknown"] = failure_stages.get("unknown", 0) + unattributed_failures
+    totals.update(
+        {
+            "by_trigger": by_trigger,
+            "attempts_by_outcome": attempts_by_outcome,
+            "failure_stages": failure_stages,
+            "attempts_observed": attempts_observed,
+            "observed_unique_sessions": len(observed_unique_sessions),
+            "unattributed_runs": unattributed_runs,
+        }
+    )
+    return totals
 
 def _day_dreamer_runs(store: SQLiteNodeStore, start_utc: str, end_utc: str) -> dict[str, Any]:
     row = store.connection.execute(
@@ -374,11 +453,11 @@ def write_missing_snapshots(
     *,
     backfill_days: int = 2,
 ) -> list[str]:
-    """Write today's snapshot row and backfill recent missing days.
+    """Refresh today's snapshot and recent event metrics; backfill missing days.
 
-    Idempotent per local date (primary-key guarded). Days before the earliest
-    recorded event are skipped so fresh installs don't accumulate zero rows.
-    Returns the list of dates written.
+    Timestamped events can be reconstructed for recent days, but stock counts
+    and storage sizes can only be reused from a snapshot captured that day.
+    Days before the earliest recorded event are skipped.
     """
 
     written: list[str] = []
@@ -389,21 +468,69 @@ def write_missing_snapshots(
         today_local = now.astimezone().date()
         days = [today_local - timedelta(days=offset) for offset in range(backfill_days, -1, -1)]
         for day in days:
-            if earliest is not None and day < earliest:
-                continue
             date_key = day.isoformat()
-            existing = store.connection.execute(
-                "SELECT 1 FROM metrics_snapshots WHERE date = ?", (date_key,)
+            existing_row = store.connection.execute(
+                "SELECT created_at, payload FROM metrics_snapshots WHERE date = ?", (date_key,)
             ).fetchone()
-            if existing is not None:
+            if earliest is not None and day < earliest and existing_row is None:
                 continue
-            payload = collect_daily_snapshot(config, runtime_paths, day=day, store=store)
-            created = store.record_metrics_snapshot(
+            existing_payload: dict[str, Any] | None = None
+            if existing_row is not None:
+                try:
+                    parsed_payload = json.loads(str(existing_row["payload"]))
+                except json.JSONDecodeError:
+                    parsed_payload = None
+                if isinstance(parsed_payload, dict):
+                    existing_payload = parsed_payload
+
+            payload = collect_daily_snapshot(
+                config,
+                runtime_paths,
+                day=day,
+                store=store,
+                include_stock_metrics=day == today_local,
+            )
+            if day < today_local:
+                captured_at = (
+                    existing_payload.get("stock_captured_at") if existing_payload is not None else None
+                ) or (existing_row["created_at"] if existing_row is not None else None)
+                try:
+                    captured_day = datetime.fromisoformat(str(captured_at).replace("Z", "+00:00")).astimezone().date()
+                except (TypeError, ValueError):
+                    captured_day = None
+                available = (
+                    existing_payload is not None
+                    and existing_payload.get("stock_metrics_available") is not False
+                    and captured_day == day
+                    and all(isinstance(existing_payload.get(key), dict) for key in ("nodes", "transcripts", "storage"))
+                )
+                if available:
+                    for key in ("nodes", "transcripts", "storage"):
+                        payload[key] = existing_payload[key]
+                    payload["stock_captured_at"] = captured_at
+                    payload["stock_metrics_available"] = True
+                else:
+                    payload.update(
+                        {
+                            "nodes": None,
+                            "transcripts": None,
+                            "storage": None,
+                            "stock_captured_at": None,
+                            "stock_metrics_available": False,
+                            "stock_metrics_reason": "not_captured_on_date",
+                        }
+                    )
+            else:
+                payload["stock_captured_at"] = now.isoformat().replace("+00:00", "Z")
+                payload["stock_metrics_available"] = True
+
+            saved = store.record_metrics_snapshot(
                 date=date_key,
                 created_at=now.isoformat().replace("+00:00", "Z"),
                 payload=payload,
+                replace=True,
             )
-            if created:
+            if saved:
                 written.append(date_key)
     finally:
         store.close()
@@ -652,9 +779,9 @@ def _report_sections(
                COALESCE(SUM(items_extracted), 0) AS items,
                COALESCE(SUM(decider_creates), 0) AS creates,
                COALESCE(SUM(decider_complements), 0) AS updates,
-               COALESCE(SUM(items_invalid), 0) AS filtered,
+               COALESCE(SUM(items_invalid), 0) AS gatekeeper_none,
                COALESCE(SUM(items_quarantined), 0) AS quarantined,
-               COALESCE(SUM(llm_failures), 0) AS failures,
+               COALESCE(SUM(failures), 0) AS failures,
                COALESCE(SUM(archived_transcripts), 0) AS archived
         FROM distiller_runs WHERE started_at >= ?
         """,
@@ -669,13 +796,14 @@ def _report_sections(
         """,
         (cutoff,),
     ).fetchone()
-    lines.append("## Lifecycle")
+    distiller_failure_count = int(distiller_row["failures"] or 0)
+    distiller_failure_label = "failure" if distiller_failure_count == 1 else "failures"
     lines.append(
         f"- Distiller: {int(distiller_row['runs'])} runs, {int(distiller_row['distilled'])} transcripts distilled "
         f"({int(distiller_row['skipped'])} short/noop skipped), {int(distiller_row['items'])} Stage-1 lessons -> "
         f"{int(distiller_row['creates'])} created + {int(distiller_row['updates'])} updated + "
-        f"{int(distiller_row['filtered'])} gatekeeper-filtered (none) + "
-        f"{int(distiller_row['quarantined'])} quarantined, {int(distiller_row['failures'])} LLM failures, "
+        f"{int(distiller_row['gatekeeper_none'])} Gatekeeper none results + "
+        f"{int(distiller_row['quarantined'])} quarantined, {distiller_failure_count} generic {distiller_failure_label}, "
         f"{int(distiller_row['archived'])} archived"
     )
     lines.append(
@@ -690,12 +818,22 @@ def _report_sections(
         db_path = runtime_paths.base / "synapse.db"
         lines.append(f"_No snapshots yet. Current DB size: {db_path.stat().st_size if db_path.exists() else 0} bytes._")
     else:
-        lines.append("| Date | DB bytes | Active bytes | Archive bytes |")
-        lines.append("|---|---|---|---|")
+        lines.append("| Date | DB bytes | Active bytes | Transcripts bytes | Archive bytes |")
+        lines.append("|---|---|---|---|---|")
         for snapshot in snapshots:
-            storage = snapshot["payload"].get("storage", {})
+            storage = snapshot["payload"].get("storage")
+            storage_values = (
+                (
+                    storage.get("db_bytes", 0),
+                    storage.get("active_bytes", 0),
+                    storage.get("transcripts_bytes", 0),
+                    storage.get("archive_bytes", 0),
+                )
+                if isinstance(storage, dict)
+                else ("unavailable", "unavailable", "unavailable", "unavailable")
+            )
             lines.append(
-                f"| {snapshot['date']} | {storage.get('db_bytes', 0)} | {storage.get('active_bytes', 0)} | {storage.get('archive_bytes', 0)} |"
+                f"| {snapshot['date']} | {storage_values[0]} | {storage_values[1]} | {storage_values[2]} | {storage_values[3]} |"
             )
     lines.append("")
 
@@ -967,4 +1105,375 @@ def _render_audit_report(summary: dict[str, Any], worst: list[dict[str, Any]]) -
         lines.append(
             f"- relevance={item['relevance']} [{item['source']}] `{item['node_id']}` — {item['reason']} (query: {item['query'][:120]})"
         )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# §6.5 North-star metrics — the four observability targets consumed by
+# `synapse stats` and stored in daily snapshots. All queries run against
+# existing tables (nodes/edges/search_events/distiller_runs/dreamer_runs/
+# write_memory_events). Tolerant of the P1B counter columns
+# (retrieved_count/injected_count/used_count) not existing yet: metric 2
+# falls back to access_count + search_events aggregates so it still yields a
+# useful baseline on pre-Phase-1B databases.
+# ---------------------------------------------------------------------------
+
+_NORTH_STAR_COUNTER_COLUMNS = ("retrieved_count", "injected_count", "used_count")
+
+
+def _ratio(numerator: float, denominator: float) -> float | None:
+    if not denominator:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def _node_usage_counter_columns(store: SQLiteStoreLike) -> set[str]:
+    try:
+        rows = store.connection.execute("PRAGMA table_info(nodes)").fetchall()
+    except Exception:  # noqa: BLE001 — metrics must never break callers
+        return set()
+    return {str(row["name"]) for row in rows} & set(_NORTH_STAR_COUNTER_COLUMNS)
+
+
+def _north_star_consolidation(store: SQLiteStoreLike) -> dict[str, Any]:
+    """Metric 1: share of knowledge nodes corroborated by >=2 sources (target >50%)."""
+
+    multi = 0
+    single = 0
+    try:
+        rows = store.connection.execute(
+            """
+            SELECT json_array_length(json_extract(okf_meta, '$.sources')) AS source_count,
+                   COUNT(*) AS count
+            FROM nodes
+            WHERE type = 'persistent'
+              AND id NOT LIKE 'mem\\_session\\_%' ESCAPE '\\'
+              AND json_valid(okf_meta)
+              AND json_extract(okf_meta, '$.sources') IS NOT NULL
+            GROUP BY source_count
+            """
+        ).fetchall()
+        for row in rows:
+            count = int(row["count"])
+            if int(row["source_count"] or 0) >= 2:
+                multi += count
+            else:
+                single += count
+    except Exception:  # noqa: BLE001
+        pass
+    total = multi + single
+    return {
+        "multi_source_nodes": multi,
+        "single_source_nodes": single,
+        "total_knowledge_nodes": total,
+        "consolidation_ratio": _ratio(multi, total),
+        "target": "> 0.50",
+    }
+
+
+def _north_star_signal_to_noise(store: SQLiteStoreLike) -> dict[str, Any]:
+    """Metric 2: retrieved -> injected -> used funnel quality.
+
+    With P1B counters present the totals come from the nodes table (the
+    honest per-node counters). Without them, retrieved/injected come from
+    search_events result rows (results = retrieved, inject=true = injected)
+    and `used_total` stays null — there is no pre-Phase-1B usage signal to
+    fabricate from access_count, which the 4x top-k inflation showed to be
+    biased.
+    """
+
+    totals: dict[str, int | None] = {"retrieved_total": 0, "injected_total": 0, "used_total": None}
+    counters = _node_usage_counter_columns(store)
+    if set(_NORTH_STAR_COUNTER_COLUMNS) <= counters:
+        row = store.connection.execute(
+            """
+            SELECT COALESCE(SUM(retrieved_count), 0) AS retrieved,
+                   COALESCE(SUM(injected_count), 0) AS injected,
+                   COALESCE(SUM(used_count), 0) AS used
+            FROM nodes WHERE type = 'persistent'
+            """
+        ).fetchone()
+        totals["retrieved_total"] = int(row["retrieved"] or 0)
+        totals["injected_total"] = int(row["injected"] or 0)
+        totals["used_total"] = int(row["used"] or 0)
+        counter_source = "nodes.counters"
+    else:
+        counter_source = "search_events"
+        for row in store.connection.execute("SELECT results FROM search_events").fetchall():
+            for item in _parse_results(row["results"]):
+                if item.get("node_id"):
+                    totals["retrieved_total"] += 1
+                    if item.get("inject"):
+                        totals["injected_total"] += 1
+
+    search_row = store.connection.execute(
+        """
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN source LIKE 'bridge%' THEN 1 ELSE 0 END), 0) AS bridge
+        FROM search_events
+        """
+    ).fetchone()
+    used_total = totals["used_total"]
+    injected_total = totals["injected_total"]
+    return {
+        "total_searches": int(search_row["total"] or 0),
+        "bridge_searches": int(search_row["bridge"] or 0),
+        "retrieved_total": totals["retrieved_total"],
+        "injected_total": injected_total,
+        "used_total": used_total,
+        "inject_gate_pass_rate": _ratio(injected_total, totals["retrieved_total"]),
+        "utility_conversion_rate": _ratio(used_total or 0, injected_total) if used_total is not None else None,
+        "counter_source": counter_source,
+    }
+
+
+def _north_star_graph_connectivity(store: SQLiteStoreLike) -> dict[str, Any]:
+    """Metric 3: orphan rate (target <3%) and project hub coverage."""
+
+    try:
+        active_rows = store.connection.execute(
+            """
+            SELECT id, json_extract(okf_meta, '$.project') AS project, tags
+            FROM nodes
+            WHERE type = 'persistent' AND status = 'active'
+              AND id NOT LIKE 'mem\\_session\\_%' ESCAPE '\\'
+            """
+        ).fetchall()
+        edge_rows = store.connection.execute("SELECT source_id, target_id FROM edges").fetchall()
+    except Exception:  # noqa: BLE001
+        return {
+            "active_knowledge_nodes": 0,
+            "orphan_nodes": 0,
+            "orphan_rate": None,
+            "hub_nodes_count": 0,
+            "projects_with_hub_ratio": None,
+            "target": "orphan_rate < 0.03",
+        }
+    degree: dict[str, int] = {}
+    for row in edge_rows:
+        degree[str(row["source_id"])] = degree.get(str(row["source_id"]), 0) + 1
+        degree[str(row["target_id"])] = degree.get(str(row["target_id"]), 0) + 1
+
+    projects: set[str] = set()
+    hub_projects: set[str] = set()
+    no_edges = 0
+    hub_nodes = 0
+    for row in active_rows:
+        node_id = str(row["id"])
+        if degree.get(node_id, 0) == 0:
+            no_edges += 1
+        try:
+            tags = json.loads(str(row["tags"] or "[]"))
+        except json.JSONDecodeError:
+            tags = []
+        is_hub = isinstance(tags, list) and "dreamer-hub" in tags
+        if is_hub:
+            hub_nodes += 1
+        project = str(row["project"]) if row["project"] else "unassigned"
+        projects.add(project)
+        if is_hub:
+            hub_projects.add(project)
+    total = len(active_rows)
+    return {
+        "active_knowledge_nodes": total,
+        "orphan_nodes": no_edges,
+        "orphan_rate": _ratio(no_edges, total),
+        "hub_nodes_count": hub_nodes,
+        "projects_with_hub_ratio": _ratio(len(hub_projects), len(projects)),
+        "target": "orphan_rate < 0.03",
+    }
+
+
+def _north_star_quarantine_codes(store: SQLiteStoreLike) -> dict[str, int]:
+    """Break down write-path warnings by code, esp. the §3.3 loss-risk split."""
+
+    breakdown: dict[str, int] = {}
+    try:
+        for row in store.connection.execute("SELECT warning_codes FROM write_memory_events").fetchall():
+            try:
+                codes = json.loads(str(row["warning_codes"] or "[]"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(codes, list):
+                continue
+            for code in codes:
+                key = str(code)
+                breakdown[key] = breakdown.get(key, 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    return breakdown
+
+
+def _north_star_quarantine_files(runtime_paths: RuntimePaths | None) -> dict[str, int]:
+    """Count quarantine records on disk, which predate/parallels the DB counter."""
+
+    by_code: dict[str, int] = {}
+    if runtime_paths is None:
+        return by_code
+    directory = runtime_paths.base / ".distiller-quarantine"
+    if not directory.is_dir():
+        return by_code
+    for path in sorted(directory.glob("*.jsonl")):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    findings = record.get("validator_findings")
+                    codes = []
+                    if isinstance(findings, list):
+                        codes = [
+                            str(finding.get("code"))
+                            for finding in findings
+                            if isinstance(finding, dict) and finding.get("code")
+                        ]
+                    if not codes:
+                        codes = ["unspecified"]
+                    for code in codes:
+                        by_code[code] = by_code.get(code, 0) + 1
+        except OSError:
+            continue
+    return by_code
+
+
+def _north_star_llm_gate_health(store: SQLiteStoreLike, runtime_paths: RuntimePaths | None) -> dict[str, Any]:
+    """Metric 4: distiller gate yields split by warning code (§6.5 acceptance 5)."""
+
+    runs = 0
+    zero_item_runs = 0
+    items_extracted = 0
+    items_quarantined = 0
+    try:
+        for row in store.connection.execute(
+            "SELECT items_extracted, items_quarantined FROM distiller_runs"
+        ).fetchall():
+            runs += 1
+            extracted = int(row["items_extracted"] or 0)
+            items_extracted += extracted
+            items_quarantined += int(row["items_quarantined"] or 0)
+            if extracted == 0:
+                zero_item_runs += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    file_codes = _north_star_quarantine_files(runtime_paths)
+    db_codes = _north_star_quarantine_codes(store)
+    warnings_by_code = dict(db_codes)
+    for code in file_codes:
+        warnings_by_code.setdefault(code, 0)
+
+    try:
+        dreamer_row = store.connection.execute(
+            """
+            SELECT COUNT(*) AS runs,
+                   COALESCE(MAX(started_at), '') AS last_started_at,
+                   COALESCE(SUM(condensed), 0) AS condensed,
+                   COALESCE(SUM(links_added), 0) AS links_added
+            FROM dreamer_runs WHERE started_at >= ?
+            """,
+            (_utc_cutoff(7),),
+        ).fetchone()
+        dreamer = {
+            "runs_last_7d": int(dreamer_row["runs"] or 0),
+            "last_started_at": str(dreamer_row["last_started_at"] or "") or None,
+            "condensed_last_7d": int(dreamer_row["condensed"] or 0),
+            "links_added_last_7d": int(dreamer_row["links_added"] or 0),
+        }
+    except Exception:  # noqa: BLE001
+        dreamer = {"runs_last_7d": 0, "last_started_at": None, "condensed_last_7d": 0, "links_added_last_7d": 0}
+
+    return {
+        "runs": runs,
+        "items_extracted": items_extracted,
+        "items_quarantined": items_quarantined,
+        "quarantine_rate": _ratio(items_quarantined, items_extracted + items_quarantined),
+        "quarantine_codes_db": db_codes,
+        "quarantine_codes_files": file_codes,
+        "okf_update_loss_risk": int(file_codes.get("okf_update_loss_risk", db_codes.get("okf_update_loss_risk", 0))),
+        "okf_takeaway_invalid": int(file_codes.get("okf_takeaway_invalid", db_codes.get("okf_takeaway_invalid", 0))),
+        "warnings_by_code": warnings_by_code,
+        "zero_item_sweep_count": zero_item_runs,
+        "zero_item_sweep_ratio": _ratio(zero_item_runs, runs),
+        "dreamer_recent": dreamer,
+    }
+
+
+def collect_north_star_metrics(
+    store: SQLiteStoreLike,
+    *,
+    runtime_paths: RuntimePaths | None = None,
+) -> dict[str, Any]:
+    """Compute the four §6.5 north-star metrics. Read-only, never raises."""
+
+    return {
+        "consolidation": _north_star_consolidation(store),
+        "signal_to_noise": _north_star_signal_to_noise(store),
+        "graph_connectivity": _north_star_graph_connectivity(store),
+        "llm_gate_health": _north_star_llm_gate_health(store, runtime_paths),
+    }
+
+
+def _fmt_rate(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1%}"
+
+
+def render_north_star_stats(metrics: dict[str, Any]) -> str:
+    """Render collect_north_star_metrics output as a compact markdown table."""
+
+    consolidation = metrics.get("consolidation") or {}
+    signal = metrics.get("signal_to_noise") or {}
+    graph = metrics.get("graph_connectivity") or {}
+    gate = metrics.get("llm_gate_health") or {}
+    lines = [
+        "# Synapse north-star metrics",
+        "",
+        "## 1. Consolidation ratio (target > 50%)",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Multi-source knowledge nodes | {consolidation.get('multi_source_nodes', 0)} |",
+        f"| Single-source knowledge nodes | {consolidation.get('single_source_nodes', 0)} |",
+        f"| Total knowledge nodes | {consolidation.get('total_knowledge_nodes', 0)} |",
+        f"| **Consolidation ratio** | **{_fmt_rate(consolidation.get('consolidation_ratio'))}** |",
+        "",
+        "## 2. Recall signal-to-noise",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Total searches | {signal.get('total_searches', 0)} |",
+        f"| Bridge searches | {signal.get('bridge_searches', 0)} |",
+        f"| Retrieved total | {signal.get('retrieved_total', 0)} |",
+        f"| Injected total | {signal.get('injected_total', 0)} |",
+        f"| Used total | {signal.get('used_total') if signal.get('used_total') is not None else '-'} |",
+        f"| Inject gate pass rate (injected/retrieved) | {_fmt_rate(signal.get('inject_gate_pass_rate'))} |",
+        f"| Utility conversion (used/injected) | {_fmt_rate(signal.get('utility_conversion_rate'))} |",
+        f"| Counter source | `{signal.get('counter_source', '-')}` |",
+        "",
+        "## 3. Wiki graph connectivity (target orphan < 3%)",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Active knowledge nodes | {graph.get('active_knowledge_nodes', 0)} |",
+        f"| Orphan nodes (0 edges) | {graph.get('orphan_nodes', 0)} |",
+        f"| **Orphan rate** | **{_fmt_rate(graph.get('orphan_rate'))}** |",
+        f"| Hub nodes | {graph.get('hub_nodes_count', 0)} |",
+        f"| Projects with a hub | {_fmt_rate(graph.get('projects_with_hub_ratio'))} |",
+        "",
+        "## 4. LLM gate & cost health",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Distiller runs | {gate.get('runs', 0)} |",
+        f"| Items extracted | {gate.get('items_extracted', 0)} |",
+        f"| Items quarantined | {gate.get('items_quarantined', 0)} |",
+        f"| Quarantine rate | {_fmt_rate(gate.get('quarantine_rate'))} |",
+        f"| `okf_update_loss_risk` | {gate.get('okf_update_loss_risk', 0)} |",
+        f"| `okf_takeaway_invalid` | {gate.get('okf_takeaway_invalid', 0)} |",
+        f"| Zero-item sweep ratio | {_fmt_rate(gate.get('zero_item_sweep_ratio'))} |",
+        f"| Dreamer runs (last 7d) | {(gate.get('dreamer_recent') or {}).get('runs_last_7d', 0)} |",
+    ]
     return "\n".join(lines) + "\n"

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import math
+import sqlite3
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from synapse.config import SynapseConfig
 from synapse.embedding import create_embedding_engine, create_reranker_engine
@@ -29,6 +30,18 @@ STATUS_MULTIPLIERS: dict[NodeStatus, float] = {
 # Persistent knowledge receives a fixed mild logit-space penalty instead of an
 # access-driven decay clock (see RetrievalPipeline.apply_decay).
 DECAY_PERSISTENT_PENALTY = -0.2
+
+# --- P2 scoring knobs (design doc §4.3(3)) --------------------------------
+# ACT-R base-level activation B_i = ln(1 + n_eff * t_eff^-0.5) scaled by alpha:
+# a nudge that lets frequently *used* memories rise, bounded so it can never
+# override the cross-encoder reranker's relevance ordering.
+ACTIVATION_ALPHA = 0.15
+# injected_count is a weak prior: 4 injections ≈ 1 real use.
+ACTIVATION_INJECTED_WEIGHT = 0.25
+# Hard cap on the activation boost (logit space).
+ACTIVATION_MAX_BOOST = 0.6
+# Fan-effect hub penalty -lambda * ln(1 + degree); ACT-R S - ln(fan).
+HUB_PENALTY_LAMBDA = 0.08
 # Multi-part recall queries are split on this separator for per-chunk dense
 # embedding (bridge recall joins messages with "\n---\n").
 _QUERY_CHUNK_SEPARATOR = "\n---\n"
@@ -148,18 +161,37 @@ class RetrievalPipeline:
         reranked = self.rerank_candidates(request.text, candidate_nodes)
 
         candidate_items: list[RetrievalItem] = []
+        scoring_context = self._build_scoring_context([node.id for node in candidate_nodes] + anchor_ids)
         for node, rerank_score in reranked:
             anchor_score = anchor_score_map.get(node.id, 0.0)
-            scored_item = self._score_candidate(node, rerank_score, anchor_score=anchor_score, is_anchor=node.id in anchor_score_map)
+            scored_item = self._score_candidate(
+                node,
+                rerank_score,
+                anchor_score=anchor_score,
+                is_anchor=node.id in anchor_score_map,
+                **scoring_context.for_node(node),
+            )
             candidate_items.append(scored_item)
 
         final_results = tuple(sorted(candidate_items, key=lambda item: (-item.score, item.node.id))[:final_top_k])
         final_results = self._apply_inject_decisions(final_results)
         if update_access and final_results:
-            self._get_store().update_access([item.node.id for item in final_results])
+            # Read/write decoupling (§4.3.1): every returned result is
+            # *retrieved*; only results that reached the inject gate are
+            # *injected*. Legacy callers that pass no gate still fall back.
+            self._get_store().update_access(
+                [item.node.id for item in final_results],
+                injected_ids=[item.node.id for item in final_results if item.is_injectable],
+            )
 
         anchor_items = tuple(
-            self._score_candidate(anchor.node, anchor.score, anchor_score=anchor.score, is_anchor=True)
+            self._score_candidate(
+                anchor.node,
+                anchor.score,
+                anchor_score=anchor.score,
+                is_anchor=True,
+                **scoring_context.for_node(anchor.node),
+            )
             for anchor in anchors
             if result_filter is None or result_filter(anchor.node)
         )
@@ -171,22 +203,6 @@ class RetrievalPipeline:
             results=final_results,
             context=context,
         )
-
-    def hybrid_search(
-        self,
-        query: str,
-        query_embedding: list[float] | None = None,
-        *,
-        limit: int = 3,
-        per_source_limit: int = 20,
-    ) -> list[_AnchorCandidate]:
-        """Fuse FTS and vector retrieval with reciprocal rank fusion.
-
-        Dense leg: long multi-part recall queries (bridge recall concatenates
-        the last 3 user messages) dilute a single embedding across topics, so
-        the query is ALSO embedded per ``\\n---\\n`` chunk and every chunk
-        votes in the fusion. The whole-query embedding participates too.
-        """
 
     def hybrid_search(
         self,
@@ -291,18 +307,15 @@ class RetrievalPipeline:
         results.sort(key=lambda item: (-item[1], item[0].id))
         return results
 
-    @staticmethod
-    def compute_rrf(result_sets: Iterable[Sequence[tuple[str, float]]], *, k: int) -> dict[str, float]:
-        """Compute reciprocal rank fusion scores from ranked result sets."""
-
-        scores: dict[str, float] = {}
-        for results in result_sets:
-            for rank, (node_id, _) in enumerate(results, start=1):
-                scores[node_id] = scores.get(node_id, 0.0) + (1.0 / (k + rank))
-        return scores
-
-    def apply_decay(self, node: Node, base_score: float) -> tuple[float, float]:
-        """Apply tier-sensitive time decay to a score.
+    def apply_decay(
+        self,
+        node: Node,
+        base_score: float,
+        *,
+        degree: int = 0,
+        project_sessions_elapsed: float | None = None,
+    ) -> tuple[float, float]:
+        """Apply tier-sensitive time decay plus P2 activation and hub penalty.
 
         Sign-safe: decay is applied as an additive penalty in logit space
         (``ln(decay_factor^days)``), so stale/superseded irrelevant results can
@@ -310,6 +323,15 @@ class RetrievalPipeline:
         for simply not being accessed recently (decay targets transient
         material; persistent knowledge keeps a fixed mild penalty after a
         grace period).
+
+        Persistent knowledge additionally carries:
+          * ACT-R base-level activation (§4.2(a), §4.3(3)) — ``+alpha * B_i``
+            with ``B_i = ln(1 + n_eff * t_eff^-0.5)``, where
+            ``n_eff = used_count + 0.25 * injected_count`` and ``t_eff`` is the
+            Project-Active Session Clock Δt_proj (falling back to wall-clock
+            days). Bounded by ``ACTIVATION_MAX_BOOST`` so it nudges ranking.
+          * Fan-effect hub penalty — ``-lambda * ln(1 + degree)`` (§4.3(3)),
+            so broad hubs give way to specific pitfalls.
         """
 
         now = self._now_fn()
@@ -321,9 +343,72 @@ class RetrievalPipeline:
             # popularity signal, not a freshness signal). A fixed mild penalty
             # keeps fresh, just-written context ahead of long-tail knowledge.
             penalty = DECAY_PERSISTENT_PENALTY
+            penalty += self._activation_boost(node, elapsed_days, project_sessions_elapsed)
+            penalty += self._hub_penalty(degree)
         else:
             penalty = math.log(factor) * elapsed_days
         return base_score + penalty, math.exp(penalty)
+
+    @staticmethod
+    def _activation_boost(
+        node: Node,
+        elapsed_days: float,
+        project_sessions_elapsed: float | None,
+    ) -> float:
+        """ACT-R base-level activation α·B_i for one persistent node."""
+
+        used_count = int(getattr(node.metadata, "used_count", 0) or 0)
+        injected_count = int(getattr(node.metadata, "injected_count", 0) or 0)
+        effective_presentations = used_count + ACTIVATION_INJECTED_WEIGHT * injected_count
+        if effective_presentations <= 0:
+            return 0.0
+        clock = project_sessions_elapsed if project_sessions_elapsed is not None else elapsed_days
+        effective_elapsed = max(1.0, float(clock))
+        base_level = math.log(1.0 + effective_presentations * (effective_elapsed ** -0.5))
+        return min(ACTIVATION_MAX_BOOST, ACTIVATION_ALPHA * base_level)
+
+    @staticmethod
+    def _hub_penalty(degree: int) -> float:
+        """Fan-effect hub penalty ``-λ·ln(1 + deg(i))`` (§4.3(3), ACT-R ``S - ln(fan)``).
+
+        A node linked to many others has weaker per-association strength, so
+        broad hubs give way to specific pitfalls. Degree 0 costs nothing.
+        """
+
+        fan = max(0, int(degree))
+        if fan <= 0:
+            return 0.0
+        return -HUB_PENALTY_LAMBDA * math.log(1.0 + fan)
+
+    @dataclass(slots=True, frozen=True)
+    class _ScoringContext:
+        """Per-search degree / project-clock lookup for P2 scoring."""
+
+        degrees: dict[str, int]
+        project_sessions: dict[str, int]
+
+        def for_node(self, node: Node) -> dict[str, Any]:
+            project = node.metadata.project
+            return {
+                "degree": self.degrees.get(node.id, 0),
+                "project_sessions_elapsed": float(self.project_sessions[project])
+                if project and project in self.project_sessions
+                else None,
+            }
+
+    def _build_scoring_context(self, node_ids: Sequence[str]) -> "RetrievalPipeline._ScoringContext":
+        """Fetch graph degree and Δt_proj once per search (not per candidate)."""
+
+        store = self._get_store()
+        try:
+            degrees = store.get_node_degrees(list(node_ids))
+        except (sqlite3.Error, AttributeError):  # pragma: no cover - degraded store
+            degrees = {}
+        try:
+            project_sessions = store.get_project_session_counts()
+        except (sqlite3.Error, AttributeError):  # pragma: no cover - degraded store
+            project_sessions = {}
+        return RetrievalPipeline._ScoringContext(degrees=degrees, project_sessions=project_sessions)
 
     def apply_status_penalty(self, node: Node, score: float) -> tuple[float, float]:
         """Apply conflict-aware penalties for disputed or superseded nodes.
@@ -384,8 +469,22 @@ class RetrievalPipeline:
             )
         return tuple(decided)
 
-    def _score_candidate(self, node: Node, rerank_score: float, *, anchor_score: float, is_anchor: bool) -> RetrievalItem:
-        decayed_score, decay_multiplier = self.apply_decay(node, rerank_score)
+    def _score_candidate(
+        self,
+        node: Node,
+        rerank_score: float,
+        *,
+        anchor_score: float,
+        is_anchor: bool,
+        degree: int = 0,
+        project_sessions_elapsed: float | None = None,
+    ) -> RetrievalItem:
+        decayed_score, decay_multiplier = self.apply_decay(
+            node,
+            rerank_score,
+            degree=degree,
+            project_sessions_elapsed=project_sessions_elapsed,
+        )
         final_score, status_multiplier = self.apply_status_penalty(node, decayed_score)
         markers = ("DISPUTED",) if node.metadata.status is NodeStatus.DISPUTED else ()
         return RetrievalItem(

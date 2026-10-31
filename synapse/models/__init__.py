@@ -1,6 +1,7 @@
 """Data model package for Synapse."""
 
 from synapse.models.node import (
+	FALLBACK_PROJECT,
 	Node,
 	NodeMetadata,
 	NodeStatus,
@@ -8,13 +9,19 @@ from synapse.models.node import (
 	SensitivityLevel,
 	WORD_LIMIT,
 	WordCountValidation,
+	clean_slug,
 	count_text_words,
 	generate_node_id,
+	infer_project,
+	kebab_slug,
+	normalize_project_slug,
+	project_domains,
 	slugify_english_title,
 	validate_word_count,
 )
 
 __all__ = [
+	"FALLBACK_PROJECT",
 	"Node",
 	"NodeMetadata",
 	"NodeStatus",
@@ -22,8 +29,13 @@ __all__ = [
 	"SensitivityLevel",
 	"WORD_LIMIT",
 	"WordCountValidation",
+	"clean_slug",
 	"count_text_words",
 	"generate_node_id",
+	"infer_project",
+	"kebab_slug",
+	"normalize_project_slug",
+	"project_domains",
 	"slugify_english_title",
 	"validate_word_count",
 ]

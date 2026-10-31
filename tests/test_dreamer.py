@@ -166,9 +166,11 @@ def test_archive_superseded_resolves_chain_and_missing_superseded_by(tmp_path: P
 
     assert "mem_old" in archived_ids      # chain terminal ACTIVE -> archived
     assert "mem_orphan" in archived_ids   # missing superseded_by -> archived
-    assert not (runtime_paths.base / "active" / "mem_old.md").exists()
-    assert not (runtime_paths.base / "active" / "mem_orphan.md").exists()
-    assert (runtime_paths.base / "active" / "mem_terminal.md").exists()  # terminal untouched
+    from synapse.storage import locate_active_node_file
+
+    assert locate_active_node_file(runtime_paths.base, "mem_old") is None
+    assert locate_active_node_file(runtime_paths.base, "mem_orphan") is None
+    assert locate_active_node_file(runtime_paths.base, "mem_terminal") is not None  # terminal untouched
     dreamer.close()
 
 
@@ -206,8 +208,10 @@ def test_archive_superseded_kept_for_disputed_terminal_archived_for_missing(tmp_
 
     assert archived_ids == ["mem_old_missing"]  # disputed kept, missing terminal archived
     assert any(w.code == "disputed_superseder" for w in warnings)
-    assert (runtime_paths.base / "active" / "mem_old_disputed.md").exists()
-    assert not (runtime_paths.base / "active" / "mem_old_missing.md").exists()
+    from synapse.storage import locate_active_node_file
+
+    assert locate_active_node_file(runtime_paths.base, "mem_old_disputed") is not None
+    assert locate_active_node_file(runtime_paths.base, "mem_old_missing") is None
     dreamer.close()
 
 
@@ -309,9 +313,11 @@ def test_synthesis_creates_fact_hub_for_typed_cluster(tmp_path: Path) -> None:
         assert set(result.member_ids) == {f"mem_kafka_{i}" for i in range(4)}
         assert client.calls and "Cluster members:" in client.calls[0]
 
-        from synapse.storage import read_node_file
+        from synapse.storage import locate_active_node_file, read_node_file
 
-        hub = read_node_file(runtime_paths.active / f"{result.hub_node_id}.md")
+        hub_path = locate_active_node_file(runtime_paths.base, result.hub_node_id)
+        assert hub_path is not None
+        hub = read_node_file(hub_path)
         assert hub.metadata.okf_type == "fact"
         assert hub.metadata.type is NodeType.PERSISTENT
         assert "## Sources" in hub.content

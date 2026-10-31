@@ -139,7 +139,10 @@ class WatchdogFileWatcher:
         self._handler = _WatchdogEventHandler(manager)
 
     def start(self) -> None:
-        self._observer.schedule(self._handler, str(self.manager.runtime_paths.active), recursive=True)
+        for root in (self.manager.runtime_paths.active, self.manager.runtime_paths.transcripts):
+            if not root.exists():
+                continue
+            self._observer.schedule(self._handler, str(root), recursive=True)
         self._observer.start()
 
     def stop(self) -> None:
@@ -340,13 +343,21 @@ class SyncManager:
         return self.drain_pending(force=True)
 
     def snapshot_active_files(self) -> dict[Path, datetime]:
+        """Snapshot every managed Markdown file (knowledge + session transcripts).
+
+        Session transcripts live in ``transcripts/`` but are indexed into the
+        same ``nodes`` table so lookup-by-id and distillation bookkeeping keep
+        working; the knowledge tree in ``active/`` stays free of raw transcripts.
+        """
+
         snapshot: dict[Path, datetime] = {}
-        if not self.runtime_paths.active.exists():
-            return snapshot
-        for path in sorted(self.runtime_paths.active.rglob("*.md")):
-            if not path.is_file():
+        for root in (self.runtime_paths.active, self.runtime_paths.transcripts):
+            if not root.exists():
                 continue
-            snapshot[self._relative_to_base(path)] = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            for path in sorted(root.rglob("*.md")):
+                if not path.is_file():
+                    continue
+                snapshot[self._relative_to_base(path)] = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
         return snapshot
 
     def _sync_upsert(self, path: Path) -> Node:

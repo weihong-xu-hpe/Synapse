@@ -212,7 +212,16 @@ Controls forgetting behavior.
 
 ### `[sanitization]`
 
-Custom regex redaction rules for remote-bound payloads.
+Built-in rules redact common key/token/password assignments and Bearer/Basic
+credentials as well as API keys, JWTs, UUIDs, IP addresses, and email addresses.
+`custom_patterns` adds deployment-specific rules. Session upserts are redacted
+before storage, and episode prompts are redacted again before model calls so
+older transcripts receive the same protection. Credential-shaped values
+(short passwords and client secrets, private key blocks, URL userinfo, and
+Kubernetes `stringData:`/`data:` blocks) are also scrubbed from every knowledge
+write, including distilled episode bodies and their evidence quotes. Rules are
+not exhaustive and do not rewrite existing Markdown files; rotate exposed
+credentials separately.
 
 ### `[logging]`
 
@@ -289,13 +298,13 @@ The active episode pipeline dehydrates tool-polling noise, carries a Global User
 - `evidence_context_token_budget` (int, default `24000`) bounds evidence excerpts passed to the gatekeeper.
 - `timeout_seconds` (int, default `300`) is the episode LLM request timeout.
 - `integrate_lessons_per_call` (int, default `12`) and `retrieval_top_k_per_lesson` (int, default `5`) bound gatekeeper batches and retrieved evidence.
-- Pending episodes with fewer than two dehydrated turns or fewer than 600 dehydrated characters are stamped without LLM calls.
+- Scheduler-selected revisions with fewer than two dehydrated turns or fewer than 600 dehydrated characters are deferred without advancing the watermark. The same revision is not retried until it changes; close and explicit CLI runs scan non-empty short revisions, and failed forced attempts remain eligible for a forced sweep retry.
 
-`POST /api/episode/close` accepts `{"session_key":"…","reason":"idle|shutdown|switch"}`. It returns `status=disabled` when `[distiller].enabled` is false; otherwise it returns `status=accepted` and schedules per-session serialized background distillation. The fallback scheduler selects transcripts idle for `idle_minutes` (default 60) on the configured `interval_minutes` cadence.
+`POST /api/episode/close` accepts `{"session_key":"…","reason":"idle|shutdown|switch"}`. It returns `status=disabled` when `[distiller].enabled` is false; otherwise `status=accepted` means only that background distillation was scheduled. Close, sweep, and CLI processing share a per-transcript lock; stamping is conditional on the processed content revision. The scheduler selects transcripts idle for `idle_minutes` (default 60) on the configured `interval_minutes` cadence.
 
 Commands: `python -m synapse distill status` and `python -m synapse distill episode` for an explicitly selected copy.
 
-`distill status` prints the active scanner and gatekeeper models plus recent run creates, updates, and gatekeeper-filtered items.
+`distill status` prints the active scanner and gatekeeper models plus recent creates, updates, no-op results, and generic failures.
 
 
 ### `[observability]`
@@ -309,8 +318,9 @@ Controls the local usage-analytics tables (schema v7) and the lookback reports. 
 What gets recorded:
 
 - **`search_events`** (one row per `search_memory` call): timestamp, `source` (`bridge` when the REST call carries `exclude_session_key`, else `rest`; `mcp` for the MCP tool), sha1-prefix `session_hash`, query text + char count + CJK ratio, top_k, include, latency, and the returned results as JSON (rank, node_id, type, okf_type, rerank_logit, score, inject). Eval runs call `RetrievalPipeline.search` directly and are **never recorded** — eval stays out of usage statistics by construction.
-- **`metrics_snapshots`** (one row per local day, written by the distiller sweep; idempotent per day with 2-day backfill for slept-through boundaries; `python -m synapse metrics snapshot` runs it manually): node counts by status/type/okf_type/project and active-persistent `verified` status (`verified_true`, `verified_false`, `verified_unset`), transcript distillation state, the day's write mix by route + decider action, distiller yield (including creates, updates, quarantine, and gatekeeper-filtered lessons), search stats (count by source, p50/p95 latency, inject rate, zero-inject share, top injected node ids), Dreamer runs, and DB/active/archive sizes.
-- **`write_memory_events.route`** (new column): write attribution — `mcp`, `rest`, `session_upsert`, `distiller`, `write_node`. The dedupe-guard `unchanged` early return now also records an event (it previously wrote nothing, undercounting identical writes). Legacy rows have `route = NULL`.
+- **`metrics_snapshots`** (one row per local day): the sweep refreshes today's data and timestamped metrics for recent days. Historical node, transcript, and storage counts are retained only when captured on that date; unavailable stock samples are marked as such, with `stock_captured_at` recording the sample time.
+- **`distiller_runs`**: `failures` counts generic failed attempts, not just model errors. New rows include the `trigger` (`close`, `sweep`, or `cli`) and per-attempt outcome, failure stage, and stable transcript identifier. Migrated rows retain their old failure totals but have `trigger=legacy` and no per-attempt attribution.
+- **`write_memory_events.route`**: write attribution includes `mcp`, `rest`, `session_upsert`, `distiller`, `distiller_recovery` for curated repair, and `write_node`. Legacy rows have `route = NULL`.
 
 Commands:
 
@@ -341,6 +351,21 @@ SYNAPSE_MODEL_API_KEY=replace-me
 ```
 
 Use this when `providers.remote_api.api_key_env` points to `SYNAPSE_MODEL_API_KEY`.
+
+Additionally, `SYNAPSE_PROJECT_DOMAINS_FILE` optionally overrides the location of
+`~/.synapse/project_domains.json` — a machine-local, non-committed mapping that
+extends deterministic project attribution (see `synapse/models/node.py`):
+
+```json
+[
+  {"project": "payments-svc", "markers": ["payments-svc", "checkout"]},
+  {"project": "cluster-ops", "markers": ["cluster-ops", "ingress"]}
+]
+```
+
+Entries are consulted before the built-in example domains (custom entries shadow
+built-ins with the same slug); the variable accepts an empty value to disable
+custom domains entirely. Malformed files are ignored, never fatal.
 
 ## Practical configuration patterns
 

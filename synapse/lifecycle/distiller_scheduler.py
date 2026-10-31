@@ -20,6 +20,11 @@ from synapse.models.node import Node
 from synapse.utils.runtime import RuntimePaths
 
 
+# schema_meta counter of knowledge nodes distilled since the last Dreamer run
+# (design doc §3.4(3): every N new nodes trigger an extra sleep cycle).
+_DREAMER_PENDING_KEY = "dreamer_pending_knowledge_nodes"
+
+
 class DistillerScheduler:
     """In-process periodic sweep of session transcripts."""
 
@@ -30,11 +35,13 @@ class DistillerScheduler:
         runtime_paths: RuntimePaths,
         logger: Any = None,
         timer_factory: Callable[..., Any] = threading.Timer,
+        now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self.runtime_paths = runtime_paths
         self._logger = logger or __import__("logging").getLogger("synapse.distiller")
         self._timer_factory = timer_factory
+        self._now_fn: Callable[[], datetime] = now_fn or (lambda: datetime.now().astimezone())
         self._state_lock = threading.RLock()
         self._timer: Any | None = None
         self._running = False
@@ -114,7 +121,7 @@ class DistillerScheduler:
                     gatekeeper_client=gatekeeper_client,
                 )
                 transcripts = selector.select_transcripts(limit=self.config.distiller.max_transcripts_per_run)
-                runs, llm_failures = self._distill(transcripts, runner)
+                runs, attempts = self._distill(transcripts, runner)
                 archive_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
                 archived = selector._archive_expired(
                     DistillerReport(started_at=archive_started_at, completed_at=archive_started_at)
@@ -126,9 +133,14 @@ class DistillerScheduler:
                     completed_at=completed.isoformat().replace("+00:00", "Z"),
                     duration_ms=round((time.perf_counter() - started_clock) * 1000),
                     transcripts_scanned=len(transcripts),
-                    llm_failures=llm_failures,
+                    failures=sum(attempt["outcome"] == "failed" for attempt in attempts),
                     archived_transcripts=archived,
+                    trigger="sweep",
+                    attempts_json=attempts,
                 )
+                # Event-driven sleep consolidation (§3.4(3)): fire a Dreamer
+                # run in the background once enough new knowledge accumulated.
+                self._maybe_trigger_dreamer(runs)
             finally:
                 selector.close()
                 try:
@@ -147,16 +159,146 @@ class DistillerScheduler:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
             lock_file.close()
 
-    def _distill(self, transcripts: list[Node], runner: Any) -> tuple[list[Any], int]:
+    def _maybe_trigger_dreamer(self, runs: list[Any]) -> None:
+        """Event-driven and sleep/wake Dreamer triggers (§3.4(3)).
+
+        Two independent reasons to fire an off-schedule Dreamer cycle:
+
+        * **Event accumulation** — newly created/updated knowledge nodes
+          accumulate in ``schema_meta`` across sweeps; once
+          ``dreamer.event_trigger_new_nodes`` is reached the counter resets and
+          a background run is fired.
+        * **Missed wall-clock schedule** — the MacBook lid may be closed across
+          the ``schedule_hour:schedule_minute`` window, so both ``launchd`` and
+          the in-process ``threading.Timer`` silently miss the run. Because this
+          scheduler ticks every few minutes while the machine is awake, it
+          checks whether today's scheduled run already happened and, if not,
+          catches up within one interval of the lid opening.
+
+        Best effort — accounting failures must never break the sweep.
+        """
+
+        if not getattr(self.config.dreamer, "enabled", True):
+            return
+        new_nodes = sum(
+            1
+            for run in runs
+            for op in (getattr(run, "ops", None) or [])
+            if str(op.get("action")) in {"created", "updated"}
+        )
+        threshold = self.config.dreamer.event_trigger_new_nodes
+        pending = 0
+        event_due = False
+        catch_up_due = False
+        try:
+            from synapse.storage import SQLiteNodeStore
+
+            with SQLiteNodeStore(
+                self.runtime_paths.base / "synapse.db",
+                embedding_dimension=self.config.embedding.dimension or 0,
+            ) as store:
+                pending = int(store.get_meta(_DREAMER_PENDING_KEY) or 0) + new_nodes
+                if pending >= threshold:
+                    store.set_meta(_DREAMER_PENDING_KEY, "0")
+                    event_due = True
+                elif new_nodes:
+                    store.set_meta(_DREAMER_PENDING_KEY, str(pending))
+                catch_up_due = self._dreamer_schedule_catch_up_due(store)
+        except Exception as exc:  # noqa: BLE001 — accounting must never break the sweep
+            self._logger.warning("Dreamer event-trigger accounting failed", extra={"error": str(exc)})
+            return
+
+        if not (event_due or catch_up_due):
+            return
+        if catch_up_due and not event_due:
+            self._logger.info(
+                "Scheduled Dreamer run missed across sleep/wake; catching up",
+                extra={"schedule_hour": self.config.dreamer.schedule_hour},
+            )
+        self._logger.info(
+            "Triggering Dreamer run",
+            extra={
+                "pending_knowledge_nodes": pending,
+                "threshold": threshold,
+                "event_due": event_due,
+                "catch_up_due": catch_up_due,
+            },
+        )
+        self._trigger_dreamer_thread()
+
+    def _dreamer_schedule_catch_up_due(self, store: Any) -> bool:
+        """True when today's wall-clock Dreamer slot has passed without a run.
+
+        Compares local wall-clock time against ``dreamer.schedule_hour/minute``
+        and the newest ``dreamer_runs.started_at``.  Only meaningful in
+        wall-clock mode (``schedule_hour`` set); returns False otherwise or when
+        the machine is still before today's slot.
+        """
+
+        dreamer = self.config.dreamer
+        schedule_hour = getattr(dreamer, "schedule_hour", None)
+        if schedule_hour is None:
+            return False
+        now = self._now_fn()
+        scheduled_today = now.replace(
+            hour=schedule_hour,
+            minute=dreamer.schedule_minute,
+            second=0,
+            microsecond=0,
+        )
+        if now < scheduled_today:
+            return False
+
+        row = store.connection.execute("SELECT MAX(started_at) AS value FROM dreamer_runs").fetchone()
+        latest_started = row["value"] if row is not None else None
+        if not latest_started:
+            return True
+        try:
+            parsed = datetime.fromisoformat(str(latest_started).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=now.tzinfo)
+        return parsed.astimezone(now.tzinfo) < scheduled_today
+
+    def _trigger_dreamer_thread(self) -> None:
+        """Spawn the background Dreamer cycle (seam for tests)."""
+
+        threading.Thread(target=self._run_triggered_dreamer, name="dreamer-event-trigger", daemon=True).start()
+
+    def _run_triggered_dreamer(self) -> None:
+        """One immediate Dreamer cycle, under the Dreamer's own process lock."""
+
+        try:
+            from synapse.lifecycle.scheduler import DreamerScheduler
+
+            DreamerScheduler(
+                self.config,
+                runtime_paths=self.runtime_paths,
+                logger=self._logger,
+            ).run_once_now()
+        except Exception as exc:  # noqa: BLE001 — triggered run must not crash the scheduler
+            self._logger.warning("Event-driven Dreamer trigger failed", extra={"error": str(exc)})
+
+    def _distill(self, transcripts: list[Node], runner: Any) -> tuple[list[Any], list[dict[str, Any]]]:
+        from synapse.lifecycle.episode_distiller import attempt_record
+
         runs: list[Any] = []
-        failures = 0
+        attempts: list[dict[str, Any]] = []
         for transcript in transcripts:
             try:
-                runs.append(runner.run(transcript.id))
-            except Exception:
-                failures += 1
-                self._logger.exception("Episode sweep failed", extra={"transcript_id": transcript.id})
-        return runs, failures
+                if getattr(getattr(transcript, "metadata", None), "force_retry", False):
+                    run = runner.run(transcript.id, force=True)
+                else:
+                    run = runner.run(transcript.id)
+            except Exception as exc:
+                stage = getattr(exc, "distiller_stage", None) or "unknown"
+                attempts.append(attempt_record(transcript.id, None, stage=stage))
+                self._logger.exception("Episode sweep failed", extra={"transcript_id": transcript.id, "stage": stage})
+            else:
+                runs.append(run)
+                attempts.append(attempt_record(transcript.id, run))
+        return runs, attempts
 
     def _write_metrics_snapshots(self) -> None:
         try:

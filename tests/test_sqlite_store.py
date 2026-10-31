@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from synapse.models import Node, NodeMetadata, NodeStatus, NodeType, SensitivityLevel
-from synapse.storage import DreamerRunMetrics, SQLiteNodeStore, WriteMemoryEventMetrics
+from synapse.storage import DistillerRunMetrics, DreamerRunMetrics, SQLiteNodeStore, WriteMemoryEventMetrics
 import synapse.storage.sqlite as sqlite_module
 from synapse.storage.sqlite import _cosine_distance
 
@@ -26,6 +26,8 @@ def make_node(
     status: NodeStatus = NodeStatus.ACTIVE,
     last_accessed: datetime | None = None,
     tags: list[str] | None = None,
+    session_key: str | None = None,
+    deferred_hash: str | None = None,
 ) -> Node:
     metadata = NodeMetadata(
         id=node_id,
@@ -37,10 +39,136 @@ def make_node(
         status=status,
         supersedes=[],
         superseded_by=None,
+        session_key=session_key,
+        deferred_hash=deferred_hash,
         tags=tags or [],
         sensitivity=SensitivityLevel.INTERNAL,
     )
     return Node(metadata=metadata, content=content, file_path=Path(f"active/{file_name}"))
+
+
+def test_node_metadata_session_and_deferred_hash_roundtrip(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    node = make_node(
+        node_id="mem_session_metadata",
+        title="Session transcript",
+        content="Short transcript content.",
+        file_name="mem_session_metadata.md",
+        session_key="session-abc",
+        deferred_hash="sha256:unchanged-content",
+    )
+
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        store.upsert_node(node)
+        stored = store.get_node(node.id)
+        assert stored is not None
+        assert stored.metadata.session_key == "session-abc"
+        assert stored.metadata.deferred_hash == "sha256:unchanged-content"
+
+        # Older rows with no session/deferred metadata remain readable.
+        store.connection.execute("UPDATE nodes SET okf_meta = '{}' WHERE id = ?", (node.id,))
+        legacy = store.get_node(node.id)
+        assert legacy is not None
+        assert legacy.metadata.session_key is None
+        assert legacy.metadata.deferred_hash is None
+
+
+def test_distiller_runs_legacy_schema_migrates_without_repeated_setup(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    with SQLiteNodeStore(db_path, embedding_dimension=3):
+        pass
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("ALTER TABLE distiller_runs RENAME COLUMN failures TO llm_failures")
+        connection.execute("ALTER TABLE distiller_runs DROP COLUMN [trigger]")
+        connection.execute("ALTER TABLE distiller_runs DROP COLUMN attempts_json")
+        connection.execute("ALTER TABLE distiller_runs DROP COLUMN items_quarantined")
+        connection.execute(
+            """
+            INSERT INTO distiller_runs (
+                started_at, completed_at, duration_ms,
+                transcripts_scanned, transcripts_distilled, transcripts_skipped,
+                items_extracted, items_invalid,
+                decider_creates, decider_complements, decider_supersedes, decider_downgrades,
+                llm_failures, archived_transcripts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-10-01T00:00:00Z", "2026-10-01T00:00:01Z", 1000,
+                3, 2, 1, 4, 1, 1, 0, 0, 0, 7, 2,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        row = store.connection.execute(
+            'SELECT failures, [trigger], attempts_json, items_quarantined FROM distiller_runs'
+        ).fetchone()
+        columns = {
+            str(column["name"])
+            for column in store.connection.execute("PRAGMA table_info(distiller_runs)").fetchall()
+        }
+        assert row["failures"] == 7
+        assert row["trigger"] == "legacy"
+        assert json.loads(row["attempts_json"]) == []
+        assert row["items_quarantined"] == 0
+        assert "llm_failures" not in columns
+        assert store._schema_needs_setup() is False
+
+
+def test_distiller_run_metrics_store_new_attempts_contract(tmp_path: Path) -> None:
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    attempts = [{"session": "mem_session_abc", "outcome": "failed", "stage": "scanner"}]
+
+    with SQLiteNodeStore(tmp_path / "synapse.db", embedding_dimension=3) as store:
+        store.record_distiller_run(
+            DistillerRunMetrics(
+                started_at=now,
+                completed_at=now,
+                duration_ms=10,
+                transcripts_scanned=1,
+                transcripts_distilled=0,
+                transcripts_skipped=0,
+                items_extracted=0,
+                items_invalid=0,
+                decider_creates=0,
+                decider_complements=0,
+                decider_supersedes=0,
+                decider_downgrades=0,
+                failures=1,
+                archived_transcripts=0,
+                trigger="sweep",
+                attempts_json=attempts,
+            )
+        )
+        row = store.connection.execute(
+            'SELECT failures, [trigger], attempts_json FROM distiller_runs'
+        ).fetchone()
+
+    assert row["failures"] == 1
+    assert row["trigger"] == "sweep"
+    assert json.loads(row["attempts_json"]) == attempts
+
+
+def test_metrics_snapshot_replace_updates_existing_row(tmp_path: Path) -> None:
+    with SQLiteNodeStore(tmp_path / "synapse.db", embedding_dimension=3) as store:
+        assert store.record_metrics_snapshot(
+            date="2026-10-01", created_at="first", payload={"value": 1}
+        ) is True
+        assert store.record_metrics_snapshot(
+            date="2026-10-01", created_at="ignored", payload={"value": 2}
+        ) is False
+        assert store.record_metrics_snapshot(
+            date="2026-10-01", created_at="replacement", payload={"value": 3}, replace=True
+        ) is True
+        snapshots = store.get_metrics_snapshots()
+
+    assert snapshots == [
+        {"date": "2026-10-01", "created_at": "replacement", "payload": {"value": 3}}
+    ]
 
 
 def test_sqlite_store_crud_and_wal_mode(tmp_path: Path) -> None:
@@ -84,7 +212,7 @@ def test_sqlite_store_crud_and_wal_mode(tmp_path: Path) -> None:
         assert store.count_nodes() == 0
 
 
-def test_fts_search_vector_search_edges_and_neighbors(tmp_path: Path) -> None:
+def test_fts_search_vector_search_and_edges(tmp_path: Path) -> None:
     db_path = tmp_path / "synapse.db"
     alpha = make_node(
         node_id="mem_20260307_alpha",
@@ -125,7 +253,6 @@ def test_fts_search_vector_search_edges_and_neighbors(tmp_path: Path) -> None:
 
         assert store.get_edges(alpha.id) == [beta.id, gamma.id]
         assert store.get_edges(beta.id, direction="incoming") == [alpha.id, gamma.id]
-        assert store.get_neighbors([alpha.id], depth=1) == [beta.id, gamma.id]
 
 
 def test_fts_search_safely_handles_date_like_tokens(tmp_path: Path) -> None:
@@ -211,8 +338,6 @@ def test_janitor_queries_and_integrity_report(tmp_path: Path) -> None:
         archival_candidates = store.find_superseded_for_archival(days_threshold=7)
         assert [node.id for node in archival_candidates] == [superseded.id]
 
-        assert store.count_disputed_nodes() == 1
-
         integrity = store.check_integrity()
         assert integrity.ok is True
         assert integrity.integrity_check_result == "ok"
@@ -276,7 +401,7 @@ def test_metrics_recording_and_aggregation(tmp_path: Path) -> None:
     assert write_summary["warnings"] == {"low_structure": 1}
 
 
-def test_missing_link_similarity_histogram_counts_unlinked_recent_pairs(tmp_path: Path) -> None:
+def test_find_missing_link_pairs_counts_unlinked_recent_pairs(tmp_path: Path) -> None:
     db_path = tmp_path / "synapse.db"
     alpha = make_node(
         node_id="mem_alpha",
@@ -305,10 +430,8 @@ def test_missing_link_similarity_histogram_counts_unlinked_recent_pairs(tmp_path
         store.upsert_node(beta, embedding=[0.9, 0.1, 0.0])
         store.upsert_node(gamma, embedding=[0.0, 1.0, 0.0])
 
-        histogram = store.missing_link_similarity_histogram(thresholds=(0.70, 0.90), recency_days=30)
         pairs = store.find_missing_link_pairs(cosine_threshold=0.90, recency_days=30)
 
-    assert histogram == {"0.70": 1, "0.90": 1}
     assert [(left.id, right.id) for left, right in pairs] == [(alpha.id, beta.id)]
 
 

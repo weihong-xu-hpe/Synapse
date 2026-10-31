@@ -272,6 +272,8 @@ def test_dreamer_run_command_uses_configured_batch_size(tmp_path: Path, monkeypa
                 archived=(),
                 condensed=(),
                 synthesized=(),
+                merged=(),
+                compacted=(),
                 warnings=(),
             )
 
@@ -352,7 +354,7 @@ def test_prune_transcript_vectors_dry_run_then_apply(tmp_path: Path) -> None:
     assert "Vectors deleted: 0" in again.output
 
 
-def test_distiller_status_shows_episode_models_and_recent_actions(tmp_path: Path) -> None:
+def test_distiller_status_reports_generic_failures(tmp_path: Path) -> None:
     config_path = write_config(tmp_path)
     with SQLiteNodeStore(tmp_path / ".synapse" / "synapse.db", embedding_dimension=1024) as store:
         store.record_distiller_run(
@@ -369,7 +371,7 @@ def test_distiller_status_shows_episode_models_and_recent_actions(tmp_path: Path
                 decider_complements=1,
                 decider_supersedes=0,
                 decider_downgrades=0,
-                llm_failures=0,
+                failures=1,
                 archived_transcripts=0,
             )
         )
@@ -377,6 +379,4 @@ def test_distiller_status_shows_episode_models_and_recent_actions(tmp_path: Path
     result = runner.invoke(app, ["--config", str(config_path), "distill", "status"])
 
     assert result.exit_code == 0, result.output
-    assert "Episode scanner models: gpt-6-luna" in result.output
-    assert "Episode gatekeeper model: claude-haiku-5.5" in result.output
-    assert "creates=1 updates=1 gatekeeper_filtered=2" in result.output
+    assert "failures=1" in result.output

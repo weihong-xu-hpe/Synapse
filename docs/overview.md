@@ -54,7 +54,7 @@ Synapse treats memory as a living system.
 Instead of keeping everything equally hot forever, it supports:
 
 - retrieval-time decay
-- nightly janitor eviction
+- nightly stale-orphan eviction
 - superseded-node archival
 - archive cleanup
 - manual condensation of archived notes into higher-level summaries
@@ -70,17 +70,23 @@ Current implementation includes:
 - file watching and delta sync
 - MCP server surface
 - write-path orchestration with conflict handling
-- lifecycle janitor and archive condensation
+- lifecycle dreamer and archive condensation
 - macOS `launchd` and Linux `systemd --user` service integration
 
 ## High-level architecture
 
-Synapse is built around four persistent layers:
+Synapse is built around five persistent layers:
 
 1. **Active Markdown memory** in `.synapse/active`
-2. **Archived Markdown memory** in `.synapse/.archive`
-3. **Derived SQLite index** in `.synapse/synapse.db`
-4. **Agent-facing MCP interface**
+2. **Raw session transcripts** in `.synapse/transcripts`
+3. **Archived Markdown memory** in `.synapse/.archive`
+4. **Derived SQLite index** in `.synapse/synapse.db`
+5. **Agent-facing MCP interface**
+
+Session transcripts (`mem_session_*` and the legacy `Session summary …` notes) are
+distiller input rather than knowledge: they are written to `.synapse/transcripts/`
+and indexed into the same SQLite `nodes` table, but they never appear in
+`.synapse/active/`, are never embedded, and are excluded from default search.
 
 Typical flow:
 
@@ -154,7 +160,7 @@ It can:
 Synapse includes real lifecycle controls:
 
 - retrieval-time decay
-- janitor-based orphan eviction
+- dreamer-based orphan eviction
 - superseded archival
 - archive retention cleanup
 - archive condensation into new active memory notes

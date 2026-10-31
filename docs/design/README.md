@@ -75,6 +75,16 @@ Dreamer 观测指标与阈值配置化设计（待评审）。
 - 哪些 Dreamer 门槛应该优先配置化
 - 如何用实际运行数据微调 Mac 本地环境的阈值
 
+### 7. `synapse-v2-memory-consolidation-and-handbook-architecture.md`
+
+v2 记忆系统总设计（2026-10-31，待评审）。回答：
+
+- 陈述性记忆（Synapse）与程序性记忆（`omp-skill-evolver` / Autolearn）的系统边界与责任矩阵
+- Pillar 1 睡眠合并（Dreamer 2.0：语义合并 / 超大节点拆分 / 12h+事件触发）
+- Pillar 2 使用信号保留与遗忘曲线（三级计数器 / 项目活动时钟 / ACT-R 激活 / hub 惩罚）
+- Pillar 3 人类/AI 双重可读、可共享给 junior 的手册（物理目录分离 + 编译式 handbook）
+- 四阶段落地路线图与验收标准
+
 ---
 
 ## Archive Policy
@@ -105,5 +115,6 @@ Dreamer 观测指标与阈值配置化设计（待评审）。
 4. `TODO-sampling-only-cutover.md`
 5. `TODO-agent-validation-followup.md`
 6. `TODO-dreamer-stats-thresholds.md`
+7. `synapse-v2-memory-consolidation-and-handbook-architecture.md`
 
 读完这几份，再决定是否需要查看 `archive/` 里的历史材料。

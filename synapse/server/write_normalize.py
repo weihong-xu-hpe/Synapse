@@ -37,6 +37,7 @@ from synapse.okf import (
     TYPE_PITFALL,
     TYPE_PROCEDURE,
     TYPE_REQUIRED_SECTIONS,
+    _split_sections,
     is_okf_type,
     parse_title_repair,
     render_title_repair_prompt,
@@ -61,23 +62,9 @@ _TEMPLATE_RULE_LINES = [
 
 
 def split_sections(body: str) -> dict[str, str]:
-    """Map ``## Heading`` -> body text (same semantics as okf._split_sections)."""
+    """Map ``## Heading`` -> body text (delegates to ``okf._split_sections``)."""
 
-    sections: dict[str, str] = {}
-    current: str | None = None
-    buffer: list[str] = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            if current is not None:
-                sections.setdefault(current, "\n".join(buffer).strip())
-            current = stripped[3:].strip()
-            buffer = []
-        elif current is not None:
-            buffer.append(line)
-    if current is not None:
-        sections.setdefault(current, "\n".join(buffer).strip())
-    return sections
+    return _split_sections(body)
 
 
 def has_okf_structure(content: str, okf_type: str | None) -> bool:
@@ -354,22 +341,3 @@ class WritePathNormalizer:
         if repaired and not title_needs_repair(repaired):
             return repaired
         return None
-
-
-def decide_write_type(
-    *,
-    node_type: str | None,
-    content: str,
-    okf_type: str | None,
-) -> tuple[str, str]:
-    """Return ``(resolved_type, mode)`` for a write; mode documents the path.
-
-    Explicit ``node_type`` always wins. Omitted type defaults to persistent
-    when the body carries OKF structure, transient otherwise.
-    """
-
-    if node_type is not None and str(node_type).strip():
-        return str(node_type), "explicit"
-    if has_okf_structure(content, okf_type):
-        return "persistent", "defaulted_persistent"
-    return "transient", "defaulted_transient"

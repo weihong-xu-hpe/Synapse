@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Iterable
 
 
 class IntegrateAction(str, Enum):
@@ -33,18 +32,3 @@ def normalize_reasoning(action: IntegrateAction, reasoning: str | None) -> str:
     if cleaned:
         return cleaned
     return _DEFAULT_REASONING[action]
-
-
-def merge_unique_values(*groups: Iterable[str]) -> list[str]:
-    """Merge string groups while preserving order and removing blanks."""
-
-    seen: set[str] = set()
-    merged: list[str] = []
-    for group in groups:
-        for value in group:
-            cleaned = str(value).strip()
-            if not cleaned or cleaned in seen:
-                continue
-            seen.add(cleaned)
-            merged.append(cleaned)
-    return merged

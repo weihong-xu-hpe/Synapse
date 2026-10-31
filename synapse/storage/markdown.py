@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -12,13 +13,21 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from synapse.models.node import Node, NodeMetadata, generate_node_id
+from synapse.models.node import (
+    Node,
+    NodeMetadata,
+    generate_node_id,
+    infer_project,
+    kebab_slug,
+)
 
 
 logger = logging.getLogger(__name__)
 
 FRONTMATTER_BOUNDARY = "---"
 WIKI_LINK_PATTERN = re.compile(r"\[\[([^\]]+)\]\]")
+
+_NODE_ID_DATE_RE = re.compile(r"^mem_(\d{8})_")
 
 _SUPERSEDED_NOTICE_PREFIX = "> ⚠️ **SUPERSEDED** by [["
 _SUPERSEDED_NOTICE_CONTEXT = "> This node is retained for historical context but its conclusions are outdated."
@@ -247,9 +256,70 @@ def atomic_write_text(path: str | Path, content: str, *, encoding: str = "utf-8"
 
 
 def active_node_path(base_path: str | Path, node_id: str) -> Path:
-    """Return the canonical active Markdown path for a node."""
+    """Legacy flat active path for a node id (``active/<id>.md``).
+
+    Knowledge nodes now live at ``active/<project>/<kebab-slug>.md`` (see
+    ``knowledge_relative_path``); this helper survives only for transcripts and
+    for cleaning up pre-hierarchy layouts, and for callers that only know an id.
+    """
 
     return Path(base_path) / "active" / f"{node_id}.md"
+
+
+def knowledge_relative_path(node: Node) -> Path:
+    """Canonical human-friendly path for a knowledge node, relative to base.
+
+    ``active/<project>/<kebab-slug>.md`` — the node's identity stays in
+    ``metadata.id`` (frontmatter), so nothing depends on the file name.
+    """
+
+    return Path("active") / infer_project(node) / f"{kebab_slug(node.metadata.id)}.md"
+
+
+def active_node_file_path(base_path: str | Path, node: Node) -> Path:
+    """Absolute canonical active path for a knowledge node."""
+
+    return Path(base_path) / knowledge_relative_path(node)
+
+
+def locate_active_node_file(base_path: str | Path, node_id: str) -> Path | None:
+    """Find the Markdown file for *node_id* anywhere under ``active/``.
+
+    Layout-agnostic: checks the flat legacy path, the canonical
+    ``active/<project>/<kebab-slug>.md`` names, then falls back to a
+    frontmatter scan so a node is always findable by its identity.
+    """
+
+    active_root = Path(base_path) / "active"
+    if not active_root.exists():
+        return None
+    slug = kebab_slug(node_id)
+    candidates = [
+        active_root / f"{node_id}.md",
+        *sorted(active_root.rglob(f"{slug}.md")),
+        *sorted(active_root.rglob(f"{slug}-*.md")),
+    ]
+    for candidate in candidates:
+        if candidate.is_file() and _markdown_frontmatter_id(candidate) == node_id:
+            return candidate
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    for candidate in sorted(active_root.rglob("*.md")):
+        if _markdown_frontmatter_id(candidate) == node_id:
+            return candidate
+    return None
+
+
+def transcript_node_path(base_path: str | Path, node_id: str) -> Path:
+    """Return the canonical Markdown path for a raw session transcript.
+
+    Session transcripts (``mem_session_*`` and the legacy session summaries)
+    are storage-only raw material for the distiller; they live outside
+    ``active/`` so the knowledge tree stays small and reviewable.
+    """
+
+    return Path(base_path) / "transcripts" / f"{node_id}.md"
 
 
 
@@ -266,6 +336,91 @@ def _is_session_transcript(node: Node) -> bool:
     return is_session_transcript(node)
 
 
+def _markdown_frontmatter_id(path: Path) -> str | None:
+    """Read the ``id`` field from a Markdown file's frontmatter (None when absent)."""
+
+    try:
+        payload, _ = split_frontmatter(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    value = payload.get("id")
+    return str(value) if value else None
+
+
+def _node_date_part(node_id: str) -> str:
+    """``YYYYMMDD`` from a ``mem_<date>_`` id, else a short id hash."""
+
+    match = _NODE_ID_DATE_RE.match(node_id)
+    if match is not None:
+        return match.group(1)
+    return hashlib.sha1(node_id.encode("utf-8")).hexdigest()[:6]
+
+
+def _with_inferred_project(node: Node) -> Node:
+    """Make every knowledge node's ``metadata.project`` explicit before writing."""
+
+    if (node.metadata.project or "").strip():
+        return node
+    project = infer_project(node)
+    return node.model_copy(update={"metadata": node.metadata.model_copy(update={"project": project})})
+
+
+def _path_owned_by_other(path: Path, node_id: str) -> bool:
+    """True when *path* exists and belongs to a different node (or has no id)."""
+
+    if not path.exists():
+        return False
+    return _markdown_frontmatter_id(path) != node_id
+
+
+def _knowledge_destination(base_path: Path, node: Node) -> Path:
+    """Canonical ``active/<project>/<kebab-slug>.md`` path, collision-safe.
+
+    Two nodes whose ids differ only by date share a kebab slug; the first keeps
+    the bare slug, later ones append their date (then a short id hash) so
+    distinct nodes can never overwrite one another.
+    """
+
+    directory = base_path / "active" / infer_project(node)
+    slug = kebab_slug(node.metadata.id)
+    candidate = directory / f"{slug}.md"
+    if _path_owned_by_other(candidate, node.metadata.id):
+        candidate = directory / f"{slug}-{_node_date_part(node.metadata.id)}.md"
+        if _path_owned_by_other(candidate, node.metadata.id):
+            digest = hashlib.sha1(node.metadata.id.encode("utf-8")).hexdigest()[:8]
+            candidate = directory / f"{slug}-{digest}.md"
+    return candidate
+
+
+def _stale_active_file(base_path: Path, node: Node, destination: Path) -> Path | None:
+    """A pre-hierarchy copy of *node* that the new destination supersedes.
+
+    The node moved from a flat ``active/<id>.md`` (or another project folder) to
+    its canonical path; leaving the old file behind would re-index a duplicate.
+    Only files inside ``active/`` that still carry this node's id are removed.
+    """
+
+    raw = node.file_path
+    if raw is None or str(raw) in {"", "."}:
+        return None
+    old_path = raw if raw.is_absolute() else base_path / raw
+    if not old_path.exists():
+        return None
+    try:
+        if old_path.resolve() == destination.resolve():
+            return None
+    except OSError:  # pragma: no cover - defensive
+        return None
+    active_root = (base_path / "active").resolve()
+    try:
+        old_path.resolve().relative_to(active_root)
+    except ValueError:
+        return None  # outside active/ — not ours to move
+    if _markdown_frontmatter_id(old_path) != node.metadata.id:
+        return None
+    return old_path
+
+
 def write_node_file(
     node: Node,
     *,
@@ -274,7 +429,13 @@ def write_node_file(
     include_banners: bool = True,
     supersession_reason: str | None = None,
 ) -> Path:
-    """Serialize and atomically write a node to disk."""
+    """Serialize and atomically write a node to disk.
+
+    Knowledge nodes written with ``base_path`` land at their canonical
+    ``active/<project>/<kebab-slug>.md`` location (the id lives in the
+    frontmatter, not the filename); session transcripts stay in
+    ``transcripts/<id>.md``.
+    """
 
     validation = node.word_count_validation()
     if validation.warning and not _is_session_transcript(node):
@@ -282,17 +443,41 @@ def write_node_file(
         # guideline (the bridge sends up to 16k chars); stay silent for them.
         logger.warning(validation.warning, extra={"node_id": node.metadata.id})
 
+    stale_path: Path | None = None
     if output_path is not None:
         destination = Path(output_path)
     elif base_path is not None:
-        destination = active_node_path(base_path, node.metadata.id)
+        base = Path(base_path)
+        # Session transcripts are raw distiller input, not knowledge: keep
+        # them out of active/ so the knowledge tree stays small.
+        if _is_session_transcript(node):
+            destination = transcript_node_path(base, node.metadata.id)
+            # A legacy copy can still sit in active/ (pre-transcripts layout).
+            # Leaving it behind would re-index as a duplicate node, so the
+            # write completes the move.
+            legacy = active_node_path(base, node.metadata.id)
+            if legacy != destination:
+                stale_path = legacy
+        else:
+            node = _with_inferred_project(node)
+            destination = _knowledge_destination(base, node)
+            stale_path = _stale_active_file(base, node, destination)
     elif node.file_path and str(node.file_path) not in {"", "."}:
         destination = Path(node.file_path)
     else:
         raise ValueError("Either output_path, base_path, or node.file_path must be provided.")
 
     markdown = node_to_markdown(node, include_banners=include_banners, supersession_reason=supersession_reason)
-    return atomic_write_text(destination, markdown)
+    written = atomic_write_text(destination, markdown)
+    if stale_path is not None:
+        try:
+            stale_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Failed to remove superseded active file after write",
+                extra={"node_id": node.metadata.id, "path": str(stale_path), "error": str(exc)},
+            )
+    return written
 
 
 

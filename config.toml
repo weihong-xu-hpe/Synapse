@@ -71,8 +71,13 @@ api_key_env = ""
 
 [dreamer]
 enabled = true
-interval_hours = 12
+# Daily wall-clock cadence: 12:00 noon local time (avoids 2/3 AM Mac sleep).
+schedule_hour = 12
+schedule_minute = 0
+interval_hours = 24
 batch_size = 8
+# Event-driven cadence (§3.4(3)): one extra sleep cycle per 30 new nodes.
+event_trigger_new_nodes = 30
 
 [dreamer.thresholds]
 missing_link_cosine = 0.75
@@ -81,6 +86,11 @@ link_weaving_recency_days = 30
 superseded_archive_days = 7
 low_structure_chars = 100
 max_missing_link_pairs_per_run = 100
+# Dreamer 2.0 sleep consolidation (§3.4): in-place semantic merge + compaction.
+semantic_merge_cosine = 0.88
+max_merges_per_run = 10
+oversized_compaction_bytes = 4096
+max_compactions_per_run = 10
 
 [observability]
 # search_events rows older than this are pruned on write (local private DB).

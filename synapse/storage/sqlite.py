@@ -156,9 +156,11 @@ class DistillerRunMetrics:
     decider_complements: int
     decider_supersedes: int
     decider_downgrades: int
-    llm_failures: int
+    failures: int
     archived_transcripts: int
     items_quarantined: int = 0
+    trigger: str = "legacy"
+    attempts_json: Sequence[dict[str, Any]] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -179,6 +181,7 @@ class SearchEventMetrics:
 
 
 OKF_META_FIELDS = (
+    "session_key",
     "okf_type",
     "okf_version",
     "sources",
@@ -187,7 +190,11 @@ OKF_META_FIELDS = (
     "distilled_at",
     "distilled_node_ids",
     "distilled_turn",
+    "deferred_hash",
+    "force_retry",
     "verified",
+    "t_valid",
+    "t_invalid",
 )
 
 
@@ -353,7 +360,14 @@ class SQLiteNodeStore:
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(distiller_runs)").fetchall()
         }
-        if "items_quarantined" not in distiller_columns:
+        if not {"items_quarantined", "failures", "trigger", "attempts_json"}.issubset(distiller_columns):
+            return True
+        node_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(nodes)").fetchall()
+        }
+        # P1B usage counters: legacy databases need the ADD COLUMN migration.
+        if not {"retrieved_count", "injected_count", "used_count"}.issubset(node_columns):
             return True
         stored_version = self.get_meta("schema_version")
         stored_dimension = self.get_meta("embedding_dimension")
@@ -391,6 +405,9 @@ class SQLiteNodeStore:
                 created_at TEXT NOT NULL,
                 last_accessed TEXT NOT NULL,
                 access_count INTEGER DEFAULT 0,
+                retrieved_count INTEGER DEFAULT 0,
+                injected_count INTEGER DEFAULT 0,
+                used_count INTEGER DEFAULT 0,
                 tags TEXT DEFAULT '[]',
                 okf_meta TEXT DEFAULT '{}'
             )
@@ -501,8 +518,10 @@ class SQLiteNodeStore:
                 decider_complements INTEGER NOT NULL,
                 decider_supersedes INTEGER NOT NULL,
                 decider_downgrades INTEGER NOT NULL,
-                llm_failures INTEGER NOT NULL,
-                archived_transcripts INTEGER NOT NULL
+                failures INTEGER NOT NULL,
+                archived_transcripts INTEGER NOT NULL,
+                "trigger" TEXT NOT NULL DEFAULT 'legacy',
+                attempts_json TEXT NOT NULL DEFAULT '[]'
             )
             """
         )
@@ -538,7 +557,7 @@ class SQLiteNodeStore:
         )
 
     def _ensure_observability_columns(self, connection: sqlite3.Connection) -> None:
-        """Migration helpers for observability tables (schema v7 additions)."""
+        """Migrate observability tables while preserving historical run values."""
 
         columns = {
             str(row["name"])
@@ -551,10 +570,19 @@ class SQLiteNodeStore:
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(distiller_runs)").fetchall()
         }
+        if "failures" not in distiller_columns:
+            if "llm_failures" in distiller_columns:
+                connection.execute("ALTER TABLE distiller_runs RENAME COLUMN llm_failures TO failures")
+            else:
+                connection.execute("ALTER TABLE distiller_runs ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
         if "items_quarantined" not in distiller_columns:
             connection.execute(
                 "ALTER TABLE distiller_runs ADD COLUMN items_quarantined INTEGER NOT NULL DEFAULT 0"
             )
+        if "trigger" not in distiller_columns:
+            connection.execute("ALTER TABLE distiller_runs ADD COLUMN \"trigger\" TEXT NOT NULL DEFAULT 'legacy'")
+        if "attempts_json" not in distiller_columns:
+            connection.execute("ALTER TABLE distiller_runs ADD COLUMN attempts_json TEXT NOT NULL DEFAULT '[]'")
 
     def _ensure_node_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -567,6 +595,13 @@ class SQLiteNodeStore:
             connection.execute("ALTER TABLE nodes ADD COLUMN sensitivity TEXT DEFAULT 'internal'")
         if "okf_meta" not in columns:
             connection.execute("ALTER TABLE nodes ADD COLUMN okf_meta TEXT DEFAULT '{}'")
+        # P1B three-level usage counters (design doc §4.3(1)).
+        if "retrieved_count" not in columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN retrieved_count INTEGER DEFAULT 0")
+        if "injected_count" not in columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN injected_count INTEGER DEFAULT 0")
+        if "used_count" not in columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN used_count INTEGER DEFAULT 0")
 
     def _ensure_vector_table(self, connection: sqlite3.Connection) -> None:
         # sqlite-vec is intentionally not required for Phase 3. The current session
@@ -673,6 +708,10 @@ class SQLiteNodeStore:
             return None
         return str(row["value"])
 
+    def set_meta(self, key: str, value: str) -> None:
+        with self.transaction() as connection:
+            self._set_meta(connection, key, value)
+
     def set_embedding_fingerprint(self, fingerprint: str) -> None:
         with self.transaction() as connection:
             self._set_meta(connection, "embedding_fingerprint", fingerprint)
@@ -704,8 +743,9 @@ class SQLiteNodeStore:
                 """
                 INSERT INTO nodes (
                     id, title, file_path, source_mtime, content, type, status,
-                    sensitivity, supersedes, superseded_by, created_at, last_accessed, access_count, tags, okf_meta
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sensitivity, supersedes, superseded_by, created_at, last_accessed,
+                    access_count, retrieved_count, injected_count, used_count, tags, okf_meta
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     file_path = excluded.file_path,
@@ -718,7 +758,12 @@ class SQLiteNodeStore:
                     superseded_by = excluded.superseded_by,
                     created_at = excluded.created_at,
                     last_accessed = excluded.last_accessed,
-                    access_count = excluded.access_count,
+                    access_count = MAX(nodes.access_count, excluded.access_count),
+                    -- Counters are monotone: a markdown re-sync that carries a
+                    -- stale (lower) value must not erase recorded usage.
+                    retrieved_count = MAX(nodes.retrieved_count, excluded.retrieved_count),
+                    injected_count = MAX(nodes.injected_count, excluded.injected_count),
+                    used_count = MAX(nodes.used_count, excluded.used_count),
                     tags = excluded.tags,
                     okf_meta = excluded.okf_meta
                 """,
@@ -726,7 +771,9 @@ class SQLiteNodeStore:
             )
             # Keep the CJK-bigram shadow content in sync (bigram-expanded text;
             # the nodes_bi_* triggers copy it into the FTS5 shadow index).
-            bi_title, bi_content, bi_tags = build_bigram_text(str(payload[1]), str(payload[4]), str(payload[13]))
+            bi_title, bi_content, bi_tags = build_bigram_text(
+                str(node.title), str(node.content), json.dumps(node.metadata.tags)
+            )
             connection.execute(
                 "DELETE FROM nodes_bi_content WHERE rowid = (SELECT rowid FROM nodes WHERE id = ?)",
                 (node.id,),
@@ -823,19 +870,175 @@ class SQLiteNodeStore:
             )
             return int(cursor.rowcount)
 
-    def update_access(self, node_ids: list[str]) -> None:
-        if not node_ids:
+    def update_access(self, node_ids: list[str], *, injected_ids: list[str] | None = None) -> None:
+        """Record a search result set with read/write decoupled counters.
+
+        P1B (§4.3.1 & §6.1.1B): every returned node is *retrieved*; only nodes
+        that actually passed the inject gate are *injected* (and bump the legacy
+        ``access_count`` / ``last_accessed``). The old behaviour — bumping the
+        aggregate on the whole top-k — inflated usage ~4x relative to real
+        exposure.
+
+        ``injected_ids=None`` is the legacy contract (no inject gate visible to
+        the caller): fall back to treating every id as injected.
+        """
+
+        retrieved = list(dict.fromkeys(node_ids))
+        if not retrieved:
             return
+        injected = list(dict.fromkeys(injected_ids if injected_ids is not None else node_ids))
         timestamp = _utc_now_isoformat()
         with self.transaction() as connection:
             connection.executemany(
-                """
-                UPDATE nodes
-                SET last_accessed = ?, access_count = access_count + 1
-                WHERE id = ?
-                """,
-                [(timestamp, node_id) for node_id in node_ids],
+                "UPDATE nodes SET retrieved_count = retrieved_count + 1 WHERE id = ?",
+                [(node_id,) for node_id in retrieved],
             )
+            if injected:
+                connection.executemany(
+                    """
+                    UPDATE nodes
+                    SET last_accessed = ?, access_count = access_count + 1, injected_count = injected_count + 1
+                    WHERE id = ?
+                    """,
+                    [(timestamp, node_id) for node_id in injected],
+                )
+
+    def record_memory_usage(
+        self,
+        *,
+        injected_ids: Sequence[str] = (),
+        used_ids: Sequence[str] = (),
+    ) -> None:
+        """Credit real memory usage (design doc §4.3(1) credit assignment).
+
+        ``used_ids`` is the dominant signal: used_count +1, access_count +1 and
+        last_accessed refreshed. ``injected_ids`` is the weak prior.
+        """
+
+        injected = list(dict.fromkeys(i for i in injected_ids if i))
+        used = list(dict.fromkeys(i for i in used_ids if i))
+        if not injected and not used:
+            return
+        timestamp = _utc_now_isoformat()
+        with self.transaction() as connection:
+            if injected:
+                connection.executemany(
+                    "UPDATE nodes SET injected_count = injected_count + 1 WHERE id = ?",
+                    [(node_id,) for node_id in injected],
+                )
+            if used:
+                connection.executemany(
+                    """
+                    UPDATE nodes
+                    SET used_count = used_count + 1, access_count = access_count + 1, last_accessed = ?
+                    WHERE id = ?
+                    """,
+                    [(timestamp, node_id) for node_id in used],
+                )
+
+    def get_node_degrees(self, node_ids: Sequence[str]) -> dict[str, int]:
+        """Total degree (incoming + outgoing edges) for each requested node id.
+
+        Feeds the P2 fan-effect hub penalty (§4.3(3)): broad hubs that match
+        everything must not crowd out specific pitfalls. Unknown ids report 0.
+        """
+
+        ids = list(dict.fromkeys(node_ids))
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT id, COUNT(*) AS degree FROM (
+                SELECT source_id AS id FROM edges WHERE source_id IN ({placeholders})
+                UNION ALL
+                SELECT target_id AS id FROM edges WHERE target_id IN ({placeholders})
+            )
+            GROUP BY id
+            """,
+            [*ids, *ids],
+        ).fetchall()
+        degrees = {node_id: 0 for node_id in ids}
+        for row in rows:
+            degrees[str(row["id"])] = int(row["degree"])
+        return degrees
+
+    def get_node_embedding(self, node_id: str) -> list[float] | None:
+        """Stored body embedding for *node_id*, or None when it has no vector."""
+
+        packed = self._load_vectors_cached().get(node_id)
+        if packed is None:
+            return None
+        return [float(value) for value in packed]
+
+    def find_near_duplicate(
+        self,
+        node_id: str,
+        *,
+        cosine_threshold: float = 0.88,
+        candidate_limit: int = 25,
+    ) -> list[tuple[str, float]]:
+        """Active typed same-project nodes whose embedding matches *node_id*.
+
+        Returns ``[(other_id, cosine)]``, most similar first — the deterministic
+        half of Dreamer 2.0's oversized-node dedupe (§3.4(2)). Callers still
+        apply their own token-overlap guard: cosine says "same topic", not
+        "same text".
+        """
+
+        source = self.get_node(node_id)
+        if source is None:
+            return []
+        embedding = self.get_node_embedding(node_id)
+        if not embedding:
+            return []
+        matches: list[tuple[str, float]] = []
+        for other_id, distance in self.vector_search(embedding, limit=max(candidate_limit, 1)):
+            if other_id == node_id:
+                continue
+            similarity = 1.0 - float(distance)
+            if similarity < cosine_threshold:
+                break  # vector_search is distance-ascending
+            other = self.get_node(other_id)
+            if other is None or other.metadata.status is not NodeStatus.ACTIVE:
+                continue
+            if other.metadata.type is not NodeType.PERSISTENT or not other.metadata.okf_type:
+                continue
+            if other.metadata.project != source.metadata.project:
+                continue
+            matches.append((other_id, similarity))
+        return matches
+
+    def get_project_session_counts(self) -> dict[str, int]:
+        """Distinct active sessions that touched each project (Δt_proj clock).
+
+        The Project-Active Session Clock (§4.3(2)) advances per *active
+        session in the project*, not per wall-clock day: while work stays in
+        one project, another project's memories do not decay. A project's
+        active sessions are the distinct source (transcript) ids referenced by
+        its active knowledge nodes.
+        """
+
+        rows = self._connection.execute(
+            """
+            SELECT json_extract(n.okf_meta, '$.project') AS project,
+                   COUNT(DISTINCT source.value) AS sessions
+            FROM nodes AS n, json_each(json_extract(n.okf_meta, '$.sources')) AS source
+            WHERE n.type = ?
+              AND n.status = ?
+              AND json_valid(n.okf_meta)
+              AND json_extract(n.okf_meta, '$.project') IS NOT NULL
+              AND json_extract(n.okf_meta, '$.sources') IS NOT NULL
+            GROUP BY project
+            """,
+            (NodeType.PERSISTENT.value, NodeStatus.ACTIVE.value),
+        ).fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            project = row["project"]
+            if project:
+                counts[str(project)] = int(row["sessions"] or 0)
+        return counts
 
     def update_status(
         self,
@@ -939,7 +1142,7 @@ class SQLiteNodeStore:
         filters = filters or {}
         clauses: list[str] = []
         values: list[Any] = []
-        for key in ("tier", "status", "type", "title"):
+        for key in ("status", "type", "title"):
             if key in filters and filters[key] is not None:
                 clauses.append(f"{key} = ?")
                 values.append(filters[key].value if hasattr(filters[key], "value") else filters[key])
@@ -1033,26 +1236,6 @@ class SQLiteNodeStore:
         # Return pseudo-bm25 positive scores so callers keep a monotone signal.
         return [(node_id, score * 100.0) for node_id, score in ranked]
 
-
-    def get_neighbors(self, node_ids: list[str], depth: int = 1) -> list[str]:
-        if depth < 1 or not node_ids:
-            return []
-        frontier = set(node_ids)
-        visited = set(node_ids)
-        neighbors: set[str] = set()
-        for _ in range(depth):
-            if not frontier:
-                break
-            placeholders = ", ".join("?" for _ in frontier)
-            rows = self._connection.execute(
-                f"SELECT DISTINCT target_id FROM edges WHERE source_id IN ({placeholders})",
-                tuple(frontier),
-            ).fetchall()
-            next_frontier = {str(row["target_id"]) for row in rows} - visited
-            neighbors.update(next_frontier)
-            visited.update(next_frontier)
-            frontier = next_frontier
-        return sorted(neighbors)
 
     def get_linked_neighbors(self, node_ids: list[str], *, limit: int = 6) -> list[str]:
         if not node_ids or limit <= 0:
@@ -1324,13 +1507,6 @@ class SQLiteNodeStore:
         ).fetchall()
         return [self._row_to_node(row) for row in rows]
 
-    def count_disputed_nodes(self) -> int:
-        row = self._connection.execute(
-            "SELECT COUNT(*) AS count FROM nodes WHERE status = ?",
-            (NodeStatus.DISPUTED.value,),
-        ).fetchone()
-        return int(row["count"]) if row is not None else 0
-
     def count_disputed_pairs(self) -> int:
         """Count disputed node pairs using the same pairing semantics as Dreamer."""
         disputed = self.find_by_status(NodeStatus.DISPUTED)
@@ -1364,19 +1540,6 @@ class SQLiteNodeStore:
         )
         self._connection.commit()
         return cursor.rowcount > 0
-
-    def missing_link_similarity_histogram(
-        self,
-        *,
-        thresholds: Iterable[float],
-        recency_days: int,
-    ) -> dict[str, int]:
-        """Count unlinked recent active node pairs above fixed cosine-similarity buckets."""
-        _, counts = self.analyze_missing_links(
-            histogram_thresholds=thresholds,
-            recency_days=recency_days,
-        )
-        return counts
 
     def _recent_active_embeddings(self, recency_days: int) -> dict[str, list[float]]:
         cutoff = _utc_cutoff(recency_days)
@@ -1443,8 +1606,8 @@ class SQLiteNodeStore:
                     transcripts_scanned, transcripts_distilled, transcripts_skipped,
                     items_extracted, items_invalid, items_quarantined,
                     decider_creates, decider_complements, decider_supersedes, decider_downgrades,
-                    llm_failures, archived_transcripts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    failures, archived_transcripts, "trigger", attempts_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metrics.started_at,
@@ -1460,8 +1623,10 @@ class SQLiteNodeStore:
                     metrics.decider_complements,
                     metrics.decider_supersedes,
                     metrics.decider_downgrades,
-                    metrics.llm_failures,
+                    metrics.failures,
                     metrics.archived_transcripts,
+                    metrics.trigger,
+                    json.dumps(list(metrics.attempts_json), ensure_ascii=False),
                 ),
             )
 
@@ -1521,15 +1686,33 @@ class SQLiteNodeStore:
             cursor = connection.execute("DELETE FROM search_events WHERE ts < ?", (cutoff,))
             return cursor.rowcount
 
-    def record_metrics_snapshot(self, *, date: str, created_at: str, payload: dict[str, Any]) -> bool:
-        """Insert today's snapshot row. Returns False when the date row already exists."""
+    def record_metrics_snapshot(
+        self,
+        *,
+        date: str,
+        created_at: str,
+        payload: dict[str, Any],
+        replace: bool = False,
+    ) -> bool:
+        """Record a snapshot; optionally atomically replace the date's row."""
         with self.transaction() as connection:
-            cursor = connection.execute(
-                """
-                INSERT OR IGNORE INTO metrics_snapshots (date, created_at, payload) VALUES (?, ?, ?)
-                """,
-                (date, created_at, json.dumps(payload, ensure_ascii=False)),
-            )
+            if replace:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO metrics_snapshots (date, created_at, payload) VALUES (?, ?, ?)
+                    ON CONFLICT(date) DO UPDATE SET
+                        created_at = excluded.created_at,
+                        payload = excluded.payload
+                    """,
+                    (date, created_at, json.dumps(payload, ensure_ascii=False)),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO metrics_snapshots (date, created_at, payload) VALUES (?, ?, ?)
+                    """,
+                    (date, created_at, json.dumps(payload, ensure_ascii=False)),
+                )
             return cursor.rowcount > 0
 
     def get_metrics_snapshots(self, *, since_date: str | None = None) -> list[dict[str, Any]]:
@@ -1551,52 +1734,6 @@ class SQLiteNodeStore:
                 continue
             snapshots.append({"date": str(row["date"]), "created_at": str(row["created_at"]), "payload": payload})
         return snapshots
-
-    def search_events_stats(self, *, since: str) -> dict[str, Any]:
-        """Aggregate search stats since an ISO cutoff, grouped by source."""
-        row = self._connection.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN json_array_length(results) > 0 THEN 1 ELSE 0 END) AS with_results,
-                AVG(latency_ms) AS avg_latency
-            FROM search_events WHERE ts >= ?
-            """,
-            (since,),
-        ).fetchone()
-        by_source: dict[str, dict[str, Any]] = {}
-        source_rows = self._connection.execute(
-            """
-            SELECT source, COUNT(*) AS count, AVG(latency_ms) AS avg_latency,
-                   SUM(CASE WHEN json_array_length(results) = 0 THEN 1 ELSE 0 END) AS zero_result
-            FROM search_events WHERE ts >= ? GROUP BY source
-            """,
-            (since,),
-        ).fetchall()
-        for src in source_rows:
-            by_source[str(src["source"])] = {
-                "count": int(src["count"] or 0),
-                "avg_latency_ms": _round_optional(src["avg_latency"]),
-                "zero_result_count": int(src["zero_result"] or 0),
-            }
-        inject_row = self._connection.execute(
-            """
-            SELECT SUM(value) AS injected FROM search_events, json_each(search_events.results)
-            WHERE search_events.ts >= ? AND json_extract(json_each.value, '$.inject') = 1
-            """,
-            (since,),
-        ).fetchone()
-        total = int(row["total"] or 0) if row is not None else 0
-        with_results = int(row["with_results"] or 0) if row is not None else 0
-        injected = int(inject_row["injected"] or 0) if inject_row is not None else 0
-        return {
-            "total": total,
-            "with_results": with_results,
-            "zero_result": total - with_results,
-            "injected_results_total": injected,
-            "avg_latency_ms": _round_optional(row["avg_latency"]) if row is not None else 0.0,
-            "by_source": by_source,
-        }
 
     def get_dreamer_metrics_summary(self) -> dict[str, Any]:
         """Return aggregate Dreamer metrics for service stats payloads."""
@@ -1785,6 +1922,9 @@ class SQLiteNodeStore:
             _ensure_isoformat(metadata.created_at),
             _ensure_isoformat(metadata.last_accessed),
             metadata.access_count,
+            metadata.retrieved_count,
+            metadata.injected_count,
+            metadata.used_count,
             json.dumps(metadata.tags),
             _okf_meta_json(metadata),
         )
@@ -1801,6 +1941,9 @@ class SQLiteNodeStore:
                 "created_at": row["created_at"],
                 "last_accessed": row["last_accessed"],
                 "access_count": row["access_count"],
+                "retrieved_count": row["retrieved_count"] or 0,
+                "injected_count": row["injected_count"] or 0,
+                "used_count": row["used_count"] or 0,
                 "type": row["type"],
                 "status": row["status"],
                 "sensitivity": row["sensitivity"] or "internal",

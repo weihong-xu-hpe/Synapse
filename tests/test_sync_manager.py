@@ -390,7 +390,7 @@ def test_reembed_warning_excludes_transcript_skips(tmp_path: Path) -> None:
             session_key="skipwarn-key",
         ),
         content="## User\ntranscript body\n",
-        file_path=Path("active/mem_session_skipwarn.md"),
+        file_path=Path("transcripts/mem_session_skipwarn.md"),
     )
     transcript_path = write_node_file(transcript, base_path=runtime_paths.base)
     # Stale disk mtimes so startup_sync's drain does not re-sync either file —
@@ -409,7 +409,8 @@ def test_reembed_warning_excludes_transcript_skips(tmp_path: Path) -> None:
         )
         knowledge_path = write_node_file(knowledge, base_path=runtime_paths.base)
         os.utime(knowledge_path, (old, old))
-        store.upsert_node(knowledge, embedding=None, source_mtime=FIXED_TIME)
+        stored_knowledge = knowledge.model_copy(update={"file_path": knowledge_path.relative_to(runtime_paths.base)})
+        store.upsert_node(stored_knowledge, embedding=None, source_mtime=FIXED_TIME)
         assert set(store.get_node_ids_without_vectors()) == {"mem_session_skipwarn", "mem_degraded1"}
 
     records: list[logging.LogRecord] = []

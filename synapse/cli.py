@@ -20,6 +20,7 @@ from synapse.config import SynapseConfig, load_config
 from synapse.deployment import ServiceActionResult, ServiceLogView, ServiceManager, ServiceStatus
 from synapse.indexing import collect_health_status, rebuild_index as rebuild_sqlite_index, run_startup_checks
 from synapse.lifecycle import Dreamer
+from synapse.lifecycle.scheduler import dreamer_process_lock
 from synapse.server.decider import LocalLLMDecider
 from synapse.storage import SQLiteNodeStore
 from synapse.utils import RuntimePaths, bootstrap_runtime_directories, configure_logging
@@ -118,7 +119,14 @@ def main_callback(
     if episode_pilot:
         # Episode command replaces every runtime path from its explicit --base before opening storage.
         placeholder = Path("/var/empty/synapse-episode-cli-unbound")
-        runtime_paths = RuntimePaths(placeholder, placeholder / "active", placeholder / ".archive", placeholder / ".logs", placeholder / ".audit")
+        runtime_paths = RuntimePaths(
+            placeholder,
+            placeholder / "active",
+            placeholder / ".archive",
+            placeholder / ".logs",
+            placeholder / ".audit",
+            placeholder / "transcripts",
+        )
         loggers = {}
     else:
         runtime_paths = bootstrap_runtime_directories(loaded_config)
@@ -205,16 +213,26 @@ def run_dreamer(
     dreamer_settings = state.config.decider.model_copy(
         update={"timeout_seconds": state.config.distiller.llm_timeout_seconds}
     )
-    dreamer = Dreamer(
-        state.config,
-        runtime_paths=state.runtime_paths,
-        sampling_client=LocalLLMDecider(dreamer_settings),
-        logger=logger,
-    )
-    try:
-        report = dreamer.run(batch_size=effective_batch_size)
-    finally:
-        dreamer.close()
+
+    # Single-flight across processes: the CLI shares dreamer.lock with the
+    # in-process DreamerScheduler so an on-demand run can never overlap a
+    # scheduled or event-driven cycle.
+    lock_path = state.runtime_paths.logs / "dreamer.lock"
+    with dreamer_process_lock(lock_path) as acquired:
+        if not acquired:
+            typer.echo("Dreamer run skipped: another Dreamer process holds dreamer.lock.")
+            return
+
+        dreamer = Dreamer(
+            state.config,
+            runtime_paths=state.runtime_paths,
+            sampling_client=LocalLLMDecider(dreamer_settings),
+            logger=logger,
+        )
+        try:
+            report = dreamer.run(batch_size=effective_batch_size)
+        finally:
+            dreamer.close()
 
     typer.echo("Dreamer run completed.")
     typer.echo(f"Scanned: {report.scanned}")
@@ -224,6 +242,8 @@ def run_dreamer(
     typer.echo(f"Archived: {len(report.archived)}")
     typer.echo(f"Condensed: {len(report.condensed)}")
     typer.echo(f"Synthesized hubs: {len(report.synthesized)}")
+    typer.echo(f"Semantic merges: {len(report.merged)}")
+    typer.echo(f"Oversized compacted/split: {len(report.compacted)}")
     typer.echo(f"Warnings: {len(report.warnings)}")
 
 
@@ -241,7 +261,7 @@ def run_episode_distiller(
     allow_live: Annotated[bool, typer.Option("--allow-live", help="Explicitly allow running against ~/synapse live data.")] = False,
 ) -> None:
     """Run episode extraction and serialized integration against the selected database."""
-    from synapse.lifecycle.episode_distiller import EpisodeDistiller
+    from synapse.lifecycle.episode_distiller import EpisodeDistiller, attempt_record
     from synapse.models import NodeStatus, NodeType
     from synapse.okf.transcripts import is_session_transcript
     from synapse.storage import SQLiteNodeStore
@@ -306,6 +326,7 @@ def run_episode_distiller(
     )
     runs = []
     failures = []
+    attempts = []
     metrics_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     metrics_started_clock = time.perf_counter()
     try:
@@ -315,7 +336,7 @@ def run_episode_distiller(
                 futures = {}
                 for session_id in session_ids:
                     started_at[session_id] = time.perf_counter()
-                    futures[executor.submit(runner.run, session_id)] = session_id
+                    futures[executor.submit(runner.run, session_id, force=True)] = session_id
                 completed = 0
                 for future in as_completed(futures):
                     session_id = futures[future]
@@ -323,19 +344,29 @@ def run_episode_distiller(
                     try:
                         result = future.result()
                         runs.append(result)
+                        attempts.append(attempt_record(session_id, result))
                         _echo_episode_progress(completed, len(session_ids), session_id, result, started_at[session_id])
                     except Exception as exc:  # preserve successful sessions in the report
                         failures.append({"session": session_id, "error": f"{type(exc).__name__}: {exc}"})
+                        attempt_id = getattr(exc, "distiller_session_id", None) or (
+                            session_id if session_id.startswith("mem_") else runner.service._session_node_id(session_id)
+                        )
+                        attempts.append(attempt_record(attempt_id, None, stage=getattr(exc, "distiller_stage", None)))
                         typer.echo(f"[{completed}/{len(session_ids)}] {session_id}: failed, {time.perf_counter() - started_at[session_id]:.1f}s")
         else:
             for index, session_id in enumerate(session_ids, 1):
                 started = time.perf_counter()
                 try:
-                    result = runner.run(session_id)
+                    result = runner.run(session_id, force=True)
                     runs.append(result)
+                    attempts.append(attempt_record(session_id, result))
                     _echo_episode_progress(index, len(session_ids), session_id, result, started)
                 except Exception as exc:  # preserve successful earlier/later sessions in the report
                     failures.append({"session": session_id, "error": f"{type(exc).__name__}: {exc}"})
+                    attempt_id = getattr(exc, "distiller_session_id", None) or (
+                        session_id if session_id.startswith("mem_") else runner.service._session_node_id(session_id)
+                    )
+                    attempts.append(attempt_record(attempt_id, None, stage=getattr(exc, "distiller_stage", None)))
                     typer.echo(f"[{index}/{len(session_ids)}] {session_id}: failed, {time.perf_counter() - started:.1f}s")
     finally:
         try:
@@ -345,7 +376,9 @@ def run_episode_distiller(
                 completed_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 duration_ms=round((time.perf_counter() - metrics_started_clock) * 1000),
                 transcripts_scanned=len(session_ids),
-                llm_failures=len(failures),
+                failures=len(failures),
+                trigger="cli",
+                attempts_json=attempts,
             )
         finally:
             try:
@@ -476,7 +509,7 @@ def distiller_status(ctx: typer.Context) -> None:
         rows = store._connection.execute(
             """
             SELECT started_at, transcripts_distilled, items_extracted, items_invalid,
-                   decider_creates, decider_complements, llm_failures, archived_transcripts
+                   decider_creates, decider_complements, failures, archived_transcripts
             FROM distiller_runs ORDER BY started_at DESC LIMIT 5
             """
         ).fetchall()
@@ -486,7 +519,7 @@ def distiller_status(ctx: typer.Context) -> None:
             typer.echo(
                 f"  {row['started_at']} distilled={row['transcripts_distilled']} items={row['items_extracted']} "
                 f"creates={row['decider_creates']} updates={row['decider_complements']} "
-                f"gatekeeper_filtered={row['items_invalid']} failures={row['llm_failures']} "
+                f"no_op={row['items_invalid']} failures={row['failures']} "
                 f"archived={row['archived_transcripts']}"
             )
     else:
@@ -520,6 +553,7 @@ def rebuild_index(
             archive=runtime_paths.archive,
             logs=runtime_paths.logs,
             audit=runtime_paths.audit,
+            transcripts=runtime_paths.transcripts,
         )
 
     result = rebuild_sqlite_index(
@@ -659,6 +693,7 @@ def status(ctx: typer.Context) -> None:
     typer.echo(f"Config path: {state.config_path}")
     typer.echo(f"Server binding: {state.config.server.host}:{state.config.server.port}")
     typer.echo(f"Active directory: {state.runtime_paths.active}")
+    typer.echo(f"Transcripts directory: {state.runtime_paths.transcripts}")
     typer.echo(f"Archive directory: {state.runtime_paths.archive}")
     typer.echo(f"Log directory: {state.runtime_paths.logs}")
     typer.echo(f"Audit directory: {state.runtime_paths.audit}")
@@ -1074,6 +1109,55 @@ def eval_run(
     typer.echo(json.dumps(payload["overall"], indent=2, ensure_ascii=False))
     for name, metrics in sorted(payload["slices"].items()):
         typer.echo(f"--- {name}: " + json.dumps(metrics, ensure_ascii=False))
+
+
+@app.command("stats")
+def stats(
+    ctx: typer.Context,
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw north-star metrics payload as JSON."),
+    ] = False,
+) -> None:
+    """Print the four §6.5 north-star metrics (consolidation, recall SNR, graph, LLM gate)."""
+
+    from synapse.observability import collect_north_star_metrics, render_north_star_stats
+
+    state = _state_from_context(ctx)
+    with SQLiteNodeStore(
+        state.runtime_paths.base / "synapse.db",
+        embedding_dimension=state.config.embedding.dimension or 0,
+    ) as store:
+        metrics = collect_north_star_metrics(store, runtime_paths=state.runtime_paths)
+    if as_json:
+        _echo_json_block(metrics)
+        return
+    typer.echo(render_north_star_stats(metrics))
+
+
+handbook_app = typer.Typer(help="Human/AI dual-readable handbook compiler.", no_args_is_help=True)
+app.add_typer(handbook_app, name="handbook")
+
+
+@handbook_app.command("build")
+def handbook_build(
+    ctx: typer.Context,
+    out_dir: Annotated[
+        Path | None,
+        typer.Option("--out-dir", help="Handbook output directory (default: <runtime base>/handbook).", file_okay=False, resolve_path=True),
+    ] = None,
+) -> None:
+    """Compile ACTIVE persistent OKF nodes into the dual-readable handbook tree."""
+
+    from synapse.handbook import build_handbook
+
+    state = _state_from_context(ctx)
+    result = build_handbook(state.config, state.runtime_paths, out_dir=out_dir)
+    typer.echo(f"Handbook written: {result['out_dir']}")
+    typer.echo(f"Knowledge nodes: {result['total_nodes']} across {len(result['projects'])} project(s)")
+    for project, count in result["projects"].items():
+        typer.echo(f"  {project}: {count}")
+    typer.echo(f"Files written: {len(result['files_written'])}")
 
 
 def main() -> None:

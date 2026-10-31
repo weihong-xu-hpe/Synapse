@@ -9,7 +9,6 @@ from synapse.config import load_config
 from synapse.server.service import SynapseServerService
 from synapse.server.write_normalize import (
     WritePathNormalizer,
-    decide_write_type,
     has_okf_structure,
     infer_okf_type,
 )
@@ -37,14 +36,6 @@ def test_infer_okf_type_matches_in_priority_order() -> None:
     assert infer_okf_type("## Steps\none") == "procedure"
     assert infer_okf_type("## Details\nstuff") == "fact"
     assert infer_okf_type("## Random\nno match") is None
-
-
-def test_decide_write_type_explicit_always_wins() -> None:
-    assert decide_write_type(node_type="transient", content="## Steps\nx", okf_type=None) == ("transient", "explicit")
-    assert decide_write_type(node_type="persistent", content="plain", okf_type=None) == ("persistent", "explicit")
-    assert decide_write_type(node_type=None, content="## Steps\nx", okf_type=None) == ("persistent", "defaulted_persistent")
-    assert decide_write_type(node_type=None, content="chatter", okf_type=None) == ("transient", "defaulted_transient")
-    assert decide_write_type(node_type=None, content="plain", okf_type="fact") == ("persistent", "defaulted_persistent")
 
 
 # ---------------------------------------------------------------------------

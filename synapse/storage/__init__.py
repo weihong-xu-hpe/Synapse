@@ -1,11 +1,14 @@
 """Storage package for Synapse."""
 
 from synapse.storage.markdown import (
+	active_node_file_path,
 	active_node_path,
 	add_supersession_banners,
 	archive_node_path,
 	atomic_write_text,
 	extract_wiki_links,
+	knowledge_relative_path,
+	locate_active_node_file,
 	node_from_markdown,
 	node_to_markdown,
 	read_node_file,
@@ -14,6 +17,7 @@ from synapse.storage.markdown import (
 	scan_markdown_nodes,
 	serialize_frontmatter,
 	split_frontmatter,
+	transcript_node_path,
 	write_node_file,
 )
 from synapse.storage.sqlite import (
@@ -30,11 +34,14 @@ from synapse.storage.sqlite import (
 )
 
 __all__ = [
+	"active_node_file_path",
 	"active_node_path",
 	"add_supersession_banners",
 	"archive_node_path",
 	"atomic_write_text",
 	"extract_wiki_links",
+	"knowledge_relative_path",
+	"locate_active_node_file",
 	"node_from_markdown",
 	"node_to_markdown",
 	"read_node_file",
@@ -51,6 +58,7 @@ __all__ = [
 	"SearchEventMetrics",
 	"WriteMemoryEventMetrics",
 	"split_frontmatter",
+	"transcript_node_path",
 	"build_node_alias_map",
 	"resolve_links_to_node_ids",
 	"write_node_file",

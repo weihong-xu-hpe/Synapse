@@ -1,8 +1,8 @@
 # Session transcript format (client → Synapse)
 
 The omp bridge submits one session transcript per session key via `POST /api/write`
-(`session_key` keyed upsert, no LLM). The server stores the payload verbatim as the
-transcript node body; the distiller parses it into turns.
+(`session_key` keyed upsert, no LLM). The server redacts sensitive content before
+storing the transcript; the distiller parses the stored body into turns.
 
 ## v2 contract
 
@@ -12,8 +12,8 @@ A v2 transcript MUST start with the marker line:
 <!-- synapse-transcript v2 -->
 ```
 
-Turns are numbered sequentially `T1..Tn` over user/assistant messages. Tool
-calls/results attach under the assistant turn that issued them. Thinking is omitted.
+Turns have stable `T<n>` numbers over user/assistant messages. Active branches
+can have gaps. Tool calls/results attach to the assistant turn; thinking is omitted.
 
 ```markdown
 <!-- synapse-transcript v2 -->
@@ -33,8 +33,8 @@ result [ok|error]:
 
 Rules:
 
-- Turn headings are exactly `## T<n> User` / `## T<n> Assistant` (level 2, sequential
-  `n` starting at 1).
+- Turn headings are exactly `## T<n> User` / `## T<n> Assistant`. Numbers are
+  positive and stable across updates; active branches may contain gaps.
 - Tool sections are level 3 under the owning assistant turn: `### Tool T<n>.<m>
   <tool_name>`; `call:` is one line of at most 1,000 characters. `result [ok|error]:`
   preserves multiline formatting up to 4,000 characters for core tools and 800 characters
@@ -42,8 +42,8 @@ Rules:
 - Scheduling/polling noise is omitted at render time: `todo`, `vibe_wait`, `vibe_list`,
   `vibe_kill`, `vibe_send`, `wait`, and `hub` wait/list/status/poll/kill operations.
 - The complete rendered transcript is capped at 1,500,000 characters.
-- The distiller extracts evidence quotes from **User turn bodies** and **tool result
-  lines** only (see docs/okf.md §9) — keep those verbatim where possible.
+- Evidence can cite User, Assistant, and surviving tool-result text. Preserve
+  the original text where possible for verification.
 
 ## Legacy v1 (accepted, no marker)
 
@@ -58,9 +58,14 @@ enclosing turn body.
   Assistant turns (Stage 0), builds a chronological Global User Spine, scans pending
   turns with a low-effort Stage 1 model in chunks up to `chunk_chars = 400000`, then
   passes candidate lessons to the Stage 2 gatekeeper and integrator.
-- Bridge `POST /api/episode/close` triggers episode processing; the server's idle
-  scheduler is the fallback, selecting transcripts idle for 60 minutes by default.
-- Distillation progress is stamped on the transcript frontmatter: `distilled_turn`
-  (last turn number covered) plus the existing `distilled_hash` / `distilled_at` /
-  `distilled_node_ids`. Re-distillation after new turns arrive only processes turns
-  after `distilled_turn` (with one previous turn as context).
+- Bridge `POST /api/episode/close` triggers asynchronous processing; `accepted`
+  means queued, not completed. The server's idle scheduler is the fallback.
+- Short non-empty revisions selected by the scheduler are deferred without
+  advancing `distilled_turn`; a content change makes them eligible again.
+  Close events and explicit CLI runs scan short revisions immediately.
+  Failed close/CLI attempts retain `force_retry` so the scheduler retries even
+  when the pending content is too short for an ordinary sweep.
+- `distilled_turn`, `distilled_hash`, `distilled_at`, and `distilled_node_ids`
+  record progress. A shared transcript lock serializes processing; the stamp
+  applies only to the revision actually read. Changes during processing remain
+  eligible for another pass. A changed previously processed prefix is rescanned.

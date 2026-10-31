@@ -263,8 +263,8 @@ Load and trigger manually: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAge
 Every search and write is recorded locally (SQLite tables `search_events`, `write_memory_events.route`, `metrics_snapshots` — schema v7) so the owner can look back after 1–2 months and decide the next upgrade direction. All data stays on the machine; query text is stored in the private local DB only. Full key reference: `docs/configuration.md` § `[observability]`.
 
 - **Search events** — one row per `search_memory` call with `source` (`bridge` / `rest` / `mcp`), session hash, query text, CJK ratio, latency, and per-result `inject` decisions. Eval runs bypass the service layer and are never recorded (usage statistics stay eval-free). Rows older than `search_events_retention_days` (default 180) are pruned on write.
-- **Daily snapshots** — written automatically after each server distiller sweep (idempotent per local day, 2-day backfill when the machine slept); node counts include active persistent nodes by `verified_true`, `verified_false`, and `verified_unset`, and distiller yield includes creates, updates, quarantines, and gatekeeper-filtered items. `python -m synapse metrics snapshot` runs/prints one manually.
-- **Write attribution** — `write_memory_events.route` distinguishes `mcp`, `rest`, `session_upsert`, `distiller`, `write_node`; the dedupe-guard `unchanged` path is recorded too.
+- **Daily snapshots** — refreshed after each distiller sweep; timestamped events are backfilled for recent days. Historical stock counts and sizes are marked unavailable unless captured on that date. `python -m synapse metrics snapshot` runs/prints one manually.
+- **Write attribution** — `write_memory_events.route` distinguishes `mcp`, `rest`, `session_upsert`, `distiller`, `distiller_recovery`, and `write_node`.
 
 Lookback commands:
 
@@ -299,6 +299,8 @@ server's idle-transcript fallback scheduler:
 - Stage 1 scans with the low-effort models in `[distiller.episode.scanner_endpoints]`, chunking pending turns at
   `chunk_chars` (default 400,000); Stage 2 uses `gatekeeper_endpoint` to validate lessons, retrieve evidence,
   and integrate them into existing or new nodes;
+- close and explicit CLI runs scan short non-empty episodes; the fallback sweep defers short revisions without advancing their watermark and retries after a content change;
+- processing is serialized per transcript, and stamps apply only to the revision actually processed;
 - episode settings include `scanner_endpoints`, `gatekeeper_endpoint`, `chunk_chars`, `max_tokens`, and
   `evidence_context_token_budget` under `[distiller.episode]` (see `docs/configuration.md`);
 - extracted lessons are written as `persistent` nodes with provenance (`sources` + transcript backlink in
@@ -306,10 +308,10 @@ server's idle-transcript fallback scheduler:
   `distiller.retention_days` (default 45), never before they are distilled.
 
 
-`synapse distill status` prints the active scanner and gatekeeper models and recent run creates, updates, and
-`gatekeeper_filtered` (`items_invalid`) counts. `synapse report --since 7d` shows new-node counts by verification
-status and the Episode Distiller funnel: runs, distilled/skipped transcripts, Stage-1 lessons, created/updated,
-gatekeeper-filtered, quarantined, LLM failures, and archived transcripts.
+`synapse distill status` prints recent creates, updates, no-op results, and generic failures.
+`synapse report --since 7d` shows the Episode Distiller funnel. New `distiller_runs`
+include trigger, per-attempt outcome and failure stage; legacy failures have no
+per-attempt attribution and must not be interpreted as model failures.
 
 Maintenance commands:
 

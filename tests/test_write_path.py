@@ -59,6 +59,16 @@ def make_service(tmp_path: Path) -> tuple[SynapseServerService, SynapseConfig, R
     return service, config, runtime_paths
 
 
+def active_text(runtime_paths: RuntimePaths, node_id: str) -> str:
+    """Read a knowledge node's Markdown from its canonical active/ location."""
+
+    from synapse.storage import locate_active_node_file
+
+    path = locate_active_node_file(runtime_paths.base, node_id)
+    assert path is not None, f"no active Markdown file for {node_id}"
+    return path.read_text(encoding="utf-8")
+
+
 def test_integrate_knowledge_supersedes_existing_node_and_syncs_db(tmp_path: Path) -> None:
     service, config, runtime_paths = make_service(tmp_path)
     original = service.write_node(
@@ -85,8 +95,8 @@ def test_integrate_knowledge_supersedes_existing_node_and_syncs_db(tmp_path: Pat
     assert result["updated_nodes"][0]["metadata"]["status"] == "superseded"
     assert result["updated_nodes"][0]["metadata"]["superseded_by"] == new_id
 
-    new_markdown = (runtime_paths.active / f"{new_id}.md").read_text(encoding="utf-8")
-    original_markdown = (runtime_paths.active / f"{original_id}.md").read_text(encoding="utf-8")
+    new_markdown = active_text(runtime_paths, new_id)
+    original_markdown = active_text(runtime_paths, original_id)
     assert f"> **Supersedes**: [[{original_id}]] — Sliding window replaced token bucket for burst traffic." in new_markdown
     assert f"> ⚠️ **SUPERSEDED** by [[{new_id}]]" in original_markdown
 
@@ -118,8 +128,8 @@ def test_integrate_knowledge_complements_existing_nodes_with_reciprocal_links(tm
     )
 
     new_id = result["node"]["id"]
-    original_markdown = (runtime_paths.active / f"{original_id}.md").read_text(encoding="utf-8")
-    new_markdown = (runtime_paths.active / f"{new_id}.md").read_text(encoding="utf-8")
+    original_markdown = active_text(runtime_paths, original_id)
+    new_markdown = active_text(runtime_paths, new_id)
     assert result["action"] == "complement"
     assert f"[[{original_id}]]" in new_markdown
     assert f"[[{new_id}]]" in original_markdown
@@ -187,7 +197,7 @@ def test_integrate_knowledge_supports_chain_supersession_without_losing_history(
     alpha_node = service.get_node(alpha_id)
     beta_node = service.get_node(beta_id)
     gamma_node = service.get_node(gamma_id)
-    beta_markdown = (runtime_paths.active / f"{beta_id}.md").read_text(encoding="utf-8")
+    beta_markdown = active_text(runtime_paths, beta_id)
 
     assert alpha_node["metadata"]["status"] == "superseded"
     assert alpha_node["metadata"]["superseded_by"] == beta_id
@@ -628,3 +638,25 @@ def test_distiller_final_body_is_not_persisted_after_failed_repair(tmp_path: Pat
     assert exc_info.value.details["execution_error"]["code"] == "INVALID_OKF_FINAL_BODY"
     with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
         assert not store.list_nodes({"status": NodeStatus.ACTIVE, "title": "Invalid final OKF body is rejected"})
+
+
+def test_write_memory_scrubs_credential_values_before_storage(tmp_path: Path) -> None:
+    """A client secret in a write body must never reach the stored node."""
+
+    from tests.test_server_api import FakeSamplingClient
+
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=FakeSamplingClient())
+    secret = "Cli3ntSecr3tValue"
+
+    result = service.write_memory(
+        title="Credential Scrubbing Probe",
+        content=f"Set CLIENT_SECRET={secret} in the service-identities secret, keep the client_id.\n",
+        node_type=NodeType.TRANSIENT,
+    )
+
+    node_id = result["execution"]["result"]["node"]["id"]
+    stored = active_text(runtime_paths, node_id)
+    assert secret not in stored
+    assert "CLIENT_SECRET=[REDACTED_CREDENTIAL]" in stored

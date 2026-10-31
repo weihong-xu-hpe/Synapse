@@ -201,10 +201,12 @@ def test_live_dreamer_weaves_missing_link_between_similar_nodes(
             assert pair_found, f"expected link between link-a/link-b, got {link_pairs}"
 
             # After sync, the markdown files should contain [[link-b]] / [[link-a]] tags.
-            a_file = runtime_paths.active / "link-a.md"
-            b_file = runtime_paths.active / "link-b.md"
-            assert a_file.exists(), "link-a.md missing after dreamer run"
-            assert b_file.exists(), "link-b.md missing after dreamer run"
+            from synapse.storage import locate_active_node_file
+
+            a_file = locate_active_node_file(runtime_paths.base, "link-a")
+            b_file = locate_active_node_file(runtime_paths.base, "link-b")
+            assert a_file is not None, "link-a.md missing after dreamer run"
+            assert b_file is not None, "link-b.md missing after dreamer run"
             a_text = a_file.read_text(encoding="utf-8")
             b_text = b_file.read_text(encoding="utf-8")
             assert "[[link-b]]" in a_text, f"link-a.md missing [[link-b]] tag:\n{a_text}"

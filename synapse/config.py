@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -244,14 +245,33 @@ class DreamerThresholdSettings(BaseModel):
     min_synthesis_cluster: int = Field(default=4, ge=2)
     max_synthesis_cluster: int = Field(default=20, ge=2)
     max_synthesis_hubs_per_run: int = Field(default=10, ge=1)
+    # Dreamer 2.0 Stage 4c — in-place semantic merge (§3.4(1)): near-duplicate
+    # clusters (2-6 members, same project) collapse into one consolidated node.
+    semantic_merge_cosine: float = Field(default=0.88, ge=0.0, le=1.0)
+    min_semantic_merge_cluster: int = Field(default=2, ge=2)
+    max_semantic_merge_cluster: int = Field(default=6, ge=2)
+    max_merges_per_run: int = Field(default=10, ge=1)
+    # Dreamer 2.0 Stage 4d — oversized node compaction (§3.4(2)).
+    oversized_compaction_bytes: int = Field(default=4096, ge=512)
+    max_compactions_per_run: int = Field(default=10, ge=1)
 
 
 class DreamerSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    interval_hours: int = Field(default=12, ge=1)
+    # Wall-clock daily cadence (§3.4(3)): fire at schedule_hour:schedule_minute
+    # local time.  Fixed *interval* timers drift into 02:00-03:00 when the
+    # MacBook is asleep and silently miss runs; a noon wall-clock target plus
+    # launchd StartCalendarInterval wake catch-up avoids that entirely.
+    # Set schedule_hour = null to fall back to interval_hours.
+    schedule_hour: int | None = Field(default=12, ge=0, le=23)
+    schedule_minute: int = Field(default=0, ge=0, le=59)
+    interval_hours: int = Field(default=24, ge=1)
     batch_size: int = Field(default=8, ge=1, le=20)
+    # Event-driven cadence (§3.4(3)): trigger an extra Dreamer run once this
+    # many newly distilled/updated knowledge nodes have accumulated.
+    event_trigger_new_nodes: int = Field(default=30, ge=1)
     thresholds: DreamerThresholdSettings = Field(default_factory=DreamerThresholdSettings)
 
 
@@ -370,6 +390,87 @@ class SynapseConfig(BaseModel):
         config = cls()
         config.attach_config_path(project_root / DEFAULT_CONFIG_FILE_NAME)
         return config
+
+    @model_validator(mode="after")
+    def _enforce_background_model_budget(self) -> "SynapseConfig":
+        """Reject frontier models in the background (Distiller/Dreamer) pools.
+
+        Design doc §3.2: background consolidation is hard-locked to free Flash
+        endpoints plus the single ``claude-haiku-5.5`` gatekeeper. A config that
+        would let Dreamer sleep-merge or the distiller integrate on a frontier
+        model fails to load instead of silently burning budget.
+        """
+
+        violations = background_model_violations(self)
+        if violations:
+            raise ValueError(
+                "background model budget violation (design doc §3.2): "
+                + ", ".join(repr(model) for model in violations)
+            )
+        return self
+
+
+# --- Background model budget guardrail (design doc §3.2) -------------------
+# Background compute — EpisodeDistiller distillation and Dreamer sleep
+# consolidation — MUST stay on free Flash endpoints (Tier A: ``[decider]``,
+# ``[distiller.episode].scanner_endpoints``) or the single paid gatekeeper
+# (Tier B: ``[distiller.episode].gatekeeper_endpoint``, ``claude-haiku-5.5``).
+# Frontier models are explicitly out of budget, even for debugging.
+FORBIDDEN_BACKGROUND_MODEL_MARKERS: tuple[str, ...] = (
+    "argon",
+    "opus",
+    "sonnet",
+    "gemini-4",
+    "gemini 4",
+    "gpt-5",
+    "gpt-7",
+    "o3-pro",
+)
+# Explicit cheap-tier markers win over a deny-list hit (``gpt-6-luna`` is a
+# cheap-tier endpoint name in the shipped defaults, not a frontier model).
+ALLOWED_BACKGROUND_MODEL_MARKERS: tuple[str, ...] = ("flash", "haiku", "mini", "small", "luna", "nano")
+
+
+def _model_token_set(model: str) -> set[str]:
+    """Alphanumeric tokens of a model name (``gpt-6-luna`` -> {gpt, 6, luna})."""
+
+    return {token for token in re.split(r"[^a-z0-9]+", (model or "").casefold()) if token}
+
+
+def is_forbidden_background_model(model: str | None) -> bool:
+    """True when *model* is a frontier model that must never run background work."""
+
+    name = (model or "").strip().casefold()
+    if not name:
+        return False
+    # Token-exact allow-list: "mini" must not match "geMINI".
+    if _model_token_set(name) & set(ALLOWED_BACKGROUND_MODEL_MARKERS):
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "-", name).strip("-")
+    return any(marker in normalized for marker in FORBIDDEN_BACKGROUND_MODEL_MARKERS)
+
+
+def ensure_background_model_allowed(model: str, *, purpose: str) -> str:
+    """Validate one background endpoint model against the §3.2 budget."""
+
+    if is_forbidden_background_model(model):
+        raise ValueError(
+            f"{purpose} must use a free Flash endpoint or the claude-haiku-5.5 gatekeeper "
+            f"(design doc §3.2 model budget); frontier model {model!r} is not allowed."
+        )
+    return model
+
+
+def background_model_violations(config: "SynapseConfig") -> list[str]:
+    """Frontier models configured for background work (empty when compliant)."""
+
+    models: list[str] = [endpoint.model for endpoint in config.decider.endpoints]
+    episode = config.distiller.episode
+    for endpoint in (episode.scanner_endpoints or episode.endpoints or [episode.endpoint]):
+        models.append(endpoint.model)
+    if episode.gatekeeper_endpoint is not None:
+        models.append(episode.gatekeeper_endpoint.model)
+    return sorted({model for model in models if is_forbidden_background_model(model)})
 
 
 def resolve_config_path(config_path: str | Path | None = None, cwd: str | Path | None = None) -> tuple[Path, bool]:

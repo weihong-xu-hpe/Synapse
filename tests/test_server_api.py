@@ -1075,6 +1075,7 @@ def test_root_handler_advertises_rest_endpoints(tmp_path: Path) -> None:
         "search": "/api/search",
         "write": "/api/write",
         "episode_close": "/api/episode/close",
+        "feedback": "/api/feedback",
     }
 
 
@@ -1130,7 +1131,7 @@ def test_keyed_upsert_create_unchanged_update(tmp_path: Path) -> None:
         assert third.json()["node"]["content"] == "Second version with more detail."
 
     # Exactly one node for the key, and the key persisted in frontmatter.
-    node_file = runtime_paths.active / f"{node_id}.md"
+    node_file = runtime_paths.transcripts / f"{node_id}.md"
     assert node_file.exists()
     assert "session_key: session-abc" in node_file.read_text(encoding="utf-8")
 
@@ -1168,13 +1169,12 @@ def test_keyed_upsert_redacts_secret_patterns_in_content(tmp_path: Path) -> None
         )
         assert response.status_code == 200
 
-    node_file = runtime_paths.active / "mem_session_fixture_node.md"
     # id derives from sha1("secret-session")[:16]; read whatever the response said.
     stored = response.json()["node"]["content"]
     assert secret not in stored
     assert "[REDACTED_API_KEY]" in stored
     assert "[REDACTED_EMAIL]" in stored
-    on_disk = list(runtime_paths.active.glob("mem_session_*.md"))
+    on_disk = list(runtime_paths.transcripts.glob("mem_session_*.md"))
     assert any("[REDACTED_API_KEY]" in p.read_text(encoding="utf-8") for p in on_disk)
 
 
@@ -1215,7 +1215,7 @@ def test_keyed_upsert_concurrent_same_key_creates_one_node(tmp_path: Path) -> No
         t.join()
 
     assert not errors
-    session_files = list(runtime_paths.active.glob("mem_session_*.md"))
+    session_files = list(runtime_paths.transcripts.glob("mem_session_*.md"))
     assert len(session_files) == 1
     assert statuses.count("created") == 1
     assert statuses.count("unchanged") + statuses.count("updated") == 3
@@ -1344,6 +1344,79 @@ def test_unkeyed_concurrent_identical_writes_create_one_node(tmp_path: Path) -> 
     created = [s for s in statuses if isinstance(s, dict) and "decision" in s]
     assert len(created) == 1
 
-    # Exactly one node file for the title.
-    node_files = list(runtime_paths.active.glob("*race_fixture*.md"))
+    # Exactly one node file for the title (kebab slug: race-fixture.md).
+    node_files = list(runtime_paths.active.rglob("*race*fixture*.md"))
     assert len(node_files) == 1
+
+
+def test_session_transcripts_live_in_transcripts_dir_not_active(tmp_path: Path) -> None:
+    """Raw session transcripts must not pollute the knowledge tree (Phase 1C)."""
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    service = SynapseServerService(config, runtime_paths=runtime_paths, sampling_client=FakeSamplingClient())
+
+    memory = service.upsert_session_memory(
+        session_key="layout-probe",
+        title="Session summary — layout probe",
+        content="## User\nraw transcript body",
+    )
+    session_id = memory["node"]["id"]
+    assert session_id.startswith("mem_session_")
+    assert memory["node"]["file_path"] == f"transcripts/{session_id}.md"
+    assert (runtime_paths.transcripts / f"{session_id}.md").exists()
+    assert not (runtime_paths.active / f"{session_id}.md").exists()
+
+    knowledge = service.write_node(
+        title="Layout probe knowledge",
+        content="## Takeaway\ndurable knowledge body",
+        node_type="persistent",
+    )
+    knowledge_id = knowledge["node"]["id"]
+    assert knowledge["node"]["file_path"] == "active/general/layout-probe-knowledge.md"
+    from synapse.storage import locate_active_node_file
+
+    active_path = locate_active_node_file(runtime_paths.base, knowledge_id)
+    assert active_path is not None and active_path.exists()
+    assert not (runtime_paths.transcripts / f"{knowledge_id}.md").exists()
+
+    # Either tree is loadable by id.
+    assert "raw transcript body" in service._load_node(session_id).content
+    assert "durable knowledge body" in service._load_node(knowledge_id).content
+
+    # A legacy copy in active/ (pre-transcripts layout) is removed when the
+    # transcript is rewritten, so it can never re-index as a duplicate node.
+    legacy = runtime_paths.active / f"{session_id}.md"
+    legacy.write_text("legacy layout placeholder", encoding="utf-8")
+    service.upsert_session_memory(
+        session_key="layout-probe",
+        title="Session summary — layout probe",
+        content="## User\nraw transcript body\n\n## Assistant\nfollow-up turn",
+    )
+    assert (runtime_paths.transcripts / f"{session_id}.md").exists()
+    assert not legacy.exists()
+
+
+def test_write_repairs_a_lone_surrogate_instead_of_failing(tmp_path: Path) -> None:
+    """A lone surrogate from an upstream truncation must not kill the write.
+
+    The omp bridge cuts tool results by UTF-16 code units, so a truncation can
+    leave half of an astral character (e.g. 🗄️ -> \\uddc4). json.loads accepts
+    that escape, but str.encode("utf-8") raises UnicodeEncodeError, which used to
+    surface as a 500 and lose the retained transcript snapshot.
+    """
+    config = load_config(write_config(tmp_path))
+    runtime_paths = bootstrap_runtime_directories(config)
+    app = create_app(config, runtime_paths=runtime_paths)
+
+    body = (
+        b'{"title": "Truncated transcript", "type": "transient", "session_key": "session-lone-surrogate",'
+        b' "content": "tail \\uddc4 of a truncated file-cabinet emoji"}'
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/api/write", content=body, headers={"Content-Type": "application/json"})
+
+    assert response.status_code == 200
+    node_id = response.json()["node"]["id"]
+    stored = (runtime_paths.transcripts / f"{node_id}.md").read_text(encoding="utf-8")
+    assert "tail \ufffd of a truncated file-cabinet emoji" in stored

@@ -325,6 +325,90 @@ def build_synthesis_prompt(cluster: tuple[Node, ...]) -> str:
     )
 
 
+def build_semantic_merge_prompt(cluster: tuple[Node, ...]) -> str:
+    """Render the Dreamer 2.0 in-place semantic merge prompt (§3.4(1)).
+
+    One high-similarity cluster (same project) becomes ONE consolidated OKF
+    node. Nighttime merges may tighten wording and de-duplicate, but every
+    concrete anchor token (error codes, identifiers, paths, numbers, durations)
+    must survive verbatim — the caller enforces this with
+    ``_missing_supersede_anchors`` after the merge.
+    """
+
+    member_blocks = [
+        "\n".join(
+            [
+                f"- ID: {node.id}",
+                f"  Title: {node.title}",
+                f"  okf_type: {node.metadata.okf_type or 'untyped'}",
+                f"  Sources: {list(node.metadata.sources)}",
+                "  Content:",
+                *[f"    {line}" for line in (node.content.splitlines() or ["<empty>"])],
+            ]
+        )
+        for node in cluster
+    ]
+    return "\n".join(
+        [
+            "You are performing Synapse Dreamer semantic merge — the sleep consolidation stage.",
+            "The nodes below are near-duplicates of each other (very high embedding similarity).",
+            "Merge them into ONE consolidated OKF knowledge node with no duplicated caveats.",
+            "Rules:",
+            "1. title: ENGLISH, a specific claim or noun phrase; no 'Merged:'/'Hub:' prefix, no date.",
+            "2. okf_type must be one of decision, fact, procedure, pitfall (pick the best fit).",
+            "3. body must contain ONLY the type's required sections, each exactly once:",
+            "     decision  -> '## Context', '## Decision', '## Consequences'",
+            "     fact      -> '## Details'",
+            "     procedure -> '## Steps'",
+            "     pitfall   -> '## Symptom', '## Cause', '## Fix'",
+            "   Do NOT include '## Takeaway' or '## Sources' in `body` (the caller adds them).",
+            "4. Preserve EVERY concrete identifier, error code, file path, flag, number, version and",
+            "   duration VERBATIM from the member nodes. Never invent new claims.",
+            "5. De-duplicate overlapping bullets; keep the union of all distinct facts.",
+            "6. takeaway: ONE line, <= 200 chars, the single most useful conclusion.",
+            _JSON_ONLY_INSTRUCTION,
+            "",
+            "Cluster members:",
+            "\n\n".join(member_blocks),
+            "",
+            _JSON_SHAPE_HEADER,
+            '{"title":"...","okf_type":"fact","takeaway":"...","body":"## Details\\n..."}',
+        ]
+    )
+
+
+def build_compaction_prompt(node: Node) -> str:
+    """Render the Dreamer 2.0 oversized-node compaction prompt (§3.4(2)).
+
+    Deduplicates bloated bullets while preserving every anchor token verbatim.
+    """
+
+    return "\n".join(
+        [
+            "You are performing Synapse Dreamer node compaction — the oversized-node stage.",
+            f"The node below is {len(node.content.encode('utf-8'))} bytes (> 4 KB) and has redundant or bloated bullets.",
+            "Rewrite it as ONE leaner OKF node with the same type, de-duplicating repeated bullets.",
+            "Rules:",
+            "1. Keep the section layout valid for the node's okf_type (required sections present exactly once).",
+            "2. Preserve EVERY concrete identifier, error code, file path, flag, number, version and",
+            "   duration VERBATIM. Deletion of a redundant *restatement* is fine; deletion of a fact is not.",
+            "3. Do NOT include '## Takeaway' or '## Sources' in `body` (the caller keeps them).",
+            "4. takeaway: ONE line, <= 200 chars.",
+            _JSON_ONLY_INSTRUCTION,
+            "",
+            "Node:",
+            f"- ID: {node.id}",
+            f"  Title: {node.title}",
+            f"  okf_type: {node.metadata.okf_type or 'untyped'}",
+            "  Content:",
+            *[f"    {line}" for line in (node.content.splitlines() or ["<empty>"])],
+            "",
+            _JSON_SHAPE_HEADER,
+            '{"title":"...","takeaway":"...","body":"## Details\\n..."}',
+        ]
+    )
+
+
 def _render_source_nodes(nodes: tuple[Node, ...]) -> str:
     blocks: list[str] = []
     for node in nodes:

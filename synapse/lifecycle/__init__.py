@@ -1,7 +1,6 @@
 """Lifecycle management package for Synapse."""
 
 from synapse.lifecycle.condensation import (
-	ArchiveCondenser,
 	CondensationDraft,
 	DeterministicArchiveCondenser,
 )
@@ -19,7 +18,6 @@ from synapse.lifecycle.distiller_scheduler import DistillerScheduler
 from synapse.lifecycle.scheduler import DreamerScheduler
 
 __all__ = [
-	"ArchiveCondenser",
 	"CondensationDraft",
 	"CondensationResult",
 	"ConflictDecision",

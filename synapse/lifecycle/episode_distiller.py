@@ -28,15 +28,18 @@ from synapse.okf.episode import (
     render_episode_integrate_prompt,
     render_episode_lesson_reduce_prompt,
     render_episode_map_prompt,
+    render_episode_merge_repair_prompt,
     render_episode_summary_prompt,
     render_episode_takeaway_repair_prompt,
 )
 from synapse.okf.transcript_format import TranscriptTurn, parse_transcript
 from synapse.okf.transcripts import is_session_transcript
 from synapse.retrieval import RetrievalPipeline
+from synapse.security import RedactionEngine, scrub_credentials
 from synapse.server.service import SynapseServiceError, SynapseServerService
 from synapse.storage import DistillerRunMetrics, SQLiteNodeStore
 from synapse.utils.runtime import RuntimePaths
+from synapse.utils.transcript_lock import transcript_lock
 
 
 @dataclass(slots=True)
@@ -81,6 +84,7 @@ class EpisodeRun:
     stages: dict[str, StageMetrics] = field(default_factory=dict)
     retrieval_calls: int = 0
     stamped: bool = False
+    deferred: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +100,7 @@ class EpisodeRun:
             "stages": {name: metrics.as_dict() for name, metrics in self.stages.items()},
             "retrieval_calls": self.retrieval_calls,
             "stamped": self.stamped,
+            "deferred": self.deferred,
         }
 
 
@@ -145,6 +150,7 @@ class EpisodeDistiller:
         self.runtime_paths = runtime_paths
         self.sampling_client = sampling_client
         self.gatekeeper_client = gatekeeper_client if gatekeeper_client is not None else sampling_client
+        self._prompt_redactor = RedactionEngine.from_config(config)
         self.service = SynapseServerService(
             config,
             runtime_paths=runtime_paths,
@@ -152,6 +158,23 @@ class EpisodeDistiller:
         )
         self._distiller_helpers = Distiller(config, runtime_paths=runtime_paths)
         self._commit_lock = threading.Lock()
+        self._attempt_state = threading.local()
+
+    @property
+    def failure_stage(self) -> str | None:
+        return getattr(self._attempt_state, "failure_stage", None)
+
+    @failure_stage.setter
+    def failure_stage(self, value: str | None) -> None:
+        self._attempt_state.failure_stage = value
+
+    @property
+    def last_session_id(self) -> str | None:
+        return getattr(self._attempt_state, "session_id", None)
+
+    @last_session_id.setter
+    def last_session_id(self, value: str | None) -> None:
+        self._attempt_state.session_id = value
 
     @staticmethod
     def make_scanner_client(config: SynapseConfig) -> Any:
@@ -213,17 +236,19 @@ class EpisodeDistiller:
         completed_at: str,
         duration_ms: int,
         transcripts_scanned: int | None = None,
-        llm_failures: int = 0,
+        failures: int = 0,
         archived_transcripts: int = 0,
+        trigger: str = "legacy",
+        attempts_json: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
     ) -> None:
         operations = [op for run in runs for op in run.ops]
         metrics = DistillerRunMetrics(
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=duration_ms,
-            transcripts_scanned=transcripts_scanned or len(runs),
+            transcripts_scanned=transcripts_scanned if transcripts_scanned is not None else len(runs),
             transcripts_distilled=sum(1 for run in runs if run.stamped and (run.lessons or run.ops)),
-            transcripts_skipped=sum(1 for run in runs if not run.lessons and not run.ops),
+            transcripts_skipped=sum(1 for run in runs if run.stamped and not run.lessons and not run.ops),
             items_extracted=sum(len(run.lessons) for run in runs),
             items_invalid=sum(op.get("action") == "none" for op in operations),
             items_quarantined=sum(op.get("action") == "quarantined" for op in operations),
@@ -231,8 +256,10 @@ class EpisodeDistiller:
             decider_complements=sum(op.get("action") == "updated" for op in operations),
             decider_supersedes=0,
             decider_downgrades=0,
-            llm_failures=llm_failures,
+            failures=failures,
             archived_transcripts=archived_transcripts,
+            trigger=trigger,
+            attempts_json=tuple(attempts_json),
         )
         with SQLiteNodeStore(
             self.runtime_paths.base / "synapse.db",
@@ -240,24 +267,52 @@ class EpisodeDistiller:
         ) as store:
             store.record_distiller_run(metrics)
 
-    def run(self, session: str) -> EpisodeRun:
-        return self.integrate_episode(*self.extract_episode(session))
+    def run(self, session: str, *, force: bool = False) -> EpisodeRun:
+        session = session.strip()
+        self.failure_stage = "source_lookup"
+        self.last_session_id = session if session.startswith("mem_") else self.service._session_node_id(session)
+        try:
+            transcript = self._resolve_transcript(session)
+            self.last_session_id = transcript.id
+            with transcript_lock(self.runtime_paths.base, transcript.id, scope="processing"):
+                if force:
+                    self.failure_stage = "write"
+                    self._distiller_helpers._mark_force_retry(transcript)
+                result = self.integrate_episode(*self.extract_episode(transcript.id, force=force))
+        except Exception as exc:
+            try:
+                exc.distiller_stage = self.failure_stage or "unknown"
+                exc.distiller_session_id = self.last_session_id
+            except (AttributeError, TypeError):
+                pass
+            raise
+        self.failure_stage = None
+        return result
 
     def extract_episode(
-        self, session: str
+        self, session: str, *, force: bool = False
     ) -> tuple[Node, list[TranscriptTurn], list[TranscriptTurn], list[TranscriptTurn], str, list[Lesson], EpisodeRun]:
         """Read and summarize one transcript without consulting or changing the knowledge graph."""
+        self.failure_stage = "source_lookup"
         transcript = self._resolve_transcript(session)
         if not is_session_transcript(transcript):
             raise ValueError(f"Not a session transcript: {transcript.id}")
+        self.failure_stage = "extract"
         parsed = parse_transcript(transcript.content)
         watermark = transcript.metadata.distilled_turn or 0
+        if watermark and transcript.metadata.distilled_hash != content_sha256(transcript.content):
+            if not _preserves_distilled_prefix(transcript.content, parsed.turns_after(watermark), transcript.metadata.distilled_hash):
+                watermark = 0
+                transcript = transcript.model_copy(
+                    update={"metadata": transcript.metadata.model_copy(update={"distilled_turn": 0})}
+                )
         original_pending = parsed.turns_after(watermark)
         if not original_pending:
             episode_id = self._episode_id(transcript, watermark, watermark, transcript.content)
+            self.failure_stage = "write"
             with self._commit_lock:
-                self._distiller_helpers._stamp_transcript(transcript, [], distilled_turn=watermark)
-            run = EpisodeRun(transcript.id, transcript.metadata.session_key, episode_id, 0, 0, 0, stamped=True)
+                stamped = self._distiller_helpers._stamp_transcript(transcript, [], distilled_turn=watermark)
+            run = EpisodeRun(transcript.id, transcript.metadata.session_key, episode_id, 0, 0, 0, stamped=stamped, deferred=not stamped)
             return transcript, [], [], parsed.turns, "", [], run
 
         all_turns: list[TranscriptTurn] = []
@@ -282,7 +337,7 @@ class EpisodeDistiller:
         )
 
         lesson_rows: list[Lesson] = []
-        if len(pending) >= 2 and len(source_text) >= 600:
+        if pending and (force or (len(pending) >= 2 and len(source_text) >= 600)):
             if len(chunks) == 1:
                 text, _ids = chunks[0]
                 payload = self._call(
@@ -314,6 +369,8 @@ class EpisodeDistiller:
                     ),
                 )
                 lesson_rows = _parse_lessons(reduced)
+        elif pending:
+            run.deferred = True
 
         run.lessons = [lesson.as_dict() for lesson in lesson_rows]
         return transcript, all_turns, pending, parsed.turns, global_user_spine, lesson_rows, run
@@ -331,6 +388,10 @@ class EpisodeDistiller:
         """Retrieve, integrate, commit, and stamp one extracted episode."""
         if run.stamped:
             return run
+        if run.deferred:
+            self.failure_stage = "write"
+            self._distiller_helpers._defer_transcript(transcript)
+            return run
         original_pending = [
             turn for turn in verification_turns if turn.number > (transcript.metadata.distilled_turn or 0)
         ]
@@ -338,6 +399,7 @@ class EpisodeDistiller:
             run.stamped = True
             return run
 
+        self.failure_stage = "integrate"
         if lessons:
             self._integrate(
                 transcript,
@@ -347,14 +409,47 @@ class EpisodeDistiller:
                 global_user_spine=global_user_spine,
                 verification_turns=verification_turns,
             )
+        self.failure_stage = "write"
         with self._commit_lock:
-            self._distiller_helpers._stamp_transcript(
+            run.stamped = self._distiller_helpers._stamp_transcript(
                 transcript,
                 [str(op.get("node_id")) for op in run.ops if op.get("node_id")],
                 distilled_turn=original_pending[-1].number,
             )
-        run.stamped = True
+        run.deferred = not run.stamped
+        self._credit_retrieved_usage(run)
         return run
+
+    def _credit_retrieved_usage(self, run: EpisodeRun) -> None:
+        """Credit nodes the distiller retrieved *and* put to work (design doc §4.3(1)).
+
+        An existing node consumed as an ``update`` target, or referenced from a
+        distilled op's ``related_ids``, was not merely retrieved — it shaped the
+        new knowledge. That is the strongest available usage signal, so it feeds
+        ``used_count`` rather than the weak ``injected_count`` prior.
+        """
+
+        used: list[str] = []
+        for op in run.ops:
+            if str(op.get("action")) == "updated":
+                target = op.get("target_id")
+                if isinstance(target, str) and target.startswith("mem_"):
+                    used.append(target)
+            for link in op.get("related_ids") or []:
+                text = str(link)
+                if text.startswith("mem_"):
+                    used.append(text)
+        used = list(dict.fromkeys(used))
+        if not used:
+            return
+        try:
+            with SQLiteNodeStore(
+                self.runtime_paths.base / "synapse.db",
+                embedding_dimension=self.config.embedding.dimension or 0,
+            ) as store:
+                store.record_memory_usage(used_ids=used)
+        except Exception as exc:  # noqa: BLE001 — credit accounting must never fail a run
+            self.service.logger.warning("Failed to credit distilled memory usage", exc_info=exc)
 
     def _resolve_transcript(self, session: str) -> Node:
         with SQLiteNodeStore(
@@ -362,13 +457,28 @@ class EpisodeDistiller:
             embedding_dimension=self.config.embedding.dimension or 0,
         ) as store:
             node = store.get_node(session)
-            if node is not None:
+            if node is None:
+                node = store.get_node(self.service._session_node_id(session))
+            if (
+                node is not None
+                and node.metadata.type is NodeType.TRANSIENT
+                and node.metadata.status is NodeStatus.ACTIVE
+                and is_session_transcript(node)
+            ):
                 return node
-            matches = [
-                candidate
-                for candidate in store.list_nodes({"type": NodeType.TRANSIENT, "status": NodeStatus.ACTIVE})
-                if candidate.metadata.session_key == session and is_session_transcript(candidate)
-            ]
+            rows = store.connection.execute(
+                """
+                SELECT id FROM nodes
+                WHERE type = ? AND status = ?
+                  AND CASE WHEN json_valid(okf_meta) THEN json_extract(okf_meta, '$.session_key') END = ?
+                """,
+                (NodeType.TRANSIENT.value, NodeStatus.ACTIVE.value, session),
+            ).fetchall()
+            matches = []
+            for row in rows:
+                candidate = store.get_node(str(row["id"]))
+                if candidate is not None and is_session_transcript(candidate):
+                    matches.append(candidate)
         if len(matches) != 1:
             raise ValueError(f"Expected one transcript matching session {session!r}; found {len(matches)}")
         return matches[0]
@@ -379,7 +489,8 @@ class EpisodeDistiller:
         return f"{transcript.id}:{start}-{end}:{digest}"
 
     def _call(self, run: EpisodeRun, stage: str, prompt: str) -> Any:
-        client = self.gatekeeper_client if stage in {"integrate", "takeaway_repair"} else self.sampling_client
+        prompt, _ = self._prompt_redactor.redact(prompt)
+        client = self.gatekeeper_client if stage in {"integrate", "takeaway_repair", "merge_repair"} else self.sampling_client
         metrics = run.stages.setdefault(stage, StageMetrics())
         started = time.perf_counter()
         call_context = getattr(client, "call_context", None)
@@ -403,6 +514,9 @@ class EpisodeDistiller:
                     max_tokens=self.settings.max_tokens,
                 )
             return payload
+        except Exception:
+            self.failure_stage = "gatekeeper" if stage in {"integrate", "takeaway_repair", "merge_repair"} else "scanner"
+            raise
         finally:
             usage = context.get("usage") if isinstance(context, Mapping) else None
             endpoints = context.get("endpoints", {}) if isinstance(context, Mapping) else {}
@@ -450,6 +564,7 @@ class EpisodeDistiller:
             prior_nodes = self._same_session_nodes(transcript)
             with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as retrieval:
                 for batch in self._integrate_lesson_batches(turns, lessons):
+                    self.failure_stage = "integrate"
                     candidates = self._retrieve_for_lessons(retrieval, batch, run)
                     allowed_target_ids = {node["id"] for node in candidates}
                     allowed_target_ids.update(node["id"] for node in prior_nodes)
@@ -466,6 +581,7 @@ class EpisodeDistiller:
                         ),
                     )
                     for op in _parse_ops(payload, len(batch)):
+                        self.failure_stage = "integrate"
                         result = self._apply_op(
                             transcript,
                             verification_turns,
@@ -622,11 +738,7 @@ class EpisodeDistiller:
         turn_by_id = {turn.id: turn for turn in turns}
         evidence_turns = {turn.id: _turn_verification_text(turn) for turn in turns}
         _verified_quotes, unverified = verify_evidence(op.evidence, turns=evidence_turns)
-        verified_flag = (
-            bool(op.verified)
-            if op.verified is not None
-            else bool(op.evidence) and not unverified
-        )
+        verified_flag = bool(op.evidence) and not unverified and op.verified is not False
         evidence_sources: list[str] = []
         for entry in op.evidence:
             turn = turn_by_id.get(entry.turn)
@@ -693,6 +805,11 @@ class EpisodeDistiller:
             related_links = list(dict.fromkeys([*preserved_links, *related_links]))
         final_content = _with_provenance(op.content, sources, op.evidence, related_ids=related_links)
         final_content, repair_error = self._repair_takeaway_only(op, final_content, sources, run)
+        # Credential gate, write side: the gatekeeper is asked to cite verbatim
+        # excerpts and exact identifiers, and evidence quotes are persisted into
+        # the node. Verification already ran against the raw op fields above, so
+        # scrubbing here removes values without downgrading `verified`.
+        final_content = scrub_credentials(final_content)
         if repair_error:
             warnings = validate_okf_node(
                 node_type="persistent",
@@ -712,24 +829,20 @@ class EpisodeDistiller:
                     transcript, op, repair_error, run, error=error, content=final_content, target_id=op.target_id,
                     verified=verified_flag, evidence_sources=evidence_sources,
                 )
+        self.failure_stage = "write"
         with self._commit_lock:
             try:
                 if op.action == "update":
-                    payload = self._commit_call(
+                    return self._commit_update_op(
+                        transcript,
+                        op,
                         run,
-                        lambda: self.service._merge_update_node(
-                            target_id=op.target_id or "",
-                            content=final_content,
-                            title=op.title,
-                            sources=[transcript.id],
-                            verified=verified_flag,
-                            route="distiller",
-                            okf_type=op.okf_type,
-                            validated_title=op.title,
-                        ),
+                        content=final_content,
+                        target_body=target.content if target is not None else "",
+                        verified=verified_flag,
+                        evidence_sources=evidence_sources,
+                        related_ids=related_links,
                     )
-                    node = self._load_node(op.target_id or "")
-                    action = str(payload.get("action", "updated"))
                 else:
                     stable_id = stable_id or self._stable_create_id(transcript, op)
                     existing = self._load_node_or_none(stable_id)
@@ -767,12 +880,16 @@ class EpisodeDistiller:
                         route="distiller",
                     )
             except SynapseServiceError as exc:
+                if exc.code == "INVALID_OKF_FINAL_BODY" and exc.details.get("repair_error"):
+                    self.failure_stage = "gatekeeper"
+                    raise
                 if exc.code == "INVALID_OKF_FINAL_BODY":
                     return self._quarantine(
                         transcript, op, exc.message, run, error=exc, content=final_content,
                         target_id=op.target_id, verified=verified_flag, evidence_sources=evidence_sources,
                     )
                 raise
+        self.failure_stage = "integrate"
         return {
             "action": action,
             "node_id": node.id,
@@ -781,6 +898,158 @@ class EpisodeDistiller:
             "target_title": node.title,
             "verified": verified_flag,
             "evidence_sources": evidence_sources,
+            "related_ids": [link for link in related_links if link != node.id],
+        }
+
+    def _commit_update_op(
+        self,
+        transcript: Node,
+        op: EpisodeOp,
+        run: EpisodeRun,
+        *,
+        content: str,
+        target_body: str,
+        verified: bool,
+        evidence_sources: list[str],
+        related_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Merge-update in place, repairing one loss-risk rejection before quarantining.
+
+        The service replaces the target body in place and keeps no history, so a
+        lossy candidate would silently delete knowledge. Its gate reports the exact
+        lines that went missing, which lets the gatekeeper merge them back in before
+        the write is abandoned.
+        """
+
+        def attempt(body: str) -> dict[str, Any]:
+            return self._commit_call(
+                run,
+                lambda: self.service._merge_update_node(
+                    target_id=op.target_id or "",
+                    content=body,
+                    title=op.title,
+                    sources=[transcript.id],
+                    verified=verified,
+                    route="distiller",
+                    okf_type=op.okf_type,
+                    validated_title=op.title,
+                ),
+            )
+
+        body = content
+        try:
+            payload = attempt(body)
+        except SynapseServiceError as exc:
+            if exc.code != "INVALID_OKF_FINAL_BODY" or not _update_loss_risk(exc):
+                raise
+            # Daytime deterministic delta merge (design doc §3.3): append only
+            # the candidate's new bullets into the existing sections, keeping
+            # every existing line byte-identical. `_omitted_knowledge_lines`
+            # between the target body and the merged body is empty *by
+            # construction*, so this needs no LLM repair call and cannot lose
+            # a line. Only if it still fails OKF validation do we pay for the
+            # gatekeeper merge-repair, and then quarantine.
+            if target_body.strip():
+                from synapse.server.service import deterministic_section_merge
+
+                deterministic = deterministic_section_merge(target_body, body)
+                if deterministic.strip() and deterministic != body:
+                    try:
+                        payload = attempt(deterministic)
+                    except SynapseServiceError as merge_exc:
+                        if merge_exc.code != "INVALID_OKF_FINAL_BODY":
+                            raise
+                        exc = merge_exc
+                    else:
+                        return self._update_op_result(
+                            payload, op, verified=verified, evidence_sources=evidence_sources, related_ids=related_ids
+                        )
+            repaired = (
+                self._repair_update_merge(target_body, body, op, run, error=exc) if target_body.strip() else None
+            )
+            if repaired is not None:
+                body = repaired
+                try:
+                    payload = attempt(body)
+                except SynapseServiceError as retry_exc:
+                    if retry_exc.code != "INVALID_OKF_FINAL_BODY" or not _update_loss_risk(retry_exc):
+                        raise
+                    exc = retry_exc
+                else:
+                    return self._update_op_result(
+                        payload, op, verified=verified, evidence_sources=evidence_sources, related_ids=related_ids
+                    )
+            return self._quarantine(
+                transcript,
+                op,
+                exc.message,
+                run,
+                error=exc,
+                content=body,
+                target_id=op.target_id,
+                verified=verified,
+                evidence_sources=evidence_sources,
+            )
+        return self._update_op_result(
+            payload, op, verified=verified, evidence_sources=evidence_sources, related_ids=related_ids
+        )
+
+    def _repair_update_merge(
+        self,
+        target_body: str,
+        content: str,
+        op: EpisodeOp,
+        run: EpisodeRun,
+        *,
+        error: SynapseServiceError,
+    ) -> str | None:
+        """Ask the gatekeeper for the existing body merged with this candidate.
+
+        Returns None when the repair cannot be attempted or returns nothing usable;
+        the caller then quarantines the candidate exactly as before.
+        """
+
+        omitted = error.details.get("omitted_lines")
+        try:
+            payload = self._call(
+                run,
+                "merge_repair",
+                render_episode_merge_repair_prompt(
+                    title=op.title,
+                    okf_type=op.okf_type,
+                    existing_body=target_body,
+                    candidate_body=content,
+                    omitted_lines=[str(line) for line in (omitted if isinstance(omitted, list) else [])],
+                ),
+            )
+        except Exception:  # noqa: BLE001 — repair is best effort; the caller quarantines
+            return None
+        repaired = payload.get("content") if isinstance(payload, Mapping) else None
+        if not isinstance(repaired, str) or not repaired.strip():
+            return None
+        return repaired
+
+    def _update_op_result(
+        self,
+        payload: dict[str, Any],
+        op: EpisodeOp,
+        *,
+        verified: bool,
+        evidence_sources: list[str],
+        related_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        node = self._load_node(op.target_id or "")
+        return {
+            "action": str(payload.get("action", "updated")),
+            "node_id": node.id,
+            "title": node.title,
+            "target_id": op.target_id or node.id,
+            "target_title": node.title,
+            "verified": verified,
+            "evidence_sources": evidence_sources,
+            # P1B credit assignment: nodes this op linked/cross-referenced were
+            # retrieved and put to work in the distilled knowledge.
+            "related_ids": [link for link in (related_ids or []) if link != node.id],
         }
 
     def _quarantine(
@@ -862,6 +1131,44 @@ class EpisodeDistiller:
         if node is None:
             raise SynapseServiceError("NODE_NOT_FOUND", f"Node does not exist: {node_id}", status_code=404)
         return node
+
+
+def _update_loss_risk(error: SynapseServiceError) -> bool:
+    """True when an update write was rejected for dropping existing knowledge."""
+
+    warnings = error.details.get("warnings")
+    return any(
+        isinstance(warning, Mapping) and warning.get("code") == "okf_update_loss_risk"
+        for warning in (warnings if isinstance(warnings, list) else [])
+    )
+
+
+def attempt_record(session_id: str, run: EpisodeRun | None, *, stage: str | None = None) -> dict[str, Any]:
+    """Represent one transcript attempt without storing a raw session key."""
+    if run is None:
+        return {"session": session_id, "outcome": "failed", "stage": stage or "unknown"}
+    if getattr(run, "deferred", False) or not run.stamped:
+        outcome = "deferred"
+    elif run.lessons or run.ops:
+        outcome = "distilled"
+    else:
+        outcome = "skipped"
+    return {"session": getattr(run, "transcript_id", session_id), "outcome": outcome, "stage": None}
+
+
+def _preserves_distilled_prefix(content: str, pending: list[TranscriptTurn], previous_hash: str | None) -> bool:
+    """Accept an incremental watermark only if the previous revision is intact."""
+    if not previous_hash or not pending:
+        return False
+    heading = re.search(
+        rf"^## T{pending[0].number} (?:User|Assistant)[^\S\r\n]*$",
+        content,
+        re.MULTILINE,
+    )
+    if heading is None:
+        return False
+    prefix = content[:heading.start()]
+    return previous_hash in {content_sha256(prefix), content_sha256(prefix.rstrip("\n"))}
 
 
 def build_episode_chunks(turns: list[TranscriptTurn], max_chars: int = 400_000) -> list[tuple[str, list[str]]]:

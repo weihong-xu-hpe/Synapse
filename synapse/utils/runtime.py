@@ -17,6 +17,7 @@ class RuntimePaths:
     archive: Path
     logs: Path
     audit: Path
+    transcripts: Path
 
 
 def get_runtime_paths(config: SynapseConfig) -> RuntimePaths:
@@ -27,12 +28,14 @@ def get_runtime_paths(config: SynapseConfig) -> RuntimePaths:
     logs = config.resolve_path(config.logging.log_dir)
     audit = base / ".audit"
     active = base / "active"
+    transcripts = base / "transcripts"
     return RuntimePaths(
         base=base,
         active=active.resolve(),
         archive=archive,
         logs=logs,
         audit=audit.resolve(),
+        transcripts=transcripts.resolve(),
     )
 
 
@@ -40,7 +43,7 @@ def bootstrap_runtime_directories(config: SynapseConfig) -> RuntimePaths:
     """Create the runtime directory structure required by Phase 1."""
 
     paths = get_runtime_paths(config)
-    for path in (paths.base, paths.active, paths.archive, paths.logs, paths.audit):
+    for path in (paths.base, paths.active, paths.transcripts, paths.archive, paths.logs, paths.audit):
         path.mkdir(parents=True, exist_ok=True)
         try:
             path.chmod(0o700)

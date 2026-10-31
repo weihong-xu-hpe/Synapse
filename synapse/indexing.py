@@ -125,7 +125,9 @@ def rebuild_index(
     selected_logger = logger or LOGGER
     paths = runtime_paths or get_runtime_paths(config)
     db_path = database_path_for_config(config)
-    nodes = scan_markdown_nodes(paths.active, relative_to=paths.base)
+    nodes = scan_markdown_nodes(paths.active, relative_to=paths.base) + scan_markdown_nodes(
+        paths.transcripts, relative_to=paths.base
+    )
     engine = create_embedding_engine(config.embedding, providers=config.providers)
     # P2b: session transcripts never get vectors — skip them BEFORE the batch
     # call so remote embedding budgets are not spent on transcript payloads.

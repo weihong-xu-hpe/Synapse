@@ -37,7 +37,7 @@ def _runtime(tmp_path: Path) -> RuntimePaths:
 
 def _write_transcript(path: RuntimePaths, node_id: str, content: str, *, title: str = "Session summary — proj", session_key: str | None = None, sync: bool = True) -> Node:
     metadata = NodeMetadata(id=node_id, title=title, type=NodeType.TRANSIENT, session_key=session_key)
-    node = Node(metadata=metadata, content=content, file_path=Path("active") / f"{node_id}.md")
+    node = Node(metadata=metadata, content=content, file_path=Path("transcripts") / f"{node_id}.md")
     write_node_file(node, base_path=path.base)
     if sync:
         _sync_all(path)
@@ -79,7 +79,7 @@ def test_selector_picks_only_idle_undistilled_transcripts(tmp_path: Path) -> Non
         import os
 
         ts = old.timestamp()
-        os.utime(paths.active / "mem_session_aaa1.md", (ts, ts))
+        os.utime(paths.transcripts / "mem_session_aaa1.md", (ts, ts))
 
         # A fresh (not idle) transcript must be skipped.
         _write_transcript(paths, "mem_session_bbb2", "## User\nfresh")
@@ -104,7 +104,7 @@ def test_selector_picks_only_idle_undistilled_transcripts(tmp_path: Path) -> Non
         _sync_all(paths)
         import os as os2
 
-        os2.utime(paths.active / "mem_session_aaa1.md", (ts, ts))
+        os2.utime(paths.transcripts / "mem_session_aaa1.md", (ts, ts))
 
         selected = distiller.select_transcripts()
         assert [n.id for n in selected] == []
@@ -141,11 +141,71 @@ def test_stamp_transcript_persists_episode_progress(tmp_path: Path) -> None:
         distiller._stamp_transcript(transcript, ["mem_knowledge1"], distilled_turn=2)
         from synapse.storage import read_node_file
 
-        stamped = read_node_file(paths.active / f"{transcript.id}.md")
+        stamped = read_node_file(paths.transcripts / f"{transcript.id}.md")
         assert stamped.metadata.distilled_hash == content_sha256(stamped.content)
         assert stamped.metadata.distilled_node_ids == ["mem_knowledge1"]
         assert stamped.metadata.distilled_turn == 2
         assert stamped.metadata.distilled_at is not None
+    finally:
+        distiller.close()
+
+def test_stamp_keeps_later_revision_pending(tmp_path: Path) -> None:
+    from synapse.storage import read_node_file
+
+    distiller, paths = _make_distiller(tmp_path)
+    original = _write_transcript(
+        paths,
+        "mem_session_race",
+        "<!-- synapse-transcript v2 -->\n\n## T1 User\nquestion\n\n## T2 Assistant\nanswer",
+    )
+    updated = original.model_copy(update={"content": original.content + "\n\n## T3 User\nnew evidence"})
+    write_node_file(updated, base_path=paths.base)
+    _sync_all(paths)
+    try:
+        assert not distiller._stamp_transcript(original, ["mem_knowledge"], distilled_turn=2)
+        stored = read_node_file(paths.transcripts / f"{original.id}.md")
+        assert stored.content == updated.content
+        assert stored.metadata.distilled_turn is None
+        assert stored.metadata.distilled_hash is None
+        assert stored.metadata.distilled_node_ids == ["mem_knowledge"]
+        assert not is_fully_distilled(stored)
+    finally:
+        distiller.close()
+
+
+def test_hash_match_does_not_hide_unprocessed_v2_turns() -> None:
+    content = "<!-- synapse-transcript v2 -->\n\n## T1 User\nold\n\n## T2 Assistant\nold\n\n## T3 User\nnew"
+    node = Node(
+        metadata=NodeMetadata(
+            id="mem_session_race",
+            title="Session summary — test",
+            distilled_hash=content_sha256(content),
+            distilled_turn=2,
+        ),
+        content=content,
+        file_path=Path("active/mem_session_race.md"),
+    )
+    assert not is_fully_distilled(node)
+
+
+def test_deferred_revision_waits_for_content_change(tmp_path: Path) -> None:
+    from synapse.storage import read_node_file
+
+    distiller, paths = _make_distiller(tmp_path)
+    transcript = _write_transcript(paths, "mem_session_deferred", "## User\nshort")
+    try:
+        assert distiller._defer_transcript(transcript)
+        path = paths.transcripts / f"{transcript.id}.md"
+        old = (datetime.now(UTC) - timedelta(hours=2)).timestamp()
+        os.utime(path, (old, old))
+        assert not distiller.select_transcripts()
+
+        deferred = read_node_file(path)
+        updated = deferred.model_copy(update={"content": deferred.content + "\n\n## Assistant\nnew content"})
+        write_node_file(updated, base_path=paths.base)
+        _sync_all(paths)
+        os.utime(path, (old, old))
+        assert [node.id for node in distiller.select_transcripts()] == [transcript.id]
     finally:
         distiller.close()
 
@@ -277,9 +337,11 @@ def test_persistent_writes_get_okf_warnings_transients_do_not(tmp_path: Path) ->
     assert node.metadata.okf_type == "fact"
     assert node.metadata.sources == ["mem_session_x"]
     # Frontmatter round-trips to disk.
-    from synapse.storage import read_node_file
+    from synapse.storage import locate_active_node_file, read_node_file
 
-    on_disk = read_node_file(runtime_paths.active / f"{node.id}.md")
+    on_disk_path = locate_active_node_file(runtime_paths.base, node.id)
+    assert on_disk_path is not None
+    on_disk = read_node_file(on_disk_path)
     assert on_disk.metadata.okf_type == "fact"
     assert on_disk.metadata.distilled_node_ids == []
 
@@ -307,16 +369,16 @@ def test_retention_archives_distilled_only(tmp_path: Path) -> None:
         )
         write_node_file(stamped, base_path=paths.base)
         _sync_all(paths)
-        os.utime(paths.active / "mem_session_ret1.md", (old_ts, old_ts))
+        os.utime(paths.transcripts / "mem_session_ret1.md", (old_ts, old_ts))
 
         # Undistilled transcript of the same age -> must NOT be archived.
         _write_transcript(paths, "mem_session_ret2", "## User\nb\n\n## Assistant\nc", session_key="s2")
-        os.utime(paths.active / "mem_session_ret2.md", (old_ts, old_ts))
+        os.utime(paths.transcripts / "mem_session_ret2.md", (old_ts, old_ts))
 
         archived = distiller._archive_expired(DistillerReport(started_at="x", completed_at="x", duration_ms=0))
         assert archived == 1
-        assert (paths.active / "mem_session_ret1.md").exists() is False
-        assert (paths.active / "mem_session_ret2.md").exists() is True
+        assert (paths.transcripts / "mem_session_ret1.md").exists() is False
+        assert (paths.transcripts / "mem_session_ret2.md").exists() is True
         assert (paths.archive / "mem_session_ret1.md").exists() is True
     finally:
         distiller.close()
@@ -894,9 +956,11 @@ def test_supersede_of_legacy_sourced_node_not_downgraded(tmp_path: Path) -> None
     assert result["decision"]["action"] == "supersede", "distilled-vs-distilled supersede must be allowed"
     assert "downgrade" not in result
 
-    from synapse.storage import read_node_file
+    from synapse.storage import locate_active_node_file, read_node_file
 
-    superseded = read_node_file(runtime_paths.active / f"{existing_id}.md")
+    superseded_path = locate_active_node_file(runtime_paths.base, existing_id)
+    assert superseded_path is not None
+    superseded = read_node_file(superseded_path)
     assert superseded.metadata.status is NodeStatus.SUPERSEDED
     service._store().close() if hasattr(service, "_store") else None
 

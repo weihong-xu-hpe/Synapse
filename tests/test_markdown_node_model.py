@@ -83,7 +83,7 @@ def test_extract_wiki_links_handles_mixed_language_and_aliases() -> None:
     assert extract_wiki_links(content) == ["Alpha_Node", "设计方案", "Gamma_Node"]
 
 
-def test_tier_word_count_validation_and_scan_helpers(tmp_path: Path) -> None:
+def test_word_count_validation_and_scan_helpers(tmp_path: Path) -> None:
     base_path = tmp_path / ".synapse"
     first = make_node()
     second = make_node(

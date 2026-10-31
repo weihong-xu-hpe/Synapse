@@ -54,7 +54,9 @@ archive_path = "./.synapse/.archive"
     assert config.distiller.episode.evidence_context_token_budget == 24_000
     assert config.distiller.max_transcripts_per_run == 500
     assert config.dreamer.enabled is True
-    assert config.dreamer.interval_hours == 12
+    assert config.dreamer.schedule_hour == 12
+    assert config.dreamer.schedule_minute == 0
+    assert config.dreamer.interval_hours == 24
     assert config.dreamer.batch_size == 8
     assert config.dreamer.thresholds.missing_link_cosine == 0.75
     assert config.dreamer.thresholds.stale_orphan_days is None

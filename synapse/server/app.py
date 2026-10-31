@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from threading import Lock, Thread
+from threading import Thread
 from time import perf_counter
 from typing import Any
 
@@ -329,7 +329,12 @@ def _create_root_handler():
             "name": "synapse",
             "version": __version__,
             "mcp": "/mcp",
-            "rest": {"search": "/api/search", "write": "/api/write", "episode_close": "/api/episode/close"},
+            "rest": {
+                "search": "/api/search",
+                "write": "/api/write",
+                "episode_close": "/api/episode/close",
+                "feedback": "/api/feedback",
+            },
             "transport": STREAMABLE_TRANSPORT_NAME,
             "session_header": STREAMABLE_SESSION_HEADER,
             "architecture_doc": ACTIVE_ARCHITECTURE_DOC,
@@ -424,10 +429,36 @@ def _create_rest_write_handler(service: SynapseServerService):
     return write_memory
 
 
-def _create_episode_close_handler(config, runtime_paths, logger):
-    locks_guard = Lock()
-    session_locks: dict[str, Lock] = {}
+def _create_feedback_handler(service: SynapseServerService):
+    """Credit real memory usage reported by the caller (design doc §4.3(1))."""
 
+    async def record_feedback(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return JSONResponse(status_code=400, content={"error": "Request body must be valid JSON"})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"error": "Request body must be a JSON object"})
+        injected = body.get("injected_node_ids") or []
+        used = body.get("used_node_ids") or []
+        if not isinstance(injected, list) or not isinstance(used, list):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "injected_node_ids and used_node_ids must be lists"},
+            )
+        result = await run_in_threadpool(
+            lambda: service.record_memory_feedback(
+                session_key=body.get("session_key"),
+                injected_node_ids=[str(item) for item in injected],
+                used_node_ids=[str(item) for item in used],
+            )
+        )
+        return JSONResponse(status_code=200, content=result)
+
+    return record_feedback
+
+
+def _create_episode_close_handler(config, runtime_paths, logger, service=None):
     async def close_episode(request: Request) -> JSONResponse:
         try:
             body = await request.json()
@@ -441,66 +472,120 @@ def _create_episode_close_handler(config, runtime_paths, logger):
             return JSONResponse(status_code=400, content={"error": "session_key must not be blank"})
         if reason not in {"idle", "shutdown", "switch"}:
             return JSONResponse(status_code=400, content={"error": "reason must be idle, shutdown, or switch"})
+
+        # P1B credit assignment: the bridge may report which memories reached
+        # the prompt (injected) and which were actually used this episode.
+        injected_raw = body.get("injected_node_ids") or []
+        used_raw = body.get("used_node_ids") or []
+        injected_node_ids = [str(item) for item in injected_raw] if isinstance(injected_raw, list) else []
+        used_node_ids = [str(item) for item in used_raw] if isinstance(used_raw, list) else []
+        if (injected_node_ids or used_node_ids) and service is not None:
+            try:
+                await run_in_threadpool(
+                    lambda: service.record_memory_feedback(
+                        session_key=session_key,
+                        injected_node_ids=injected_node_ids,
+                        used_node_ids=used_node_ids,
+                    )
+                )
+            except Exception:  # noqa: BLE001 — feedback must never block the close
+                if logger is not None:
+                    logger.warning(
+                        "Episode close feedback recording failed",
+                        extra={"session_key": session_key},
+                        exc_info=True,
+                    )
         if not config.distiller.enabled:
             return JSONResponse(status_code=200, content={"status": "disabled", "session_key": session_key})
 
-        with locks_guard:
-            session_lock = session_locks.setdefault(session_key, Lock())
-
         def distill_in_background() -> None:
-            with session_lock:
-                from synapse.lifecycle.episode_distiller import EpisodeDistiller
+            from synapse.lifecycle.episode_distiller import EpisodeDistiller, attempt_record
 
-                started = datetime.now(UTC)
-                started_at = started.isoformat().replace("+00:00", "Z")
-                started_clock = perf_counter()
-                scanner_client = None
-                gatekeeper_client = None
-                runner = None
-                runs = []
-                llm_failures = 0
-                try:
-                    scanner_client = EpisodeDistiller.make_scanner_client(config)
-                    gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(config)
-                    runner = EpisodeDistiller(
-                        config,
-                        runtime_paths=runtime_paths,
-                        sampling_client=scanner_client,
-                        gatekeeper_client=gatekeeper_client,
+            started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            started_clock = perf_counter()
+            scanner_client = None
+            gatekeeper_client = None
+            runner = None
+            runs = []
+            attempts = []
+            failures = 0
+            try:
+                scanner_client = EpisodeDistiller.make_scanner_client(config)
+                gatekeeper_client = EpisodeDistiller.make_gatekeeper_client(config)
+                runner = EpisodeDistiller(
+                    config,
+                    runtime_paths=runtime_paths,
+                    sampling_client=scanner_client,
+                    gatekeeper_client=gatekeeper_client,
+                )
+                result = runner.run(session_key, force=True)
+                runs.append(result)
+                attempts.append(attempt_record(result.transcript_id, result))
+            except Exception as exc:
+                failures = 1
+                fallback_id = session_key if session_key.startswith("mem_") else SynapseServerService._session_node_id(session_key)
+                session_id = getattr(exc, "distiller_session_id", None) or fallback_id
+                stage = getattr(exc, "distiller_stage", None) or "unknown"
+                attempts.append(attempt_record(session_id, None, stage=stage))
+                if logger is not None:
+                    logger.exception(
+                        "Episode close distillation failed",
+                        extra={"session_key": session_key, "reason": reason, "stage": stage},
                     )
-                    runs.append(runner.run(session_key))
-                except Exception:
-                    llm_failures = 1
-                    if logger is not None:
-                        logger.exception(
-                            "Episode close distillation failed",
-                            extra={"session_key": session_key, "reason": reason},
-                        )
-                finally:
+            finally:
+                completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                duration_ms = round((perf_counter() - started_clock) * 1000)
+                try:
                     try:
                         if runner is not None:
-                            completed = datetime.now(UTC)
-                            try:
-                                runner.record_run_metrics(
-                                    runs,
+                            runner.record_run_metrics(
+                                runs,
+                                started_at=started_at,
+                                completed_at=completed_at,
+                                duration_ms=duration_ms,
+                                transcripts_scanned=1,
+                                failures=failures,
+                                trigger="close",
+                                attempts_json=attempts,
+                            )
+                        else:
+                            from synapse.storage import DistillerRunMetrics, SQLiteNodeStore
+
+                            with SQLiteNodeStore(
+                                runtime_paths.base / "synapse.db",
+                                embedding_dimension=config.embedding.dimension or 0,
+                            ) as store:
+                                store.record_distiller_run(DistillerRunMetrics(
                                     started_at=started_at,
-                                    completed_at=completed.isoformat().replace("+00:00", "Z"),
-                                    duration_ms=round((perf_counter() - started_clock) * 1000),
+                                    completed_at=completed_at,
+                                    duration_ms=duration_ms,
                                     transcripts_scanned=1,
-                                    llm_failures=llm_failures,
-                                )
-                            except Exception:
-                                if logger is not None:
-                                    logger.exception(
-                                        "Episode close metrics recording failed",
-                                        extra={"session_key": session_key, "reason": reason},
-                                    )
-                            runner.close()
-                    finally:
-                        for client in (scanner_client, gatekeeper_client):
-                            close_client = getattr(client, "close", None)
-                            if callable(close_client):
-                                close_client()
+                                    transcripts_distilled=0,
+                                    transcripts_skipped=0,
+                                    items_extracted=0,
+                                    items_invalid=0,
+                                    decider_creates=0,
+                                    decider_complements=0,
+                                    decider_supersedes=0,
+                                    decider_downgrades=0,
+                                    failures=failures,
+                                    archived_transcripts=0,
+                                    trigger="close",
+                                    attempts_json=attempts,
+                                ))
+                    except Exception:
+                        if logger is not None:
+                            logger.exception(
+                                "Episode close metrics recording failed",
+                                extra={"session_key": session_key, "reason": reason},
+                            )
+                    if runner is not None:
+                        runner.close()
+                finally:
+                    for client in (scanner_client, gatekeeper_client):
+                        close_client = getattr(client, "close", None)
+                        if callable(close_client):
+                            close_client()
 
         Thread(target=distill_in_background, name="episode-close", daemon=True).start()
         return JSONResponse(
@@ -629,7 +714,8 @@ def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None,
     app.post("/api/search")(_create_rest_search_handler(service))
     app.post("/api/write")(_create_rest_write_handler(service))
     app.post("/api/episode/close")(
-        _create_episode_close_handler(config, service.runtime_paths, logger or service.logger)
+        _create_episode_close_handler(config, service.runtime_paths, logger or service.logger, service)
     )
+    app.post("/api/feedback")(_create_feedback_handler(service))
 
     return app

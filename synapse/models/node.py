@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -101,10 +103,21 @@ class NodeMetadata(BaseModel):
     title: str = Field(min_length=1)
     created_at: datetime = Field(default_factory=utc_now)
     last_accessed: datetime | None = None
+    # Legacy aggregate counter. Kept in sync with injected_count + used_count
+    # (see _sync_access_count) so pre-P1B callers keep working.
     access_count: int = Field(default=0, ge=0)
-    importance: float = Field(default=0.5, ge=0.0, le=1.0, exclude=True)
+    # P1B three-level usage counters (design doc §4.3(1), read/write decoupling):
+    #   retrieved_count — appeared in a /api/search result set (diagnostic only)
+    #   injected_count  — passed the inject gate and entered a prompt (weak prior)
+    #   used_count      — referenced/used, or credited by the distiller (dominant)
+    retrieved_count: int = Field(default=0, ge=0)
+    injected_count: int = Field(default=0, ge=0)
+    used_count: int = Field(default=0, ge=0)
+    # Zep-style bi-temporal validity (design doc §3.4): set when a memory merge
+    # creates (t_valid) or retires (t_invalid) a node.
+    t_valid: str | None = None
+    t_invalid: str | None = None
     type: NodeType = NodeType.TRANSIENT
-    tier: str = Field(default="note", exclude=True)
     status: NodeStatus = NodeStatus.ACTIVE
     supersedes: list[str] = Field(default_factory=list)
     superseded_by: str | None = None
@@ -123,6 +136,10 @@ class NodeMetadata(BaseModel):
     # P2c incremental distillation: last turn number covered by distillation.
     # None = never (or legacy) distilled; re-distills process later turns only.
     distilled_turn: int | None = None
+    # Content hash deferred for short-transcript distillation; reselect when it changes.
+    deferred_hash: str | None = None
+    # A close/CLI attempt must be retried even when its pending revision is short.
+    force_retry: bool | None = None
     # P2+ evidence (owner decision C): true when every evidence quote in the
     # node was deterministically verified against the source transcript.
     # Absent on pre-existing nodes — treated as unverified-only-if-present.
@@ -169,6 +186,20 @@ class NodeMetadata(BaseModel):
     def _set_default_last_accessed(self) -> "NodeMetadata":
         if self.last_accessed is None:
             self.last_accessed = self.created_at
+        return self
+
+    @model_validator(mode="after")
+    def _sync_access_count(self) -> "NodeMetadata":
+        """Keep the legacy ``access_count`` at least ``injected_count + used_count``.
+
+        The split counters are the source of truth for P2 scoring; legacy
+        callers read ``access_count``. Never *lower* it: pre-P1B nodes carry
+        historical counts that the new counters cannot reconstruct.
+        """
+
+        floor = self.injected_count + self.used_count
+        if self.access_count < floor:
+            self.access_count = floor
         return self
 
     @field_serializer("created_at", "last_accessed")
@@ -322,3 +353,135 @@ def generate_node_id(title: str, current_date: date | datetime | str | None = No
         title_hash = hashlib.sha1(title.encode("utf-8")).hexdigest()[:10]
         slug = f"node_{title_hash}"
     return f"mem_{node_date.strftime('%Y%m%d')}_{slug}"
+
+
+# ---------------------------------------------------------------------------
+# Human-friendly names for knowledge nodes (single source of truth)
+# ---------------------------------------------------------------------------
+#
+# A node's *identity* is ``metadata.id`` (persisted in frontmatter), never its
+# filename. These helpers derive the human-facing directory/filename layout
+# from that identity: ``active/<project>/<kebab-slug>.md``. Both the storage
+# writer and the handbook compiler import them, so there is exactly one
+# project/slug convention across the codebase.
+
+_NODE_ID_DATE_PREFIX = re.compile(r"^mem_\d{8}_")
+
+FALLBACK_PROJECT = "general"
+
+# Deterministic project attribution: explicit ``metadata.project`` always wins;
+# otherwise the first domain whose marker appears in ``f"{id} {title} {content}"``
+# claims the node. Marker order is significant (specific tokens before looser
+# ones); unmatched nodes land in ``general`` — never a guessed unknown domain.
+# Built-in domains are generic examples only. Machine-local workspace domains
+# live outside the repository in ``~/.synapse/project_domains.json`` (override
+# the location with ``SYNAPSE_PROJECT_DOMAINS_FILE``; set the variable to an
+# empty value to disable custom domains entirely). Custom entries are consulted
+# first and shadow built-ins with the same slug, so a local file fully
+# reproduces a private workspace layout without leaking it into the codebase.
+_BUILTIN_PROJECT_DOMAINS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("synapse", ("synapse", "dreamer", "distiller", "okf")),
+    ("omp", ("omp", "skill-evolver", "autolearn", "vibe")),
+    ("payments-svc", ("payments-svc", "payments")),
+    ("cluster-ops", ("cluster-ops", "cluster_ops")),
+)
+
+_PROJECT_DOMAINS_FILE_ENV = "SYNAPSE_PROJECT_DOMAINS_FILE"
+_DEFAULT_PROJECT_DOMAINS_FILE = Path("~/.synapse/project_domains.json")
+_CUSTOM_DOMAINS_CACHE: dict[str, tuple[int, tuple[tuple[str, tuple[str, ...]], ...]]] = {}
+
+
+def _custom_project_domains() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Load machine-local domain mappings (mtime-cached); ``()`` when absent/invalid.
+
+    File format: ``[{"project": "<slug>", "markers": ["<marker>", ...]}, ...]``.
+    Unreadable or malformed files are ignored, never fatal.
+    """
+
+    env_raw = os.environ.get(_PROJECT_DOMAINS_FILE_ENV)
+    if env_raw is None:
+        path = _DEFAULT_PROJECT_DOMAINS_FILE.expanduser()
+    elif not (path_raw := env_raw.strip()):
+        return ()
+    else:
+        path = Path(path_raw).expanduser()
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        return ()
+    key = str(path)
+    cached = _CUSTOM_DOMAINS_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        entries = None
+    parsed: list[tuple[str, tuple[str, ...]]] = []
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            slug = normalize_project_slug(str(entry.get("project") or ""))
+            markers = entry.get("markers")
+            if slug == FALLBACK_PROJECT or not isinstance(markers, list):
+                continue
+            normalized = tuple(dict.fromkeys(str(m).strip().lower() for m in markers if str(m).strip()))
+            if normalized:
+                parsed.append((slug, normalized))
+    result = tuple(parsed)
+    _CUSTOM_DOMAINS_CACHE[key] = (mtime, result)
+    return result
+
+
+def project_domains() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Active project→markers map: custom local entries first, built-ins after."""
+
+    custom = _custom_project_domains()
+    custom_slugs = {slug for slug, _ in custom}
+    builtin = tuple((slug, markers) for slug, markers in _BUILTIN_PROJECT_DOMAINS if slug not in custom_slugs)
+    return custom + builtin
+
+
+def clean_slug(node_id: str) -> str:
+    """Strip the ``mem_YYYYMMDD_`` date prefix for human-readable filenames."""
+
+    slug = _NODE_ID_DATE_PREFIX.sub("", node_id).strip("-_")
+    return slug or node_id
+
+
+def kebab_slug(node_id: str) -> str:
+    """Human-friendly kebab-case filename stem derived from a node id.
+
+    ``mem_20261031_helm_hook_timeout_cleanup`` becomes
+    ``helm-hook-timeout-cleanup``.
+    """
+
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", clean_slug(node_id)).replace("_", "-").strip("-.")
+    return slug or node_id
+
+
+def normalize_project_slug(value: str) -> str:
+    """Slug a project name for use as a directory segment."""
+
+    slug = re.sub(r"[^a-z0-9._/-]+", "-", value.lower()).strip("-.")
+    return slug or FALLBACK_PROJECT
+
+
+def infer_project(node: "Node") -> str:
+    """Deterministic project attribution for a knowledge node.
+
+    An explicit ``metadata.project`` wins (lowercased/slugged); otherwise known
+    workspace-domain markers (built-in examples plus any machine-local
+    ``~/.synapse/project_domains.json`` entries) are matched against
+    id + title + content.
+    """
+
+    explicit = (node.metadata.project or "").strip()
+    if explicit:
+        return normalize_project_slug(explicit)
+    haystack = f"{node.id} {node.title} {node.content}".lower()
+    for project, markers in project_domains():
+        if any(marker in haystack for marker in markers):
+            return project
+    return FALLBACK_PROJECT

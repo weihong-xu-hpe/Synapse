@@ -13,9 +13,10 @@ def _json(value: Any) -> str:
 _SCANNER_POLICY = [
     "Extract only high-value, durable system knowledge; do not summarize the conversation or its progress.",
     "Keep these categories: (1) component/config/repository ownership and topology, including which repo or chart owns a resource; (2) internal or external API quirks, error codes, and contract edge cases such as 404/400/empty-result handling; (3) infrastructure, middleware, and auth debugging pitfalls stated as exact Symptom -> Cause -> Fix; (4) confirmed architectural or engineering decisions approved by the user.",
-    "FORBIDDEN: self-inflicted bugs in temporary scripts or session-written code that were fixed in the same session (including typos, regex mistakes, and indentation errors); one-off probe timings or batch progress counts; and early hypotheses later refuted or corrected by the user or later turns.",
-    "Use the Global User Spine to resolve corrections and evolving intent. Do NOT filter or reject lessons based on `turn_eligibility` or `assistant_prose_is_not_evidence`; every User, Assistant, and Tool turn is valid Stage 1 context.",
+    "FORBIDDEN: self-inflicted bugs in temporary scripts or session-written code that were fixed in the same session (including typos, regex mistakes, and indentation errors); one-off probe timings or batch progress counts; early hypotheses later refuted or corrected by the user or later turns; and workspace-local ephemeral facts (e.g., temporary /tmp artifact paths, random test UUIDs created for one smoke test, transient PID/memory readings, or a single PR's point-in-time CI state) that do not generalize across sessions.",
+    "Prefer behavioral contrasts: prioritize extracting lessons where a trajectory shows a clear contrast (attempt A failed with symptom X -> diagnosed cause Y -> fix/procedure B succeeded), and use the Global User Spine to resolve corrections and evolving intent. Do NOT filter or reject lessons based on `turn_eligibility` or `assistant_prose_is_not_evidence`; every User, Assistant, and Tool turn is valid Stage 1 context.",
     "Write a detailed Chinese synthesis while preserving exact English identifiers, repository names, file paths, config keys, error strings, and code symbols. `topic` is an English title.",
+    "Credentials are never knowledge: never reproduce a password, client secret, token, API key, database password, or private key value in `claim` or `topic`. Keep the config key, secret name, namespace, or rotation procedure and write the value as `<redacted>`. A lesson whose only content is a credential value has no durable value — omit it.",
 ]
 
 
@@ -78,8 +79,11 @@ def render_episode_integrate_prompt(
     return "\n".join(
         [
             "You are both the Strict Gatekeeper and the OKF Integrator for durable Synapse knowledge.",
-            "Value and refutation gate: output action=none for a self-inflicted temporary script/code bug fixed in this session, a one-off timing or batch-progress count, or an early hypothesis refuted by later turns. Use the Global User Spine and cited excerpts to detect corrections; for example, if a later turn clarifies that 401 was not caused by CORS, do not preserve the CORS hypothesis.",
+            "Value, refutation, and workspace-ephemerality gate: output action=none for (a) a self-inflicted temporary script/code bug fixed in this session, (b) a one-off timing or batch-progress count, (c) an early hypothesis refuted by later turns, or (d) workspace-local ephemeral state (random test UUIDs, temporary /tmp paths, or single-run transient metrics) presented as a universal fact. Use the Global User Spine and cited excerpts to detect corrections; for example, if a later turn clarifies that 401 was not caused by CORS, do not preserve the CORS hypothesis.",
             "Merge/update versus create: default to update when a same-session or retrieved persistent node already covers the topic; use its exact target_id. Create only when no candidate fits, and provide a specific justification. Never create a duplicate sibling for an existing claim.",
+            "An `update` op REPLACES the target node body in place and no history is kept, so the body supplied for that target in the retrieved candidates must survive the rewrite. Copy every substantive line of that body into `content` with byte-identical wording — reordering sections or moving a line into another section is fine, but never rephrase, merge, summarize or drop it — and only then add the new lesson on top. A long existing body stays long.",
+            "Credential gate: a secret value is never knowledge. Never put a password, client secret, token, API key, database password, connection string, or private key into `content`: keep the config key, secret name, namespace, and rotation procedure, and write the value as `<redacted>`. Return action=none with reason 'credential only' when the credential value is the lesson's only substance. Never widen a quote to capture a credential value.",
+            "Evidence quotes are verified literally against the turn text, so quote a fragment that excludes the credential value (for example the command with `<redacted>` in place of the secret) rather than a fragment you rewrote.",
             "Language and OKF format: title MUST be a specific English title. Content MUST be a complete valid OKF body with `## Takeaway` as one Chinese line (target <=160 characters, hard maximum 200), the required sections for okf_type, and `## Sources`. Write Takeaway and body sections in Chinese while preserving exact English identifiers, repository names, paths, commands, config keys, and error strings. Required sections: fact=Details; decision=Decision and Consequences; procedure=Steps; pitfall=Symptom, Cause, and Fix.",
             "Verification is an annotation, never a write gate. Set verified=true when the technical claim (including repo, path, config key, error string, or root cause) is grounded in the supplied excerpts from User turns, Tool outputs, or Assistant source-code/log analysis and is not refuted later. Set verified=false only for speculative or ungrounded claims. Return verbatim evidence quotes, each <=200 characters, with its turn ID.",
             'Return JSON only: {"ops":[{"action":"update","lesson_index":0,"target_id":"...","title":"...","okf_type":"fact|decision|procedure|pitfall","content":"...","related_ids":["mem_..."],"verified":true,"evidence":[{"turn":"T12","quote":"verbatim excerpt <= 200 chars"}]},{"action":"create","lesson_index":1,"title":"...","okf_type":"...","content":"...","related_ids":["mem_..."],"justification":"...","verified":false,"evidence":[]},{"action":"none","lesson_index":2,"reason":"..."}]}. `related_ids` is optional for create/update.',
@@ -95,6 +99,30 @@ def render_episode_integrate_prompt(
             global_user_spine,
             "Verbatim excerpts for each lesson's evidence_turns (include User, Assistant, and surviving Tool sections):",
             _json(evidence_context),
+        ]
+    )
+
+
+def render_episode_merge_repair_prompt(
+    *,
+    title: str,
+    okf_type: str,
+    existing_body: str,
+    candidate_body: str,
+    omitted_lines: list[str],
+) -> str:
+    return "\n".join(
+        [
+            "Repair one automatic knowledge UPDATE whose candidate body dropped knowledge that the node it replaces already contains.",
+            "The candidate body REPLACES the existing node body in place and no history is kept, so every dropped line is lost knowledge.",
+            'Return JSON only: {"title":"...","content":"..."} with the FULL corrected body in `content`.',
+            "Every substantive line of `existing_body` MUST appear in `content` with byte-identical wording. You may reorder sections or move a line into another section, but never rephrase, merge, summarize or drop it; integrate the candidate's new information on top of that.",
+            "`omitted_lines` lists the lines the write gate found missing from the candidate; each of them must appear verbatim in the repaired `content`.",
+            "Keep the OKF structure of `candidate_body`: exactly one non-empty `## Takeaway` line in Chinese of at most 200 characters, the required sections for the okf_type, and `## Sources`.",
+            "Preserve exact English identifiers, repository names, file paths, commands, config keys and error strings. Do not add claims and do not repeat the same statement twice.",
+            f"Title: {title}",
+            f"OKF type: {okf_type}",
+            _json({"existing_body": existing_body, "candidate_body": candidate_body, "omitted_lines": omitted_lines}),
         ]
     )
 

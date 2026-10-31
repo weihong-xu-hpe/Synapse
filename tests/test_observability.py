@@ -23,7 +23,7 @@ from synapse.observability import (
 )
 from synapse.server.decider import LocalLLMDecider
 from synapse.server.service import SynapseServerService
-from synapse.storage import DistillerRunMetrics, SQLiteNodeStore, SearchEventMetrics
+from synapse.storage import SQLiteNodeStore, SearchEventMetrics
 from synapse.utils.runtime import bootstrap_runtime_directories, get_runtime_paths
 
 
@@ -83,6 +83,65 @@ def _store(config: SynapseConfig) -> SQLiteNodeStore:
         embedding_dimension=config.embedding.dimension or 0,
     )
 
+
+
+def _insert_write_event(store: SQLiteNodeStore, *, created_at: str) -> None:
+    store.connection.execute(
+        """
+        INSERT INTO write_memory_events (
+            created_at, node_type, action, candidate_count, similarity_threshold,
+            warning_codes, sampling_provider, execution_succeeded, route
+        ) VALUES (?, 'persistent', 'created', 0, 0.0, '[]', 'test', 1, 'test')
+        """,
+        (created_at,),
+    )
+    store.connection.commit()
+
+
+def _insert_distiller_run(
+    store: SQLiteNodeStore,
+    *,
+    started_at: str,
+    failures: int = 0,
+    trigger: str = "legacy",
+    attempts: list[dict[str, Any]] | None = None,
+    transcripts_scanned: int = 0,
+    transcripts_distilled: int = 0,
+    transcripts_skipped: int = 0,
+    items_extracted: int = 0,
+    items_invalid: int = 0,
+    items_quarantined: int = 0,
+    decider_creates: int = 0,
+    decider_complements: int = 0,
+    archived_transcripts: int = 0,
+) -> None:
+    store.connection.execute(
+        """
+        INSERT INTO distiller_runs (
+            started_at, completed_at, duration_ms, transcripts_scanned,
+            transcripts_distilled, transcripts_skipped, items_extracted, items_invalid,
+            items_quarantined, decider_creates, decider_complements, decider_supersedes,
+            decider_downgrades, failures, archived_transcripts, "trigger", attempts_json
+        ) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+        """,
+        (
+            started_at,
+            started_at,
+            transcripts_scanned,
+            transcripts_distilled,
+            transcripts_skipped,
+            items_extracted,
+            items_invalid,
+            items_quarantined,
+            decider_creates,
+            decider_complements,
+            failures,
+            archived_transcripts,
+            trigger,
+            json.dumps(attempts if attempts is not None else []),
+        ),
+    )
+    store.connection.commit()
 
 # ---------------------------------------------------------------------------
 # search events
@@ -294,17 +353,139 @@ def test_write_routes_are_attributed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_snapshot_is_idempotent_per_day_and_backfills(tmp_path: Path) -> None:
+
+
+def test_snapshot_refreshes_today_when_new_events_arrive(tmp_path: Path) -> None:
     config = _config(tmp_path)
     paths = get_runtime_paths(config)
-    first = write_missing_snapshots(config, paths, backfill_days=2)
-    second = write_missing_snapshots(config, paths, backfill_days=2)
-    assert len(first) == 3  # today + 2 backfill days
-    assert second == []
+    event_time = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     with _store(config) as store:
-        dates = [str(row["date"]) for row in store.connection.execute("SELECT date FROM metrics_snapshots").fetchall()]
-    assert len(dates) == len(set(dates))
+        _insert_write_event(store, created_at=event_time)
 
+    write_missing_snapshots(config, paths, backfill_days=0)
+    with _store(config) as store:
+        first_payload = store.get_metrics_snapshots()[0]["payload"]
+        _insert_write_event(store, created_at=event_time)
+    write_missing_snapshots(config, paths, backfill_days=0)
+
+    with _store(config) as store:
+        snapshots = store.get_metrics_snapshots()
+    assert len(snapshots) == 1
+    assert first_payload["writes"]["total"] == 1
+    assert snapshots[0]["payload"]["writes"]["total"] == 2
+
+
+def test_historical_backfill_marks_stock_metrics_unavailable(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    paths = get_runtime_paths(config)
+    today = datetime.now().astimezone().date()
+    yesterday = today - timedelta(days=1)
+    old_event_time = datetime(yesterday.year, yesterday.month, yesterday.day, 12).astimezone(UTC)
+    service = SynapseServerService(config, runtime_paths=paths)
+    service.integrate_knowledge(title="Current Stock Sentinel", content="Current stock sentinel body.")
+    with _store(config) as store:
+        _insert_write_event(store, created_at=old_event_time.isoformat().replace("+00:00", "Z"))
+
+    write_missing_snapshots(config, paths, backfill_days=1)
+    with _store(config) as store:
+        snapshots = {row["date"]: row["payload"] for row in store.get_metrics_snapshots()}
+
+    historical = snapshots[yesterday.isoformat()]
+    current = snapshots[today.isoformat()]
+    assert historical["writes"]["total"] == 1
+    assert historical["nodes"] is None
+    assert historical["transcripts"] is None
+    assert historical["storage"] is None
+    assert historical["stock_metrics_available"] is False
+    assert historical["stock_metrics_reason"] == "not_captured_on_date"
+    assert isinstance(current["nodes"], dict)
+    assert current["stock_metrics_available"] is True
+    report = render_report(config, paths, since_days=30)
+    assert f"| {yesterday.isoformat()} | unavailable | unavailable | unavailable | unavailable |" in report
+
+
+def test_historical_refresh_preserves_captured_stock_values(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    paths = get_runtime_paths(config)
+    today = datetime.now().astimezone().date()
+    yesterday = today - timedelta(days=1)
+    old_event_time = datetime(yesterday.year, yesterday.month, yesterday.day, 12).astimezone(UTC)
+    expected_stocks = {
+        "nodes": {"total": 17},
+        "transcripts": {"represented": 3},
+        "storage": {"db_bytes": 21, "active_bytes": 22, "archive_bytes": 23},
+    }
+    with _store(config) as store:
+        _insert_write_event(store, created_at=old_event_time.isoformat().replace("+00:00", "Z"))
+        assert store.record_metrics_snapshot(
+            date=yesterday.isoformat(),
+            created_at=old_event_time.isoformat().replace("+00:00", "Z"),
+            payload=expected_stocks,
+        )
+
+    write_missing_snapshots(config, paths, backfill_days=1)
+    write_missing_snapshots(config, paths, backfill_days=1)
+    with _store(config) as store:
+        historical = next(row["payload"] for row in store.get_metrics_snapshots() if row["date"] == yesterday.isoformat())
+
+    assert historical["writes"]["total"] == 1
+    for key, value in expected_stocks.items():
+        assert historical[key] == value
+    assert historical["stock_metrics_available"] is True
+    assert historical["stock_captured_at"] == old_event_time.isoformat().replace("+00:00", "Z")
+
+
+def test_historical_backfill_does_not_relabel_late_stock_sample(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    paths = get_runtime_paths(config)
+    now = datetime.now(UTC)
+    yesterday = now.astimezone().date() - timedelta(days=1)
+    old_event_time = datetime(yesterday.year, yesterday.month, yesterday.day, 12).astimezone(UTC)
+    with _store(config) as store:
+        _insert_write_event(store, created_at=old_event_time.isoformat().replace("+00:00", "Z"))
+        store.record_metrics_snapshot(
+            date=yesterday.isoformat(),
+            created_at=now.isoformat().replace("+00:00", "Z"),
+            payload={"nodes": {"total": 99}, "transcripts": {}, "storage": {}},
+        )
+    write_missing_snapshots(config, paths, backfill_days=1)
+    with _store(config) as store:
+        historical = next(row["payload"] for row in store.get_metrics_snapshots() if row["date"] == yesterday.isoformat())
+    assert historical["writes"]["total"] == 1
+    assert historical["nodes"] is None
+    assert historical["stock_metrics_available"] is False
+
+
+def test_distiller_snapshot_separates_trigger_failures_and_sessions(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    paths = get_runtime_paths(config)
+    now = datetime.now(UTC)
+    local_today = now.astimezone().date()
+    event_time = datetime(local_today.year, local_today.month, local_today.day, 12).astimezone(UTC)
+    timestamp = event_time.isoformat().replace("+00:00", "Z")
+    with _store(config) as store:
+        _insert_distiller_run(store, started_at=timestamp, failures=1, trigger="legacy")
+        _insert_distiller_run(
+            store,
+            started_at=timestamp,
+            failures=1,
+            trigger="close",
+            attempts=[
+                {"session": "node-a", "outcome": "distilled", "stage": None},
+                {"session": "node-b", "outcome": "failed", "stage": "scanner"},
+                {"session": "node-a", "outcome": "skipped", "stage": None},
+            ],
+        )
+        payload = collect_daily_snapshot(config, paths, day=local_today, store=store)
+
+    distiller = payload["distiller"]
+    assert distiller["failures"] == 2
+    assert distiller["by_trigger"] == {"legacy": 1, "close": 1}
+    assert distiller["failure_stages"] == {"unknown": 1, "scanner": 1}
+    assert distiller["attempts_by_outcome"] == {"distilled": 1, "failed": 1, "skipped": 1}
+    assert distiller["attempts_observed"] == 3
+    assert distiller["observed_unique_sessions"] == 2
+    assert distiller["unattributed_runs"] == 1
 
 def test_snapshot_payload_contains_expected_sections(tmp_path: Path) -> None:
     config = _config(tmp_path)
@@ -346,6 +527,12 @@ def test_snapshot_payload_contains_expected_sections(tmp_path: Path) -> None:
         "items_created",
         "items_updated",
         "items_quarantined",
+        "failures",
+        "by_trigger",
+        "failure_stages",
+        "attempts_by_outcome",
+        "observed_unique_sessions",
+        "unattributed_runs",
     }
     assert "distiller" in payload and "searches" in payload and "storage" in payload
 
@@ -402,39 +589,33 @@ def test_report_includes_episode_distiller_funnel_and_verification(tmp_path: Pat
     )
     now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     with _store(config) as store:
-        store.record_distiller_run(
-            DistillerRunMetrics(
-                started_at=now,
-                completed_at=now,
-                duration_ms=100,
-                transcripts_scanned=4,
-                transcripts_distilled=1,
-                transcripts_skipped=2,
-                items_extracted=3,
-                items_invalid=1,
-                decider_creates=1,
-                decider_complements=1,
-                decider_supersedes=0,
-                decider_downgrades=0,
-                llm_failures=1,
-                archived_transcripts=2,
-                items_quarantined=1,
-            )
+        _insert_distiller_run(
+            store,
+            started_at=now,
+            failures=1,
+            trigger="close",
+            transcripts_scanned=4,
+            transcripts_distilled=1,
+            transcripts_skipped=2,
+            items_extracted=3,
+            items_invalid=1,
+            decider_creates=1,
+            decider_complements=1,
+            archived_transcripts=2,
+            items_quarantined=1,
         )
 
     content = render_report(config, paths, since_days=7)
     assert "verified_true" in content and "verified_false" in content and "verified_unset" in content
-    assert (
-        "- Distiller: 1 runs, 1 transcripts distilled (2 short/noop skipped), 3 Stage-1 lessons -> "
-        "1 created + 1 updated + 1 gatekeeper-filtered (none) + 1 quarantined, 1 LLM failures, 2 archived"
-    ) in content
+    assert "1 quarantined" in content
+    assert "1 generic failure" in content
 
 def test_report_includes_snapshot_storage_table(tmp_path: Path) -> None:
     config = _config(tmp_path)
     paths = get_runtime_paths(config)
     write_missing_snapshots(config, paths, backfill_days=0)
     content = render_report(config, paths, since_days=30)
-    assert "| Date | DB bytes | Active bytes | Archive bytes |" in content
+    assert "| Date | DB bytes | Active bytes | Transcripts bytes | Archive bytes |" in content
 
 
 def test_report_out_path_writes_file(tmp_path: Path) -> None:

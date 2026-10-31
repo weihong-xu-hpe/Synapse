@@ -32,12 +32,15 @@ from synapse.storage import (
     SearchEventMetrics,
     WriteMemoryEventMetrics,
     extract_wiki_links,
+    locate_active_node_file,
+    read_node_file,
     split_frontmatter,
     write_node_file,
 )
 from synapse.server.write_path import IntegrateAction, normalize_reasoning
 from synapse.sync import SyncBatchResult, SyncManager
 from synapse.utils.runtime import RuntimePaths, bootstrap_runtime_directories
+from synapse.utils.transcript_lock import transcript_lock
 
 
 LOGGER = logging.getLogger("synapse.mcp-daemon")
@@ -107,6 +110,204 @@ def _missing_supersede_anchors(old_content: str, new_content: str) -> list[str]:
         if re.search(pattern, candidate) is None:
             missing.append(anchor)
     return missing
+
+
+def _substantive_line_pairs(content: str) -> list[tuple[str, str]]:
+    """Pair each substantive line with its comparison form, excluding provenance markup."""
+    excluded = {"sources", "related", "evidence"}
+    section = ""
+    fence: str | None = None
+    pairs: list[tuple[str, str]] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        marker = re.match(r"^(`{3,}|~{3,})", stripped)
+        if marker:
+            if fence is None:
+                fence = marker.group(1)[0]
+            elif marker.group(1)[0] == fence:
+                fence = None
+            continue
+        if fence is None and stripped.startswith("## "):
+            section = stripped[3:].strip().casefold()
+            continue
+        if not stripped or section in excluded:
+            continue
+        normalized = re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)", "", stripped)
+        pairs.append((stripped, " ".join(normalized.split()).casefold()))
+    return pairs
+
+
+def _omitted_knowledge_lines(old_content: str, new_content: str) -> list[str]:
+    """Existing substantive lines that `new_content` no longer carries, in original form."""
+
+    candidate = " ".join(normalized for _line, normalized in _substantive_line_pairs(new_content))
+    return [line for line, normalized in _substantive_line_pairs(old_content) if normalized not in candidate]
+
+
+# Sections that carry provenance rather than knowledge: merged as a de-duplicated
+# set (they are excluded from the byte-identical loss gate by design).
+_PROVENANCE_SECTIONS = frozenset({"sources", "related", "evidence"})
+_TAKEAWAY_HEADING = "takeaway"
+_FENCE_MARKER_PATTERN = re.compile(r"^(`{3,}|~{3,})")
+_BULLET_PREFIX_PATTERN = re.compile(r"^(?:[-*]\s+|\d+[.)]\s+)")
+
+
+def _normalize_comparison_line(line: str) -> str:
+    """Same normalization `_substantive_line_pairs` applies to a single line."""
+
+    stripped = line.strip()
+    normalized = _BULLET_PREFIX_PATTERN.sub("", stripped)
+    return " ".join(normalized.split()).casefold()
+
+
+def _split_section_blocks(content: str) -> list[tuple[str | None, list[str]]]:
+    """Split a body into (heading, lines) blocks; the first block has heading None.
+
+    Lines are preserved verbatim so a merge can re-emit them byte-identically.
+    """
+
+    blocks: list[tuple[str | None, list[str]]] = []
+    heading: str | None = None
+    buffer: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            blocks.append((heading, buffer))
+            heading = stripped[3:].strip()
+            buffer = []
+        else:
+            buffer.append(line)
+    blocks.append((heading, buffer))
+    return blocks
+
+
+def _candidate_units(content: str) -> list[tuple[str, list[str]]]:
+    """Group candidate lines into (section, unit) where fenced blocks stay whole.
+
+    Keeps fences balanced when only part of a fenced block is new.
+    """
+
+    lines = content.splitlines()
+    units: list[tuple[str, list[str]]] = []
+    section = ""
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            section = stripped[3:].strip()
+            index += 1
+            continue
+        marker = _FENCE_MARKER_PATTERN.match(stripped)
+        if marker:
+            fence_char = marker.group(1)[0]
+            block = [line]
+            index += 1
+            while index < len(lines):
+                block.append(lines[index])
+                if _FENCE_MARKER_PATTERN.match(lines[index].strip()) and lines[index].strip().startswith(fence_char):
+                    index += 1
+                    break
+                index += 1
+            units.append((section, block))
+            continue
+        units.append((section, [line]))
+        index += 1
+    return units
+
+
+def deterministic_section_merge(existing_content: str, candidate_content: str) -> str:
+    """Deterministically append a candidate's *delta bullets* into an existing body.
+
+    Daytime write path (design doc §3.3): the LLM only ever produces delta
+    bullets, and Python merges them into the target body. Every existing
+    substantive line is re-emitted verbatim, so ``_omitted_knowledge_lines``
+    between the old body and the merged body is empty **by construction** —
+    no repair round-trip, no token cost, no line loss.
+    """
+
+    existing = existing_content.rstrip("\n")
+    if not existing.strip():
+        return candidate_content.strip()
+
+    blocks = _split_section_blocks(existing)
+    existing_norms = {normalized for _line, normalized in _substantive_line_pairs(existing)}
+    known_headings = {heading.casefold() for heading, _lines in blocks if heading}
+    provenance_norms: set[str] = set()
+    for heading, lines in blocks:
+        if heading is not None and heading.casefold() in _PROVENANCE_SECTIONS:
+            for line in lines:
+                if line.strip():
+                    provenance_norms.add(_normalize_comparison_line(line))
+
+    deltas: dict[str, list[str]] = {}
+    delta_headings: dict[str, str] = {}
+    candidate_takeaway: list[str] = []
+
+    def _add_delta(section: str, lines: list[str]) -> None:
+        key = section.casefold()
+        delta_headings.setdefault(key, section)
+        deltas.setdefault(key, []).extend(lines)
+
+    for section, unit in _candidate_units(candidate_content):
+        if not section:
+            # Preamble (`# Title` / intro prose) is owned by the existing body.
+            continue
+        key = section.casefold()
+        substantive = [line for line in unit if line.strip()]
+        if not substantive:
+            continue
+        if key == _TAKEAWAY_HEADING:
+            if _TAKEAWAY_HEADING not in known_headings:
+                candidate_takeaway.extend(substantive)
+            continue
+        if key in _PROVENANCE_SECTIONS:
+            fresh = [
+                line
+                for line in substantive
+                if _normalize_comparison_line(line) not in provenance_norms
+            ]
+            for line in fresh:
+                provenance_norms.add(_normalize_comparison_line(line))
+            if fresh:
+                _add_delta(section, fresh)
+            continue
+        # Substantive knowledge unit: keep it whole if anything inside is new.
+        new_lines = [
+            line
+            for line in substantive
+            if _normalize_comparison_line(line) not in existing_norms
+        ]
+        if not new_lines:
+            continue
+        for line in new_lines:
+            existing_norms.add(_normalize_comparison_line(line))
+        _add_delta(section, unit)
+
+    if not deltas and not candidate_takeaway:
+        return existing
+
+    output: list[str] = []
+    for heading, lines in blocks:
+        if heading is None:
+            output.extend(lines)
+            if candidate_takeaway and _TAKEAWAY_HEADING not in known_headings:
+                output.extend(["", "## Takeaway", *candidate_takeaway])
+            continue
+        output.append(f"## {heading}")
+        output.extend(lines)
+        key = heading.casefold()
+        extra = deltas.pop(key, None)
+        if extra:
+            if output and output[-1].strip():
+                output.append("")
+            output.extend(extra)
+
+    for key, extra in deltas.items():
+        output.extend(["", f"## {delta_headings.get(key, key)}", *extra])
+
+    merged = "\n".join(output).rstrip("\n")
+    return merged if merged.strip() else existing
 
 
 def _query_cjk_ratio(text: str) -> float:
@@ -188,10 +389,8 @@ class SynapseServerService:
             f"synapse_sampling_client_{id(self)}",
             default=sampling_client,
         )
-        # Serializes concurrent session-keyed upserts of the same key, and
-        # unkeyed writes of the same (title, content-hash) pair.
-        self._session_key_locks: dict[str, threading.Lock] = {}
-        self._session_key_locks_guard = threading.Lock()
+        # Serializes unkeyed writes of the same (title, content-hash) pair.
+        self._content_write_locks_guard = threading.Lock()
         self._content_write_locks: dict[str, threading.Lock] = {}
 
     @property
@@ -326,6 +525,49 @@ class SynapseServerService:
         from synapse.okf.transcripts import is_session_transcript
 
         return not is_session_transcript(node)
+
+    def record_memory_feedback(
+        self,
+        *,
+        session_key: str | None = None,
+        injected_node_ids: Sequence[str] = (),
+        used_node_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Credit real memory usage (design doc §4.3(1), Oblivion credit assignment).
+
+        Called by ``/api/feedback`` and by ``/api/episode/close`` when the
+        caller reports which memories were injected into the prompt and which
+        were actually used. Only *used* memories drive retention strongly;
+        injected ones are the weak prior. Never breaks the write path.
+        """
+
+        def _clean(values: Sequence[str] | None) -> list[str]:
+            if not values:
+                return []
+            cleaned: list[str] = []
+            for value in values:
+                text = str(value).strip()
+                if text:
+                    cleaned.append(text)
+            return list(dict.fromkeys(cleaned))
+
+        injected = _clean(injected_node_ids)
+        used = _clean(used_node_ids)
+        if not injected and not used:
+            raise SynapseServiceError(
+                "INVALID_FEEDBACK",
+                "Provide at least one injected_node_ids or used_node_ids entry",
+            )
+        with self._store() as store:
+            store.record_memory_usage(injected_ids=injected, used_ids=used)
+        payload = {
+            "status": "ok",
+            "session_key": (session_key or "").strip() or None,
+            "injected_count": len(injected),
+            "used_count": len(used),
+        }
+        self._log_tool_call("record_memory_feedback", {"session_key": payload["session_key"]}, payload)
+        return payload
 
     def integrate_knowledge(
         self,
@@ -515,12 +757,19 @@ class SynapseServerService:
         merge_update_target: str | None = None,
     ) -> dict[str, Any]:
         clean_title = title.strip()
+        # A lone surrogate (upstream truncation inside an astral pair) is
+        # json-legal but not UTF-8 encodable: the file writer would raise
+        # mid-write and lose the whole note. Repair it at ingest.
+        from synapse.security import scrub_credentials, strip_lone_surrogates
+
+        content = scrub_credentials(strip_lone_surrogates(content))
+        clean_title = strip_lone_surrogates(clean_title)
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         # Hold the (title, content-hash) lock across guard check -> decider ->
         # integrate so two concurrent identical writes cannot both pass the
         # guard and both create a node.
         lock_key = f"{clean_title}::{content_hash}"
-        lock = self._lock_for(self._content_write_locks, self._session_key_locks_guard, lock_key)
+        lock = self._lock_for(self._content_write_locks, self._content_write_locks_guard, lock_key)
         with lock:
             guard = self._find_identical_active_node(clean_title, content)
             if guard is not None:
@@ -576,6 +825,30 @@ class SynapseServerService:
         okf_type: str | None = None,
         validated_title: str | None = None,
     ) -> dict[str, Any]:
+        with transcript_lock(self.runtime_paths.base, target_id, scope="mutation"):
+            return self._merge_update_node_locked(
+                target_id=target_id,
+                content=content,
+                title=title,
+                sources=sources,
+                verified=verified,
+                route=route,
+                okf_type=okf_type,
+                validated_title=validated_title,
+            )
+
+    def _merge_update_node_locked(
+        self,
+        *,
+        target_id: str,
+        content: str,
+        title: str,
+        sources: list[str],
+        verified: bool | None,
+        route: str | None,
+        okf_type: str | None = None,
+        validated_title: str | None = None,
+    ) -> dict[str, Any]:
         """Merge-update an existing node IN PLACE (near-duplicate gate).
 
         Same node id, body replaced by the caller's merged OKF body; sources
@@ -602,6 +875,22 @@ class SynapseServerService:
                 sources=merged_sources,
                 links=[],
             )
+            omitted_lines = _omitted_knowledge_lines(existing.content, content)
+            if omitted_lines:
+                reason = "Automatic update omitted existing knowledge; review is required"
+                raise SynapseServiceError(
+                    "INVALID_OKF_FINAL_BODY",
+                    reason,
+                    status_code=422,
+                    details={
+                        "warnings": [{"code": "okf_update_loss_risk", "message": reason}],
+                        "final_content": content,
+                        "omitted_line_count": len(omitted_lines),
+                        # The caller repairs the merge with the exact lines that went
+                        # missing; the body itself is already in `final_content`.
+                        "omitted_lines": omitted_lines[:60],
+                    },
+                )
         else:
             existing_title = existing.title
             okf_warnings = self._okf_write_warnings(
@@ -1034,23 +1323,24 @@ class SynapseServerService:
         # P2b: transcripts soon carry tool outputs with secrets — redact at
         # the boundary so nothing sensitive is ever persisted (storage-only
         # material never passes through the outbound cloud sanitizer).
-        from synapse.security import RedactionEngine
+        from synapse.security import RedactionEngine, scrub_credentials, strip_lone_surrogates
 
-        content = RedactionEngine.from_config(self.config).redact(content)[0]
+        redacted, _ = RedactionEngine.from_config(self.config).redact(content)
+        content = scrub_credentials(strip_lone_surrogates(redacted))
+        clean_title = strip_lone_surrogates(clean_title)
 
         node_id = self._session_node_id(clean_key)
-        lock = self._lock_for(self._session_key_locks, self._session_key_locks_guard, node_id)
-        with lock:
+        with transcript_lock(self.runtime_paths.base, node_id, scope="mutation"):
             normalized_type = node_type if isinstance(node_type, NodeType) else NodeType(str(node_type))
             normalized_sensitivity = (
                 sensitivity if isinstance(sensitivity, SensitivityLevel) else SensitivityLevel(str(sensitivity))
             )
             normalized_links = self._normalize_links(links or [])
 
-            existing_path = self.runtime_paths.active / f"{node_id}.md"
+            existing_path = self._resolve_node_path(node_id)
             existing: Node | None = None
             revived_distilled_ids: list[str] = []
-            if existing_path.exists():
+            if existing_path is not None:
                 existing = self._load_node(node_id)
             else:
                 # P2c revival: the session_key may have an ARCHIVED copy (the
@@ -1067,7 +1357,12 @@ class SynapseServerService:
                         extra={"node_id": node_id, "carried_distilled_node_ids": len(revived_distilled_ids)},
                     )
 
-            if existing is not None and existing.title == clean_title and existing.content == content:
+            if (
+                existing is not None
+                and existing.title == clean_title
+                and existing.content == content
+                and existing.metadata.session_key == clean_key
+            ):
                 action = "unchanged"
                 stored_node = existing
                 sync_result: SyncBatchResult | None = None
@@ -1095,7 +1390,7 @@ class SynapseServerService:
                 node = Node(
                     metadata=metadata,
                     content=self._embed_links(content, normalized_links),
-                    file_path=Path("active") / f"{node_id}.md",
+                    file_path=Path("transcripts") / f"{node_id}.md",
                 )
                 absolute_path = write_node_file(node, base_path=self.runtime_paths.base)
                 sync_result = self._sync_paths([absolute_path])
@@ -1278,10 +1573,38 @@ class SynapseServerService:
         self._log_tool_call("stats", {}, payload)
         return payload
 
+    def _resolve_node_path(self, node_id: str) -> Path | None:
+        """Return the on-disk Markdown path for *node_id*.
+
+        Session transcripts live in ``transcripts/``; knowledge nodes live in
+        ``active/<project>/<kebab-slug>.md``. The stored ``file_path`` is
+        checked first, then both trees (and the whole active hierarchy) so
+        callers never need to know where a node lives.
+        """
+
+        with self._store() as store:
+            stored = store.get_node(node_id)
+        if stored is not None and str(stored.file_path) not in {"", "."}:
+            candidate = stored.file_path if stored.file_path.is_absolute() else self.runtime_paths.base / stored.file_path
+            if candidate.exists():
+                return candidate
+        transcript = self.runtime_paths.transcripts / f"{node_id}.md"
+        if transcript.exists():
+            return transcript
+        flat = self.runtime_paths.active / f"{node_id}.md"
+        if flat.exists():
+            return flat
+        return locate_active_node_file(self.runtime_paths.base, node_id)
+
     def _load_node(self, node_id: str) -> Node:
         with self._store() as store:
             node = store.get_node(node_id)
         if node is None:
+            # Fall back to disk: the index may lag a just-written file, and a
+            # node is loadable by id from either active/ or transcripts/.
+            path = self._resolve_node_path(node_id)
+            if path is not None:
+                return read_node_file(path).model_copy(update={"file_path": path.relative_to(self.runtime_paths.base)})
             raise NodeNotFoundError(node_id)
         return node
 
@@ -1326,7 +1649,7 @@ class SynapseServerService:
         base_id = generate_node_id(title)
         candidate = base_id
         with self._store() as store:
-            if store.get_node(candidate) is None and not (self.runtime_paths.active / f"{candidate}.md").exists():
+            if store.get_node(candidate) is None and self._resolve_node_path(candidate) is None:
                 return candidate
             # Collision: deterministic short hash of title + creation date
             # (docs/okf.md ID plan) instead of _2/_3 counters; extend from 4
@@ -1334,7 +1657,7 @@ class SynapseServerService:
             now_iso = datetime.now(UTC).isoformat()
             digest = hashlib.sha1(f"{title}{now_iso}".encode("utf-8")).hexdigest()
             candidate = f"{base_id}_{digest[:4]}"
-            if store.get_node(candidate) is not None or (self.runtime_paths.active / f"{candidate}.md").exists():
+            if store.get_node(candidate) is not None or self._resolve_node_path(candidate) is not None:
                 candidate = f"{base_id}_{digest[:6]}"
         return candidate
 
@@ -1533,6 +1856,9 @@ class SynapseServerService:
                     ensure_ascii=False,
                 )
             )
+            from synapse.security import RedactionEngine
+
+            prompt, _ = RedactionEngine.from_config(self.config).redact(prompt)
             self.logger.info(
                 "Distiller final OKF validation repair attempted",
                 extra={"title": title, "okf_type": okf_type, "warning_codes": [finding.code for finding in errors]},
@@ -1855,11 +2181,17 @@ class SynapseServerService:
         written_paths: list[Path] = []
         reason_overrides = supersession_reasons or {}
         for node in nodes:
-            absolute_path = self.runtime_paths.base / node.file_path
+            # write_node_file resolves the canonical destination itself
+            # (active/<project>/<kebab-slug>.md for knowledge, transcripts/ for
+            # session transcripts) and reports exactly what it wrote.
             supersession_reason = reason_overrides.get(node.id)
-            if supersession_reason is None and node.metadata.supersedes and absolute_path.exists():
-                supersession_reason = self._read_existing_supersession_reason(absolute_path)
-            write_node_file(node, output_path=absolute_path, supersession_reason=supersession_reason)
+            if supersession_reason is None and node.metadata.supersedes:
+                existing_path = locate_active_node_file(self.runtime_paths.base, node.id)
+                if existing_path is not None:
+                    supersession_reason = self._read_existing_supersession_reason(existing_path)
+            absolute_path = write_node_file(
+                node, base_path=self.runtime_paths.base, supersession_reason=supersession_reason
+            )
             written_paths.append(absolute_path)
         return self._sync_paths(written_paths)
 

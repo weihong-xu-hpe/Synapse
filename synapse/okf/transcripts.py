@@ -7,9 +7,8 @@ markdown writer. No duplicate logic elsewhere.
 Predicates (design decision A1):
 - ``is_session_transcript``  — keyed (``mem_session_*`` / ``session_key``) or
   legacy (transient titled ``Session summary …``) transcript nodes.
-- ``is_distilled_current``   — ``distilled_hash`` matches sha256 of the current
-  content. True even when zero knowledge items were produced (the LLM judged
-  nothing durable); such transcripts are never re-selected.
+- ``is_distilled_current``   — the content hash matches and no numbered v2
+  turns remain beyond the recorded watermark. Zero extracted items are valid.
 - ``is_represented``         — ``is_distilled_current`` AND knowledge nodes
   exist. Fully-represented transcripts are excluded from default search.
 """
@@ -20,11 +19,13 @@ import hashlib
 import re
 
 from synapse.models import Node, NodeType
+from synapse.okf.transcript_format import V2_MARKER
 
 SESSION_ID_PREFIX = "mem_session_"
 LEGACY_TITLE_PREFIX = "Session summary"
 # Legacy session-summary node ids: mem_<YYYYMMDD>_session_summary_*
 LEGACY_ID_PATTERN = re.compile(r"^mem_\d{8}_session_summary_.+$")
+_V2_TURN_HEADING = re.compile(r"^## T(\d+) (?:User|Assistant)[^\S\r\n]*$", re.MULTILINE)
 
 
 def content_sha256(content: str) -> str:
@@ -43,9 +44,11 @@ def is_distilled_current(node: Node) -> bool:
     """Transcript was distilled at its current content revision (zero items OK)."""
 
     metadata = node.metadata
-    if not metadata.distilled_hash:
+    if metadata.force_retry or not metadata.distilled_hash or metadata.distilled_hash != content_sha256(node.content):
         return False
-    return metadata.distilled_hash == content_sha256(node.content)
+    if metadata.distilled_turn is not None and V2_MARKER in node.content:
+        return not any(int(match.group(1)) > metadata.distilled_turn for match in _V2_TURN_HEADING.finditer(node.content))
+    return True
 
 
 def is_represented(node: Node) -> bool:

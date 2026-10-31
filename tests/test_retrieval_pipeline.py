@@ -109,18 +109,21 @@ def make_node(
     return Node(metadata=metadata, content=content, file_path=Path(f"active/{file_name}"))
 
 
-def test_rrf_formula_combines_rankings_correctly() -> None:
-    scores = RetrievalPipeline.compute_rrf(
+def test_fuse_rankings_keeps_each_lists_best_rrf_score() -> None:
+    ranked = RetrievalPipeline.fuse_rankings(
         (
             [("alpha", 2.0), ("beta", 1.0)],
             [("beta", 0.1), ("alpha", 0.2), ("gamma", 0.3)],
         ),
         k=60,
+        limit=10,
     )
 
-    assert scores["alpha"] == pytest.approx((1 / 61) + (1 / 62))
-    assert scores["beta"] == pytest.approx((1 / 62) + (1 / 61))
-    assert scores["gamma"] == pytest.approx(1 / 63)
+    assert ranked == [
+        ("alpha", pytest.approx(1 / 61)),
+        ("beta", pytest.approx(1 / 61)),
+        ("gamma", pytest.approx(1 / 63)),
+    ]
 
 
 def test_graph_hop_returns_one_degree_neighbors_from_both_directions(tmp_path: Path) -> None:

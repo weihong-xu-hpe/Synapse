@@ -20,10 +20,11 @@ from synapse.okf.transcripts import (
     is_represented,  # noqa: F401  (re-exported for callers/tests)
     is_session_transcript,
 )
-from synapse.server.service import SynapseServiceError
-from synapse.storage import DistillerRunMetrics, SQLiteNodeStore, archive_node_path
+from synapse.server.service import SynapseServiceError, SyncFailedError
+from synapse.storage import SQLiteNodeStore, archive_node_path
 from synapse.storage.markdown import write_node_file
 from synapse.utils.runtime import RuntimePaths
+from synapse.utils.transcript_lock import transcript_lock
 
 LOGGER = logging.getLogger("synapse.distiller")
 _QUARANTINE_WRITE_LOCK = threading.Lock()
@@ -46,27 +47,8 @@ class DistillerReport:
     decider_complements: int = 0
     decider_supersedes: int = 0
     decider_downgrades: int = 0
-    llm_failures: int = 0
+    failures: int = 0
     archived_transcripts: int = 0
-
-    def metrics(self) -> DistillerRunMetrics:
-        return DistillerRunMetrics(
-            started_at=self.started_at,
-            completed_at=self.completed_at,
-            duration_ms=self.duration_ms,
-            transcripts_scanned=self.transcripts_scanned,
-            transcripts_distilled=self.transcripts_distilled,
-            transcripts_skipped=self.transcripts_skipped,
-            items_extracted=self.items_extracted,
-            items_invalid=self.items_invalid,
-            items_quarantined=self.items_quarantined,
-            decider_creates=self.decider_creates,
-            decider_complements=self.decider_complements,
-            decider_supersedes=self.decider_supersedes,
-            decider_downgrades=self.decider_downgrades,
-            llm_failures=self.llm_failures,
-            archived_transcripts=self.archived_transcripts,
-        )
 
 
 # Public predicate name used by transcript-state tests.
@@ -122,6 +104,8 @@ class Distiller:
             if updated_at is None or updated_at > idle_cutoff:
                 continue
             if is_distilled_current(node):
+                continue
+            if not node.metadata.force_retry and node.metadata.deferred_hash == content_sha256(node.content):
                 continue
             candidates.append(node)
         candidates.sort(key=lambda node: self._content_updated_at(node) or now)
@@ -229,38 +213,78 @@ class Distiller:
         *,
         distilled_turn: int | None = None,
         mark_current: bool = True,
-    ) -> None:
-        path = self.runtime_paths.base / transcript.file_path
-        if not path.exists():
-            return
-        node = self._load_transcript_from_disk(transcript.id)
-        if node is None:
-            return
-        merged_ids = list(dict.fromkeys([*node.metadata.distilled_node_ids, *knowledge_ids]))
-        watermark = distilled_turn if distilled_turn is not None else node.metadata.distilled_turn
-        metadata = node.metadata.model_copy(
-            update={
-                "distilled_hash": content_sha256(node.content) if mark_current else None,
-                "distilled_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "distilled_node_ids": merged_ids,
-                "distilled_turn": watermark,
-            }
-        )
-        write_node_file(node.model_copy(update={"metadata": metadata}), base_path=self.runtime_paths.base)
-        self._sync_transcript(path)
+    ) -> bool:
+        """Stamp only the exact content revision that was processed."""
+        with transcript_lock(self.runtime_paths.base, transcript.id, scope="mutation"):
+            node = self._load_transcript_from_disk(transcript.id)
+            if node is None:
+                return False
+            merged_ids = list(dict.fromkeys([*node.metadata.distilled_node_ids, *knowledge_ids]))
+            unchanged = content_sha256(node.content) == content_sha256(transcript.content)
+            updates: dict[str, Any] = {"distilled_node_ids": merged_ids}
+            if unchanged:
+                updates.update(
+                    distilled_hash=content_sha256(transcript.content) if mark_current else None,
+                    distilled_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    distilled_turn=distilled_turn if distilled_turn is not None else node.metadata.distilled_turn,
+                    deferred_hash=None,
+                    force_retry=None if mark_current else node.metadata.force_retry,
+                )
+            elif merged_ids == node.metadata.distilled_node_ids:
+                return False
+            metadata = node.metadata.model_copy(update=updates)
+            written = write_node_file(node.model_copy(update={"metadata": metadata}), base_path=self.runtime_paths.base)
+            self._sync_transcript(written)
+            return unchanged
+
+    def _defer_transcript(self, transcript: Node) -> bool:
+        """Remember a short revision without advancing its processed watermark."""
+        with transcript_lock(self.runtime_paths.base, transcript.id, scope="mutation"):
+            node = self._load_transcript_from_disk(transcript.id)
+            if node is None or node.metadata.force_retry or content_sha256(node.content) != content_sha256(transcript.content):
+                return False
+            metadata = node.metadata.model_copy(update={"deferred_hash": content_sha256(node.content)})
+            written = write_node_file(node.model_copy(update={"metadata": metadata}), base_path=self.runtime_paths.base)
+            self._sync_transcript(written)
+            return True
+
+    def _mark_force_retry(self, transcript: Node) -> None:
+        """Persist forced work so a failed short episode is retried by a sweep."""
+        with transcript_lock(self.runtime_paths.base, transcript.id, scope="mutation"):
+            node = self._load_transcript_from_disk(transcript.id)
+            if node is None or (node.metadata.force_retry and node.metadata.deferred_hash is None):
+                return
+            metadata = node.metadata.model_copy(update={"deferred_hash": None, "force_retry": True})
+            written = write_node_file(node.model_copy(update={"metadata": metadata}), base_path=self.runtime_paths.base)
+            self._sync_transcript(written)
+
+    def _transcript_path(self, node_id: str) -> Path | None:
+        """Return the on-disk path of a transcript, checking both trees."""
+
+        for candidate in (
+            self.runtime_paths.transcripts / f"{node_id}.md",
+            self.runtime_paths.active / f"{node_id}.md",
+        ):
+            if candidate.exists():
+                return candidate
+        return None
 
     def _load_transcript_from_disk(self, node_id: str) -> Node | None:
+        """Load a transcript by id from ``transcripts/`` (falling back to ``active/``)."""
+
         from synapse.storage import read_node_file
 
-        candidate = self.runtime_paths.active / f"{node_id}.md"
-        return read_node_file(candidate) if candidate.exists() else None
+        candidate = self._transcript_path(node_id)
+        return read_node_file(candidate) if candidate is not None else None
 
     def _sync_transcript(self, path: Path) -> None:
         from synapse.sync import SyncManager
 
         manager = SyncManager(self.config, runtime_paths=self.runtime_paths, logger=self._logger, debounce_seconds=0.0)
         try:
-            manager.sync_paths([str(path)])
+            result = manager.sync_paths([str(path)])
+            if result.failed:
+                raise SyncFailedError({"failed": result.failed, "details": list(result.details)})
         finally:
             manager.close()
 
@@ -277,36 +301,43 @@ class Distiller:
             updated_at = self._content_updated_at(node)
             if updated_at is None or updated_at > cutoff:
                 continue
-            if self._archive_transcript(node):
+            if self._archive_transcript(node, cutoff=cutoff):
                 archived += 1
         return archived
 
-    def _archive_transcript(self, node: Node) -> bool:
-        """Move a transcript to the archive and reconcile its index deletion."""
+    def _archive_transcript(self, node: Node, *, cutoff: datetime) -> bool:
+        """Move an unchanged, still-expired transcript under the shared locks."""
+        source_path = self._transcript_path(node.id) or (self.runtime_paths.base / node.file_path)
+        with transcript_lock(self.runtime_paths.base, node.id, scope="processing"):
+            with transcript_lock(self.runtime_paths.base, node.id, scope="mutation"):
+                current = self._load_transcript_from_disk(node.id)
+                if current is None or not is_session_transcript(current) or not is_distilled_current(current):
+                    return False
+                updated_at = self._content_updated_at(current)
+                if updated_at is None or updated_at > cutoff:
+                    return False
+                destination = archive_node_path(self.runtime_paths.archive, node.id)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    return False
+                source_path.replace(destination)
+                from synapse.sync import SyncManager
 
-        source_path = self.runtime_paths.base / node.file_path
-        if not source_path.exists():
-            return False
-        destination = archive_node_path(self.runtime_paths.archive, node.id)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            return False
-        source_path.replace(destination)
-        from synapse.sync import SyncManager
-
-        manager = SyncManager(self.config, runtime_paths=self.runtime_paths, logger=self._logger, debounce_seconds=0.0)
-        try:
-            manager.queue_event("delete", source_path)
-            manager.drain_pending(force=True)
-        finally:
-            manager.close()
-        self._logger.info(
-            "Archived distilled transcript",
-            extra={
-                "node_id": node.id,
-                "reason": "distilled-retention",
-                "source_path": str(source_path),
-                "archive_path": str(destination),
-            },
-        )
-        return True
+                manager = SyncManager(self.config, runtime_paths=self.runtime_paths, logger=self._logger, debounce_seconds=0.0)
+                try:
+                    manager.queue_event("delete", source_path)
+                    result = manager.drain_pending(force=True)
+                    if result.failed:
+                        raise SyncFailedError({"failed": result.failed, "details": list(result.details)})
+                finally:
+                    manager.close()
+                self._logger.info(
+                    "Archived distilled transcript",
+                    extra={
+                        "node_id": node.id,
+                        "reason": "distilled-retention",
+                        "source_path": str(source_path),
+                        "archive_path": str(destination),
+                    },
+                )
+                return True
