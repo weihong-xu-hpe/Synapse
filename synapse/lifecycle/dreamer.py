@@ -46,7 +46,7 @@ from synapse.storage import (
     locate_active_node_file,
     write_node_file,
 )
-from synapse.storage.markdown import extract_wiki_links
+from synapse.storage.markdown import WIKI_LINK_PATTERN, extract_wiki_links
 from synapse.storage.sqlite import DreamerRunMetrics
 from synapse.sync import SyncBatchResult, SyncManager
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
@@ -140,6 +140,7 @@ class DreamerReport:
     synthesized: tuple[SynthesisResult, ...] = field(default_factory=tuple)
     merged: tuple[MergeResult, ...] = field(default_factory=tuple)
     compacted: tuple[CompactionResult, ...] = field(default_factory=tuple)
+    repointed_links: int = 0
     deleted_archive_paths: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[DreamerWarning, ...] = field(default_factory=tuple)
     sync: SyncBatchResult = field(default_factory=SyncBatchResult)
@@ -320,8 +321,8 @@ class Dreamer:
         archived_ids, condensed_results = self._execute_triage(triage_decisions, store, warnings)
         self._execute_links(link_decisions, store, warnings)
         self._execute_conflicts(conflict_decisions, store, warnings)
+        repointed_links = self._repoint_superseded_links(store)
         archived_superseded_ids = self._archive_superseded(superseded, store, warnings)
-
         # Purge expired archives
         deleted_archive_paths = tuple(
             path.as_posix()
@@ -355,6 +356,7 @@ class Dreamer:
             synthesized=tuple(synthesis_results),
             merged=tuple(merge_results),
             compacted=tuple(compaction_results),
+            repointed_links=repointed_links,
             deleted_archive_paths=deleted_archive_paths,
             warnings=tuple(warnings),
             sync=sync_result,
@@ -1708,6 +1710,68 @@ class Dreamer:
         archived = self._archive_nodes(valid, reason="superseded", warnings=warnings)
         return [n.id for n in archived]
 
+
+    def _repoint_superseded_links(self, store: SQLiteNodeStore) -> int:
+        """Deterministically repoint ``[[old_id]]`` wiki links and ``sources`` to active chain terminals.
+
+        When Dreamer merges or retires nodes (Stage 4c/4d/5), inbound ``[[old_id]]``
+        links in surviving active nodes would otherwise dangle into ``.archive/``.
+        Follows ``superseded_by`` chains to live ACTIVE terminals and rewrites
+        referencing nodes in place before ``startup_sync`` rebuilds ``edges``.
+        """
+
+        superseded_nodes = store.find_by_status(NodeStatus.SUPERSEDED)
+        if not superseded_nodes:
+            return 0
+
+        remap: dict[str, str] = {}
+        for node in superseded_nodes:
+            if not node.metadata.superseded_by:
+                continue
+            terminal, outcome = self._resolve_supersession_chain(node, store)
+            if outcome == "terminal" and terminal is not None and self._is_live_active(terminal):
+                if terminal.id != node.id:
+                    remap[node.id] = terminal.id
+        if not remap:
+            return 0
+
+        def _replace_wiki_link(match: re.Match[str]) -> str:
+            raw = match.group(1)
+            target, sep, alias = raw.partition("|")
+            stripped = target.strip()
+            replacement = remap.get(stripped)
+            if replacement is None:
+                return match.group(0)
+            return f"[[{replacement}|{alias}]]" if sep else f"[[{replacement}]]"
+
+        repointed_count = 0
+        for node in store.find_by_status(NodeStatus.ACTIVE):
+            if not self._is_live_active(node):
+                continue
+            local_remap = {old: new for old, new in remap.items() if new != node.id}
+            if not local_remap:
+                continue
+
+            links_in_body = extract_wiki_links(node.content)
+            hits = sum(1 for link in links_in_body if link in local_remap)
+            new_content = WIKI_LINK_PATTERN.sub(_replace_wiki_link, node.content) if hits else node.content
+
+            old_sources = list(node.metadata.sources)
+            new_sources = list(dict.fromkeys(local_remap.get(src, src) for src in old_sources))
+            sources_changed = new_sources != old_sources
+
+            if new_content == node.content and not sources_changed:
+                continue
+
+            updated = node.model_copy(update={"content": new_content})
+            if sources_changed:
+                updated = self._with_metadata(updated, sources=new_sources)
+            self._persist(store, updated)
+            repointed_count += max(hits, 1 if sources_changed else 0)
+
+        if repointed_count:
+            self._logger.info("Repointed superseded wiki links", extra={"repointed_links": repointed_count})
+        return repointed_count
     # -- Disputed pair discovery --------------------------------------------
 
     def _find_disputed_pairs(self, store: SQLiteNodeStore) -> list[tuple[Node, Node]]:

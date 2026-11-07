@@ -372,6 +372,7 @@ class EpisodeDistiller:
         elif pending:
             run.deferred = True
 
+        lesson_rows = _cap_lessons_for_source_size(lesson_rows, len(source_text))
         run.lessons = [lesson.as_dict() for lesson in lesson_rows]
         return transcript, all_turns, pending, parsed.turns, global_user_spine, lesson_rows, run
 
@@ -1290,6 +1291,28 @@ def _parse_lessons(payload: Any) -> list[Lesson]:
         )
         result.append(Lesson(topic=topic, claim=claim, evidence_turns=evidence_turns, okf_type=okf_type))
     return result
+
+
+_SHORT_EPISODE_CHAR_THRESHOLD = 1500
+_SHORT_EPISODE_MAX_LESSONS = 3
+_LESSON_TYPE_PRIORITY = {"pitfall": 0, "decision": 1, "procedure": 2, "fact": 3}
+
+
+def _cap_lessons_for_source_size(lessons: list[Lesson], source_chars: int) -> list[Lesson]:
+    """Borges-map anti-bloat guard: prevent short transcripts from exploding into many nodes."""
+    if source_chars >= _SHORT_EPISODE_CHAR_THRESHOLD or len(lessons) <= _SHORT_EPISODE_MAX_LESSONS:
+        return lessons
+    indexed = list(enumerate(lessons))
+    ranked = sorted(
+        indexed,
+        key=lambda pair: (
+            -len(pair[1].evidence_turns),
+            _LESSON_TYPE_PRIORITY.get(pair[1].okf_type, 4),
+            pair[0],
+        ),
+    )[:_SHORT_EPISODE_MAX_LESSONS]
+    keep_indices = {idx for idx, _ in ranked}
+    return [lesson for idx, lesson in indexed if idx in keep_indices]
 def _parse_ops(payload: Any, lesson_count: int) -> list[EpisodeOp]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("ops"), list):
         raise ValueError("Integrate response must contain an ops array")

@@ -648,3 +648,55 @@ def test_cli_handbook_build_and_stats(tmp_path: Path) -> None:
     assert table_result.exit_code == 0, table_result.output
     assert "Consolidation ratio" in table_result.output
     assert "Wiki graph connectivity" in table_result.output
+
+
+def test_project_top_takeaways_prioritizes_multi_source_and_tracks_compression_ratio(tmp_path: Path) -> None:
+    from synapse.handbook import project_top_takeaways
+
+    config = _config(tmp_path)
+    store = _store(config)
+    try:
+        _seed_node(
+            store,
+            "mem_20261001_single-high-used",
+            title="Single source high used",
+            content="## Takeaway\nSingle source takeaway.\n\n## Details\nBody.\n\n## Sources\n- [[mem_s1]]\n",
+            sources=["mem_s1"],
+            project="synapse",
+            access_count=10,
+        )
+        _seed_node(
+            store,
+            "mem_20261002_multi-corroborated",
+            title="Multi source corroborated",
+            content="## Takeaway\nMulti source takeaway.\n\n## Details\nBody.\n\n## Sources\n- [[mem_s1]]\n- [[mem_s2]]\n",
+            sources=["mem_s1", "mem_s2"],
+            project="synapse",
+            access_count=1,
+        )
+        _seed_node(
+            store,
+            "mem_session_tx1",
+            title="Session summary — synapse",
+            content="## T1 User\n" + ("x" * 500),
+            okf_type=None,
+            node_type=NodeType.TRANSIENT,
+            session_key="tx1",
+        )
+        store.connection.commit()
+
+        index = project_top_takeaways(store, "Synapse", limit=5)
+        assert index["project"] == "synapse"
+        assert index["total_nodes"] == 2
+        assert [item["node_id"] for item in index["items"]] == [
+            "mem_20261002_multi-corroborated",
+            "mem_20261001_single-high-used",
+        ]
+        assert index["items"][0]["takeaway"] == "Multi source takeaway."
+
+        metrics = collect_north_star_metrics(store, runtime_paths=get_runtime_paths(config))
+        assert metrics["consolidation"]["compression_ratio"] is not None
+        assert metrics["consolidation"]["knowledge_bytes"] > 0
+        assert metrics["consolidation"]["transcript_bytes"] > 500
+    finally:
+        store.close()

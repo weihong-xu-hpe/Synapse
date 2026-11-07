@@ -1180,3 +1180,30 @@ def test_evidence_across_read_line_number_prefixes_verifies() -> None:
         turns=turns,
     )
     assert verified_fake == []
+
+
+def test_short_episode_lesson_cap_and_screen_readable_policy() -> None:
+    from synapse.lifecycle.episode_distiller import Lesson, _cap_lessons_for_source_size
+    from synapse.okf.episode import render_episode_integrate_prompt, render_episode_summary_prompt
+
+    summary_prompt = render_episode_summary_prompt(turns="## T1 User\nhi", global_user_spine="T1: hi")
+    integrate_prompt = render_episode_integrate_prompt(
+        lessons=[],
+        same_session_nodes=[],
+        retrieved_nodes=[],
+        evidence_context=[],
+        global_user_spine="T1: hi",
+    )
+    assert "screen-readable code literals" in summary_prompt
+    assert "screen-readable single-file code literals" in integrate_prompt
+
+    lessons = [
+        Lesson(topic="F1", claim="c1", evidence_turns=["T1"], okf_type="fact"),
+        Lesson(topic="P1", claim="c2", evidence_turns=["T1"], okf_type="pitfall"),
+        Lesson(topic="D1", claim="c3", evidence_turns=["T1", "T2"], okf_type="decision"),
+        Lesson(topic="F2", claim="c4", evidence_turns=["T1"], okf_type="fact"),
+        Lesson(topic="PR1", claim="c5", evidence_turns=["T1"], okf_type="procedure"),
+    ]
+    capped = _cap_lessons_for_source_size(lessons, 900)
+    assert [l.topic for l in capped] == ["P1", "D1", "PR1"]
+    assert len(_cap_lessons_for_source_size(lessons, 2000)) == 5

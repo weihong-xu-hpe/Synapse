@@ -32,6 +32,8 @@ from synapse.models import (
     NodeType,
     clean_slug,
     infer_project,
+    normalize_project_slug,
+    project_domains,
 )
 from synapse.okf import _split_sections
 from synapse.okf.transcripts import is_session_transcript
@@ -102,6 +104,59 @@ def _multi_source(nodes: list[Node]) -> list[Node]:
         key=lambda n: (-len(_sources(n)), -n.metadata.access_count, n.id),
     )
 
+
+def resolve_project_slug(raw_project: str) -> str:
+    """Resolve a workspace directory or project name to its canonical handbook slug."""
+
+    slug = normalize_project_slug(raw_project)
+    if slug == _FALLBACK_PROJECT:
+        return _FALLBACK_PROJECT
+    low = raw_project.strip().lower()
+    for domain_slug, markers in project_domains():
+        if slug == domain_slug or any(marker in low for marker in markers):
+            return domain_slug
+    return slug
+
+
+def project_top_takeaways(
+    store: SQLiteNodeStore,
+    project: str,
+    *,
+    limit: int = 6,
+) -> dict[str, Any]:
+    """Return top corroborated/high-utility takeaways for *project* (session header index)."""
+
+    target_project = resolve_project_slug(project)
+    capped_limit = max(1, min(int(limit), 20))
+    matched = [
+        node
+        for node in _knowledge_nodes(store)
+        if infer_project(node) == target_project
+    ]
+    multi = _multi_source(matched)
+    multi_ids = {node.id for node in multi}
+    single = sorted(
+        (node for node in matched if node.id not in multi_ids),
+        key=lambda n: (-n.metadata.used_count, -n.metadata.access_count, n.id),
+    )
+    selected = (multi + single)[:capped_limit]
+    items: list[dict[str, Any]] = []
+    for node in selected:
+        sections = _split_sections(node.content)
+        items.append(
+            {
+                "node_id": node.id,
+                "title": node.title,
+                "okf_type": node.metadata.okf_type or "fact",
+                "takeaway": _takeaway(node, sections),
+                "sources_count": len(_sources(node)),
+            }
+        )
+    return {
+        "project": target_project,
+        "total_nodes": len(matched),
+        "items": items,
+    }
 
 def _page_link(node: Node, okf_type: str) -> str:
     if okf_type in {"fact", "procedure"}:

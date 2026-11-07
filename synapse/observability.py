@@ -125,14 +125,7 @@ def collect_daily_snapshot(
                 {
                     "nodes": _node_counts(store),
                     "transcripts": _transcript_counts(store),
-                    "storage": {
-                        "db_bytes": (runtime_paths.base / "synapse.db").stat().st_size
-                        if (runtime_paths.base / "synapse.db").exists()
-                        else 0,
-                        "active_bytes": _dir_size(runtime_paths.active),
-                        "transcripts_bytes": _dir_size(runtime_paths.transcripts),
-                        "archive_bytes": _dir_size(runtime_paths.archive),
-                    },
+                    "storage": _storage_metrics(runtime_paths),
                     # §6.5 north-star trend series ride the stock block: they
                     # are stock metrics (current graph/usage state), so they
                     # follow exactly the same captured-this-day semantics.
@@ -152,6 +145,25 @@ def collect_daily_snapshot(
         if owns_store:
             store.close()
 
+
+
+def _storage_metrics(runtime_paths: RuntimePaths) -> dict[str, Any]:
+    db_bytes = (
+        (runtime_paths.base / "synapse.db").stat().st_size
+        if (runtime_paths.base / "synapse.db").exists()
+        else 0
+    )
+    active_bytes = _dir_size(runtime_paths.active)
+    transcripts_bytes = _dir_size(runtime_paths.transcripts)
+    archive_bytes = _dir_size(runtime_paths.archive)
+    compression_ratio = round(active_bytes / transcripts_bytes, 4) if transcripts_bytes > 0 else None
+    return {
+        "db_bytes": db_bytes,
+        "active_bytes": active_bytes,
+        "transcripts_bytes": transcripts_bytes,
+        "archive_bytes": archive_bytes,
+        "compression_ratio": compression_ratio,
+    }
 
 def _node_counts(store: SQLiteNodeStore) -> dict[str, Any]:
     by_status: dict[str, int] = {}
@@ -1140,11 +1152,14 @@ def _north_star_consolidation(store: SQLiteStoreLike) -> dict[str, Any]:
 
     multi = 0
     single = 0
+    knowledge_bytes = 0
+    transcript_bytes = 0
     try:
         rows = store.connection.execute(
             """
             SELECT json_array_length(json_extract(okf_meta, '$.sources')) AS source_count,
-                   COUNT(*) AS count
+                   COUNT(*) AS count,
+                   COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) AS total_bytes
             FROM nodes
             WHERE type = 'persistent'
               AND id NOT LIKE 'mem\\_session\\_%' ESCAPE '\\'
@@ -1155,10 +1170,21 @@ def _north_star_consolidation(store: SQLiteStoreLike) -> dict[str, Any]:
         ).fetchall()
         for row in rows:
             count = int(row["count"])
+            knowledge_bytes += int(row["total_bytes"] or 0)
             if int(row["source_count"] or 0) >= 2:
                 multi += count
             else:
                 single += count
+        tx_row = store.connection.execute(
+            """
+            SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) AS total_bytes
+            FROM nodes
+            WHERE id LIKE 'mem\\_session\\_%' ESCAPE '\\'
+               OR (type = 'transient' AND title LIKE 'Session summary%')
+            """
+        ).fetchone()
+        if tx_row is not None:
+            transcript_bytes = int(tx_row["total_bytes"] or 0)
     except Exception:  # noqa: BLE001
         pass
     total = multi + single
@@ -1167,6 +1193,9 @@ def _north_star_consolidation(store: SQLiteStoreLike) -> dict[str, Any]:
         "single_source_nodes": single,
         "total_knowledge_nodes": total,
         "consolidation_ratio": _ratio(multi, total),
+        "knowledge_bytes": knowledge_bytes,
+        "transcript_bytes": transcript_bytes,
+        "compression_ratio": _ratio(knowledge_bytes, transcript_bytes),
         "target": "> 0.50",
     }
 
@@ -1439,6 +1468,7 @@ def render_north_star_stats(metrics: dict[str, Any]) -> str:
         f"| Single-source knowledge nodes | {consolidation.get('single_source_nodes', 0)} |",
         f"| Total knowledge nodes | {consolidation.get('total_knowledge_nodes', 0)} |",
         f"| **Consolidation ratio** | **{_fmt_rate(consolidation.get('consolidation_ratio'))}** |",
+        f"| Compression ratio (knowledge/transcript bytes) | {_fmt_rate(consolidation.get('compression_ratio'))} |",
         "",
         "## 2. Recall signal-to-noise",
         "",

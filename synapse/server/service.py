@@ -477,6 +477,16 @@ class SynapseServerService:
         self._log_tool_call("search_memory", {"query": query, "top_k": top_k, "include": include}, payload)
         return payload
 
+    def get_project_index(self, project: str, *, limit: int = 6) -> dict[str, Any]:
+        """Return top takeaways for *project* to preemptively orient new sessions."""
+
+        from synapse.handbook import project_top_takeaways
+
+        if not project or not project.strip():
+            return {"project": "general", "total_nodes": 0, "items": []}
+        with self._store() as store:
+            return project_top_takeaways(store, project.strip(), limit=limit)
+
     def _record_search_event(
         self,
         *,

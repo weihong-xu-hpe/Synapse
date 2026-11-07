@@ -348,3 +348,48 @@ def test_synthesis_skips_small_clusters(tmp_path: Path) -> None:
         assert client.calls == []
     finally:
         dreamer.close()
+
+
+def test_repoint_superseded_links_updates_wiki_links_and_sources(tmp_path: Path) -> None:
+    """When A -> B -> C (ACTIVE), active node D referencing [[mem_a]] and source mem_a
+    is deterministically repointed to [[mem_c]] and source mem_c."""
+    from synapse.storage import locate_active_node_file, read_node_file, write_node_file
+
+    config, runtime_paths = make_runtime(tmp_path)
+    dreamer = make_dreamer(tmp_path)
+    store = dreamer._get_store()
+    try:
+        node_a = make_node("mem_a", status=NodeStatus.SUPERSEDED).model_copy(
+            update={"metadata": NodeMetadata(id="mem_a", title="Node A", status=NodeStatus.SUPERSEDED, superseded_by="mem_b")}
+        )
+        node_b = make_node("mem_b", status=NodeStatus.SUPERSEDED).model_copy(
+            update={"metadata": NodeMetadata(id="mem_b", title="Node B", status=NodeStatus.SUPERSEDED, superseded_by="mem_c")}
+        )
+        node_c = make_node("mem_c", status=NodeStatus.ACTIVE)
+        node_d = Node(
+            metadata=NodeMetadata(
+                id="mem_d",
+                title="Referencing node D",
+                status=NodeStatus.ACTIVE,
+                type=NodeType.PERSISTENT,
+                sources=["mem_a"],
+            ),
+            content="See [[mem_a]] and [[mem_b|Alias B]] for details.",
+            file_path=Path("active/mem_d.md"),
+        )
+        for n in (node_a, node_b, node_c, node_d):
+            write_node_file(n, base_path=runtime_paths.base)
+            store.upsert_node(n)
+
+        repointed = dreamer._repoint_superseded_links(store)
+        assert repointed == 2
+
+        d_path = locate_active_node_file(runtime_paths.base, "mem_d")
+        assert d_path is not None
+        updated_d = read_node_file(d_path)
+        assert "[[mem_c]]" in updated_d.content
+        assert "[[mem_c|Alias B]]" in updated_d.content
+        assert "[[mem_a]]" not in updated_d.content
+        assert updated_d.metadata.sources == ["mem_c"]
+    finally:
+        dreamer.close()

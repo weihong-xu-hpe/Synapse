@@ -382,6 +382,24 @@ def _create_rest_search_handler(service: SynapseServerService):
     return search_memory
 
 
+def _create_rest_project_index_handler(service: SynapseServerService):
+    """Return top project takeaways for session-start context orientation."""
+
+    async def project_index(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        project = str(body.get("project") or request.query_params.get("project") or "").strip()
+        limit = int(body.get("limit") or request.query_params.get("limit") or 6)
+        result = await run_in_threadpool(service.get_project_index, project, limit=limit)
+        return JSONResponse(status_code=200, content=result)
+
+    return project_index
+
+
 def _create_rest_write_handler(service: SynapseServerService):
     """Thin REST wrapper for non-MCP clients (e.g. omp hooks)."""
 
@@ -713,6 +731,7 @@ def create_app(config, *, runtime_paths=None, logger=None, sampling_client=None,
     app.get("/health")(_create_health_handler())
     app.post("/api/search")(_create_rest_search_handler(service))
     app.post("/api/write")(_create_rest_write_handler(service))
+    app.post("/api/project-index")(_create_rest_project_index_handler(service))
     app.post("/api/episode/close")(
         _create_episode_close_handler(config, service.runtime_paths, logger or service.logger, service)
     )
