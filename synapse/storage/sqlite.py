@@ -195,6 +195,7 @@ OKF_META_FIELDS = (
     "verified",
     "t_valid",
     "t_invalid",
+    "compaction_attempted_hash",
 )
 
 
@@ -1267,24 +1268,25 @@ class SQLiteNodeStore:
         ).fetchall()
         return [str(row["id"]) for row in rows]
 
-    def find_synthesis_clusters(
+    @staticmethod
+    def _cluster_project_key(node: Node, *, project_mode: str = "explicit_slug") -> str:
+        from synapse.models import infer_project, normalize_project_slug
+
+        if project_mode == "inferred":
+            return infer_project(node)
+        raw = (node.metadata.project or "").strip()
+        if not raw:
+            return ""
+        if project_mode == "raw":
+            return raw
+        return normalize_project_slug(raw)
+
+    def _load_typed_embeddings(
         self,
         *,
-        cosine_threshold: float = 0.80,
-        min_size: int = 4,
-        max_size: int = 20,
-    ) -> list[list[Node]]:
-        """Cluster active typed (okf_type set, non-transcript) nodes by embedding similarity.
-
-        Connected components over the similarity graph (edge when cosine >=
-        threshold), grouped per ``project``; components outside
-        [min_size, max_size] are skipped. Hub nodes (tagged in Sources with a
-        member id already covered by an existing hub) must not re-cluster as
-        members — callers exclude them before invoking; this query already
-        excludes nodes whose content contains a ``From:``-style hub marker via
-        the caller's filter.
-        """
-
+        min_size: int,
+        exclude_hubs: bool = False,
+    ) -> tuple[dict[str, Node], dict[str, list[float]]]:
         rows = self._connection.execute(
             """
             SELECT n.id
@@ -1297,13 +1299,15 @@ class SQLiteNodeStore:
         ).fetchall()
         candidate_ids = [str(row["id"]) for row in rows]
         if len(candidate_ids) < min_size:
-            return []
+            return {}, {}
 
         embeddings: dict[str, list[float]] = {}
         nodes: dict[str, Node] = {}
         for node_id in candidate_ids:
             node = self.get_node(node_id)
             if node is None or not node.metadata.okf_type:
+                continue
+            if exclude_hubs and "dreamer-hub" in node.metadata.tags:
                 continue
             vec_row = self._connection.execute(
                 "SELECT embedding FROM nodes_vec WHERE id = ?", [node_id]
@@ -1315,8 +1319,22 @@ class SQLiteNodeStore:
             except (json.JSONDecodeError, TypeError):
                 continue
             nodes[node_id] = node
+        return nodes, embeddings
 
-        # Union-find over similarity edges.
+    def find_synthesis_clusters(
+        self,
+        *,
+        cosine_threshold: float = 0.80,
+        min_size: int = 4,
+        max_size: int = 20,
+        exclude_hubs: bool = False,
+    ) -> list[list[Node]]:
+        """Cluster active typed (okf_type set, non-transcript) nodes by embedding similarity."""
+
+        nodes, embeddings = self._load_typed_embeddings(min_size=min_size, exclude_hubs=exclude_hubs)
+        if len(embeddings) < min_size:
+            return []
+
         parent: dict[str, str] = {node_id: node_id for node_id in embeddings}
 
         def find(x: str) -> str:
@@ -1331,14 +1349,13 @@ class SQLiteNodeStore:
                 parent[rb] = ra
 
         ids = sorted(embeddings)
-        for i, id_a in enumerate(ids):
-            for id_b in ids[i + 1 :]:
-                # Same-project constraint: nodes only cluster within a project.
-                if (nodes[id_a].metadata.project or "") != (nodes[id_b].metadata.project or ""):
-                    continue
-                similarity = _safe_cosine_similarity(embeddings[id_a], embeddings[id_b])
-                if similarity is not None and similarity >= cosine_threshold:
-                    union(id_a, id_b)
+        by_project: dict[str, list[str]] = {}
+        for node_id in ids:
+            by_project.setdefault(nodes[node_id].metadata.project or "", []).append(node_id)
+        # Same-project constraint: nodes only cluster within a project.
+        for group in by_project.values():
+            for id_a, id_b, _similarity in _similar_pairs(group, embeddings, cosine_threshold):
+                union(id_a, id_b)
 
         components: dict[str, list[str]] = {}
         for node_id in ids:
@@ -1349,6 +1366,79 @@ class SQLiteNodeStore:
             if not (min_size <= len(member_ids) <= max_size):
                 continue
             clusters.append([nodes[member_id] for member_id in sorted(member_ids)])
+        clusters.sort(key=lambda cluster: cluster[0].id)
+        return clusters
+
+    def find_complete_linkage_clusters(
+        self,
+        *,
+        cosine_threshold: float = 0.86,
+        floor_cosine: float = 0.84,
+        min_size: int = 2,
+        max_size: int = 6,
+        project_mode: str = "explicit_slug",
+        exclude_hubs: bool = True,
+    ) -> list[list[Node]]:
+        """Deterministic diameter-bounded complete-linkage clusters per project."""
+
+        nodes, embeddings = self._load_typed_embeddings(min_size=min_size, exclude_hubs=exclude_hubs)
+        if len(embeddings) < min_size:
+            return []
+
+        by_project: dict[str, list[str]] = {}
+        for node_id in sorted(embeddings):
+            key = self._cluster_project_key(nodes[node_id], project_mode=project_mode)
+            by_project.setdefault(key, []).append(node_id)
+
+        clusters: list[list[Node]] = []
+        for key in sorted(by_project):
+            group = by_project[key]
+            if len(group) < min_size:
+                continue
+            sims: dict[tuple[str, str], float] = {}
+            seed_edges: list[tuple[float, str, str]] = []
+            for id_a, id_b, sim in _similar_pairs(group, embeddings, floor_cosine):
+                sims[(id_a, id_b)] = sim
+                if sim >= cosine_threshold:
+                    seed_edges.append((sim, id_a, id_b))
+            if not seed_edges:
+                continue
+            seed_edges.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+            assigned: set[str] = set()
+            for _sim, id_a, id_b in seed_edges:
+                if id_a in assigned or id_b in assigned:
+                    continue
+                members = [id_a, id_b]
+                assigned.add(id_a)
+                assigned.add(id_b)
+                while len(members) < max_size:
+                    best_cand: str | None = None
+                    best_min_sim = -1.0
+                    for cand in group:
+                        if cand in assigned:
+                            continue
+                        pair_sims: list[float] = []
+                        valid = True
+                        for m in members:
+                            pair = (cand, m) if cand < m else (m, cand)
+                            s = sims.get(pair)
+                            if s is None or s < floor_cosine:
+                                valid = False
+                                break
+                            pair_sims.append(s)
+                        if not valid or not any(s >= cosine_threshold for s in pair_sims):
+                            continue
+                        min_pair = min(pair_sims)
+                        if min_pair > best_min_sim or (min_pair == best_min_sim and (best_cand is None or cand < best_cand)):
+                            best_min_sim = min_pair
+                            best_cand = cand
+                    if best_cand is None:
+                        break
+                    members.append(best_cand)
+                    assigned.add(best_cand)
+                if len(members) >= min_size:
+                    clusters.append([nodes[mid] for mid in sorted(members)])
         clusters.sort(key=lambda cluster: cluster[0].id)
         return clusters
 
@@ -2020,6 +2110,42 @@ def _safe_cosine_similarity(left: list[float], right: list[float]) -> float | No
         return 1.0 - _cosine_distance(left, right)
     except ValueError:
         return None
+
+
+def _similar_pairs(
+    ids: list[str],
+    embeddings: dict[str, list[float]],
+    min_similarity: float,
+    *,
+    block_rows: int = 512,
+) -> list[tuple[str, str, float]]:
+    """Every pair ``(ids[i], ids[j])`` with ``i < j`` whose similarity is >= *min_similarity*.
+
+    Vectorised equivalent of looping ``_safe_cosine_similarity`` over all pairs.
+    Embeddings are stored unit-length, so (as in ``_cosine_distance``) the raw dot
+    product is the similarity: float64, clamped to [-1, 1] and rounded exactly as
+    the scalar helper does. Vectors of different length never match. Rows are
+    scanned in blocks so a large project group never builds one n x n matrix.
+    """
+
+    by_dim: dict[int, list[int]] = {}
+    for index, node_id in enumerate(ids):
+        by_dim.setdefault(len(embeddings[node_id]), []).append(index)
+
+    pairs: list[tuple[str, str, float]] = []
+    for positions in by_dim.values():
+        if len(positions) < 2:
+            continue
+        matrix = np.asarray([embeddings[ids[p]] for p in positions], dtype=np.float64)
+        for start in range(0, len(positions), block_rows):
+            block = matrix[start : start + block_rows] @ matrix.T
+            sims = 1.0 - np.round(1.0 - np.clip(block, -1.0, 1.0), 8)
+            rows, cols = np.nonzero(sims >= min_similarity)
+            for row, col in zip(rows.tolist(), cols.tolist()):
+                first = start + row
+                if col > first:  # upper triangle only; ids are sorted, so ids[first] < ids[col]
+                    pairs.append((ids[positions[first]], ids[positions[col]], float(sims[row, col])))
+    return pairs
 
 
 def _round_optional(value: Any) -> float:

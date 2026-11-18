@@ -1183,3 +1183,36 @@ def test_gatekeeper_credentials_are_scrubbed_from_the_written_node(tmp_path: Pat
         assert stored.metadata.verified is True
     finally:
         runner.close()
+
+
+def test_credit_retrieved_usage_excludes_passive_related_ids(tmp_path: Path) -> None:
+    """Only action=='updated' target_id increments used_count; related_ids must not."""
+    config, paths, transcript = _setup(tmp_path)
+    runner = _runner(config, paths, FakeClient())
+    try:
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            t_node = Node(
+                metadata=NodeMetadata(id="mem_target", title="Target", type=NodeType.PERSISTENT, okf_type="fact"),
+                content="## Takeaway\n\nTarget\n\n## Details\n\nTarget\n",
+                file_path=Path("active/mem_target.md"),
+            )
+            r_node = Node(
+                metadata=NodeMetadata(id="mem_related", title="Related", type=NodeType.PERSISTENT, okf_type="fact"),
+                content="## Takeaway\n\nRelated\n\n## Details\n\nRelated\n",
+                file_path=Path("active/mem_related.md"),
+            )
+            store.upsert_node(t_node)
+            store.upsert_node(r_node)
+
+        run = EpisodeRun(transcript.id, transcript.metadata.session_key, "ep-1", 10, 1, 1)
+        run.ops = [
+            {"action": "updated", "target_id": "mem_target", "node_id": "mem_target", "related_ids": ["mem_related"]},
+            {"action": "created", "node_id": "mem_new", "related_ids": ["mem_related"]},
+        ]
+        runner._credit_retrieved_usage(run)
+
+        with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
+            assert store.get_node("mem_target").metadata.used_count == 1
+            assert store.get_node("mem_related").metadata.used_count == 0
+    finally:
+        runner.close()

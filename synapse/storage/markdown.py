@@ -227,6 +227,21 @@ def node_to_markdown(node: Node, *, include_banners: bool = True, supersession_r
 
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort fsync of a directory fd on POSIX after rename/create."""
+
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def atomic_write_text(path: str | Path, content: str, *, encoding: str = "utf-8") -> Path:
     """Write text atomically by replacing the destination with a sibling temp file."""
 
@@ -248,6 +263,7 @@ def atomic_write_text(path: str | Path, content: str, *, encoding: str = "utf-8"
             os.fsync(handle.fileno())
             temp_path = Path(handle.name)
         os.replace(temp_path, destination)
+        _fsync_directory(destination.parent)
     finally:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink(missing_ok=True)

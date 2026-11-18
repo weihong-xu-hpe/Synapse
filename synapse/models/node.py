@@ -144,6 +144,8 @@ class NodeMetadata(BaseModel):
     # node was deterministically verified against the source transcript.
     # Absent on pre-existing nodes — treated as unverified-only-if-present.
     verified: bool | None = None
+    # Content hash of the oversized revision that already failed/resisted compaction.
+    compaction_attempted_hash: str | None = None
     tags: list[str] = Field(default_factory=list)
     sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
 

@@ -393,3 +393,212 @@ def test_repoint_superseded_links_updates_wiki_links_and_sources(tmp_path: Path)
         assert updated_d.metadata.sources == ["mem_c"]
     finally:
         dreamer.close()
+
+
+def test_archive_divergent_collision_quarantines_and_preserves_canonical(tmp_path: Path) -> None:
+    """When canonical .archive/<id>.md already exists with divergent content,
+    quarantine the old file to .archive/.collisions/ and promote the retiring file."""
+    from synapse.storage import archive_node_path, read_node_file, write_node_file
+
+    config, runtime_paths = make_runtime(tmp_path)
+    dreamer = make_dreamer(tmp_path)
+    try:
+        old_arch = Node(
+            metadata=NodeMetadata(
+                id="mem_col_1",
+                title="Collision Node",
+                type=NodeType.PERSISTENT,
+                status=NodeStatus.SUPERSEDED,
+                superseded_by="mem_old_winner",
+            ),
+            content="Old archived snapshot",
+        )
+        arch_path = archive_node_path(runtime_paths.archive, "mem_col_1")
+        arch_path.parent.mkdir(parents=True, exist_ok=True)
+        arch_path.write_text(f"---\nid: mem_col_1\ntitle: Collision Node\nstatus: superseded\nsuperseded_by: mem_old_winner\n---\n\nOld archived snapshot\n", encoding="utf-8")
+
+        active_retiring = Node(
+            metadata=NodeMetadata(
+                id="mem_col_1",
+                title="Collision Node",
+                type=NodeType.PERSISTENT,
+                status=NodeStatus.SUPERSEDED,
+                superseded_by="mem_new_winner",
+            ),
+            content="Newer retiring body",
+        )
+        written = write_node_file(active_retiring, base_path=runtime_paths.base)
+        retiring = active_retiring.model_copy(update={"file_path": written.relative_to(runtime_paths.base)})
+        warnings: list = []
+        archived = dreamer._archive_nodes([retiring], reason="semantic_merge", warnings=warnings)
+        assert len(archived) == 1
+        assert not any(w.code == "archive_collision" for w in warnings)
+        assert not written.exists()
+        canonical = read_node_file(arch_path)
+        assert canonical.metadata.superseded_by == "mem_new_winner"
+        collisions = list((runtime_paths.archive / ".collisions").glob("mem_col_1.*.md"))
+        assert len(collisions) == 1
+        assert read_node_file(collisions[0]).metadata.superseded_by == "mem_old_winner"
+    finally:
+        dreamer.close()
+
+
+def test_complete_linkage_prevents_chaining_and_respects_project_mode(tmp_path: Path) -> None:
+    """Complete-linkage rejects transitive A-B-C chains when cos(A,C) < floor_cosine."""
+    config, runtime_paths = make_runtime(tmp_path)
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        a = _typed_cluster_node("mem_a").model_copy(update={"metadata": _typed_cluster_node("mem_a").metadata.model_copy(update={"project": "Synapse"})})
+        b = _typed_cluster_node("mem_b").model_copy(update={"metadata": _typed_cluster_node("mem_b").metadata.model_copy(update={"project": "synapse"})})
+        c = _typed_cluster_node("mem_c").model_copy(update={"metadata": _typed_cluster_node("mem_c").metadata.model_copy(update={"project": "synapse"})})
+        # A=(1,0,0), B=(0.9, 0.43589, 0), C=(0.62, 0.7846, 0): cos(A,B)=0.9, cos(B,C)~0.9, cos(A,C)=0.62 < 0.84
+        store.upsert_node(a, embedding=[1.0, 0.0, 0.0])
+        store.upsert_node(b, embedding=[0.92, 0.391918, 0.0])
+        store.upsert_node(c, embedding=[0.64, 0.768375, 0.0])
+
+        clusters = store.find_complete_linkage_clusters(
+            cosine_threshold=0.86,
+            floor_cosine=0.84,
+            min_size=2,
+            max_size=6,
+            project_mode="explicit_slug",
+        )
+        assert len(clusters) == 1
+        assert [n.id for n in clusters[0]] == ["mem_a", "mem_b"]
+
+
+def test_three_way_provenance_excludes_unknown_and_cycles(tmp_path: Path) -> None:
+    """Same-root dedups and unknown/cyclic leaves must not inflate verified_independent_multi_source."""
+    from synapse.observability import _three_way_provenance_stats
+
+    config, runtime_paths = make_runtime(tmp_path)
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        # 1) Real 2-session node
+        n1 = _typed_cluster_node("mem_real").model_copy(
+            update={"metadata": _typed_cluster_node("mem_real").metadata.model_copy(update={"sources": ["mem_session_1", "mem_session_2"]})}
+        )
+        # 2) Same-root dedup (two intermediates from one session)
+        m1 = _typed_cluster_node("mem_m1").model_copy(
+            update={"metadata": _typed_cluster_node("mem_m1").metadata.model_copy(update={"sources": ["mem_session_x"], "status": NodeStatus.SUPERSEDED})}
+        )
+        m2 = _typed_cluster_node("mem_m2").model_copy(
+            update={"metadata": _typed_cluster_node("mem_m2").metadata.model_copy(update={"sources": ["mem_session_x"], "status": NodeStatus.SUPERSEDED})}
+        )
+        n2 = _typed_cluster_node("mem_dedup").model_copy(
+            update={"metadata": _typed_cluster_node("mem_dedup").metadata.model_copy(update={"sources": ["mem_m1", "mem_m2"]})}
+        )
+        # 3) Unknown + cycle node
+        n3 = _typed_cluster_node("mem_unk").model_copy(
+            update={"metadata": _typed_cluster_node("mem_unk").metadata.model_copy(update={"sources": ["mem_missing_leaf", "mem_unk"]})}
+        )
+        for n in (n1, m1, m2, n2, n3):
+            store.upsert_node(n)
+
+        stats = _three_way_provenance_stats(store, runtime_paths=runtime_paths)
+        assert stats["verified_independent_multi_source"] == 1
+        assert stats["same_root_dedup_count"] == 1
+        assert stats["unknown_or_cyclic_provenance_count"] == 1
+
+
+def test_eval_strict_stale_as_miss_scores_zero_on_missing_and_follows_archive(tmp_path: Path) -> None:
+    """resolve_labels follows superseded_by in .archive/<id>.md; strict_stale_as_miss=True scores missing queries as 0.0."""
+    from synapse.eval.golden import GoldenQuery, RelevantDoc
+    from synapse.eval.harness import EvalReport, QueryResult, resolve_labels
+    from synapse.retrieval import RetrievalPipeline
+    from synapse.storage import archive_node_path, write_node_file
+
+    config, runtime_paths = make_runtime(tmp_path)
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        winner = _typed_cluster_node("mem_winner")
+        write_node_file(winner, base_path=runtime_paths.base)
+        store.upsert_node(winner)
+
+    arch_path = archive_node_path(runtime_paths.archive, "mem_retired")
+    arch_path.parent.mkdir(parents=True, exist_ok=True)
+    arch_path.write_text(
+        "---\nid: mem_retired\ntitle: Retired\nstatus: superseded\nsuperseded_by: mem_winner\n---\n\nOld\n",
+        encoding="utf-8",
+    )
+
+    queries = [
+        GoldenQuery(id="q1", query="kafka", relevant=(RelevantDoc(node_id="mem_retired", tier="must"),)),
+        GoldenQuery(id="q2", query="gone", relevant=(RelevantDoc(node_id="mem_deleted", tier="must"),)),
+    ]
+    with RetrievalPipeline(config, runtime_paths=runtime_paths) as pipeline:
+        resolved, stale, no_label = resolve_labels(queries, pipeline, archive_dir=runtime_paths.archive)
+    assert [d.node_id for d in resolved["q1"].relevant] == ["mem_winner"]
+    assert stale["q1"] == 0
+    assert no_label == ["q2"]
+
+    r1 = QueryResult(query_id="q1", slice="en", recall5=1.0, mrr10=1.0, top1_relevant=True)
+    r2 = QueryResult(query_id="q2", slice="en", recall5=0.0, mrr10=0.0, top1_relevant=False)
+    non_strict = EvalReport(per_query=[r1, r2], queries_without_labels=["q2"], strict_stale_as_miss=False).to_dict()
+    strict = EvalReport(per_query=[r1, r2], queries_without_labels=["q2"], strict_stale_as_miss=True).to_dict()
+    assert non_strict["overall"]["recall@5"] == 1.0
+    assert strict["overall"]["recall@5"] == 0.5
+
+
+def test_archive_collision_crash_recovery_startup_sync(tmp_path: Path) -> None:
+    """Simulate crash between canonical replacement and source unlink; startup_sync keeps canonical superseded intact."""
+    from synapse.storage import archive_node_path, read_node_file, write_node_file
+    from synapse.sync import SyncManager
+
+    config, runtime_paths = make_runtime(tmp_path)
+    retired = Node(
+        metadata=NodeMetadata(
+            id="mem_crash_1",
+            title="Crash Node",
+            type=NodeType.PERSISTENT,
+            status=NodeStatus.SUPERSEDED,
+            superseded_by="mem_winner_final",
+        ),
+        content="Retiring node body",
+    )
+    active_path = write_node_file(retired, base_path=runtime_paths.base)
+    arch_path = archive_node_path(runtime_paths.archive, "mem_crash_1")
+    arch_path.parent.mkdir(parents=True, exist_ok=True)
+    arch_path.write_text(active_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+        SyncManager(config, runtime_paths=runtime_paths, store=store, debounce_seconds=0.0).startup_sync()
+        loaded = store.get_node("mem_crash_1")
+        assert loaded is not None
+        assert loaded.metadata.status is NodeStatus.SUPERSEDED
+        assert loaded.metadata.superseded_by == "mem_winner_final"
+        assert read_node_file(arch_path).metadata.superseded_by == "mem_winner_final"
+
+
+def test_similar_pairs_matches_scalar_cosine_for_every_pair() -> None:
+    """The numpy scan must return exactly the pairs the scalar helper would, across block boundaries."""
+    import random
+
+    from synapse.storage.sqlite import _safe_cosine_similarity, _similar_pairs
+
+    rng = random.Random(3)
+
+    def unit(dim: int) -> list[float]:
+        v = [rng.gauss(0, 1) for _ in range(dim)]
+        norm = sum(x * x for x in v) ** 0.5
+        return [x / norm for x in v]
+
+    base = unit(16)
+    embeddings: dict[str, list[float]] = {}
+    for i in range(40):
+        v = [b + rng.gauss(0, 0.15) for b in base] if i % 2 else unit(16)  # near-duplicates mixed with noise
+        norm = sum(x * x for x in v) ** 0.5
+        embeddings[f"n{i:02d}"] = [x / norm for x in v]
+    embeddings["odd_dim"] = unit(8)  # a different length must never match anything
+    ids = sorted(embeddings)
+
+    for threshold in (0.0, 0.5, 0.84, 0.9):
+        expected: dict[tuple[str, str], float] = {}
+        for index, id_a in enumerate(ids):
+            for id_b in ids[index + 1 :]:
+                similarity = _safe_cosine_similarity(embeddings[id_a], embeddings[id_b])
+                if similarity is not None and similarity >= threshold:
+                    expected[(id_a, id_b)] = similarity
+        got = {(a, b): s for a, b, s in _similar_pairs(ids, embeddings, threshold, block_rows=7)}
+        assert got.keys() == expected.keys()
+        assert all(abs(got[key] - expected[key]) < 1e-9 for key in got)
+        if threshold == 0.5:
+            assert expected, "test data must produce pairs or the comparison is vacuous"
+        assert not any("odd_dim" in key for key in got)

@@ -57,7 +57,7 @@ class EvalReport:
     stale_labels_total: int = 0
     # Query ids whose labels were ALL stale — reported, not scored as misses.
     queries_without_labels: list[str] = field(default_factory=list)
-
+    strict_stale_as_miss: bool = False
     def to_dict(self) -> dict[str, Any]:
         def _mean(values: list[float]) -> float:
             return sum(values) / len(values) if values else 0.0
@@ -115,7 +115,10 @@ class EvalReport:
         # fully-stale-label queries for ranking metrics but keeps their
         # latency/positive-score signal).
         no_label = set(self.queries_without_labels)
-        labeled = [r for r in self.per_query if r.slice != "none" and r.query_id not in no_label]
+        if self.strict_stale_as_miss:
+            labeled = [r for r in self.per_query if r.slice != "none"]
+        else:
+            labeled = [r for r in self.per_query if r.slice != "none" and r.query_id not in no_label]
         empties = [r for r in self.per_query if r.slice == "none"]
         all_lat = [l for r in self.per_query for l in r.latencies_ms]
         overall = {
@@ -203,16 +206,13 @@ def _lexical_hit_count(pipeline: RetrievalPipeline, query: str) -> int:
 def resolve_labels(
     queries: list[GoldenQuery],
     pipeline: RetrievalPipeline,
+    *,
+    archive_dir: Path | None = None,
 ) -> tuple[dict[str, GoldenQuery], dict[str, int], list[str]]:
-    """Resolve golden label node ids against live node state.
-
-    Superseded labels follow ``superseded_by`` to the terminal active node
-    (cycle-safe). Archived or missing nodes are dropped and counted as stale.
-    A query whose labels are ALL stale is reported via ``queries_without_labels``
-    and excluded from ranking metrics rather than scored as a miss.
-    """
+    """Resolve golden label node ids against live node state and canonical .archive/<id>.md."""
 
     from synapse.models.node import NodeStatus
+    from synapse.storage.markdown import archive_node_path, read_node_file
 
     store = pipeline._get_store()
     resolved: dict[str, GoldenQuery] = {}
@@ -225,15 +225,25 @@ def resolve_labels(
         while current and current not in seen:
             seen.add(current)
             node = store.get_node(current)
-            # Archived nodes are removed from the index; missing == archived.
+            if node is None and archive_dir is not None:
+                arch_path = archive_node_path(archive_dir, current)
+                if arch_path.exists():
+                    try:
+                        node = read_node_file(arch_path)
+                    except Exception:  # noqa: BLE001
+                        node = None
             if node is None:
                 return None
             if node.metadata.status == NodeStatus.SUPERSEDED and node.metadata.superseded_by:
                 current = node.metadata.superseded_by
                 continue
+            if node.metadata.status == NodeStatus.SUPERSEDED:
+                return None
+            # If resolved from archive without SUPERSEDED status, check if still indexed
+            if store.get_node(current) is None:
+                return None
             return current
         return None  # cycle or dangling chain
-
     for gq in queries:
         if gq.expect_no_result or not gq.relevant:
             resolved[gq.id] = gq
@@ -267,6 +277,7 @@ def run_eval(
     top_k: int = 5,
     runs: int = 1,
     runtime_paths: RuntimePaths | None = None,
+    strict_stale_as_miss: bool = False,
 ) -> EvalReport:
     """Run all golden queries through the real retrieval pipeline.
 
@@ -281,6 +292,7 @@ def run_eval(
     report = EvalReport(
         created_at=datetime.now(UTC).isoformat(),
         config_path=str(config.config_path),
+        strict_stale_as_miss=strict_stale_as_miss,
     )
 
     from synapse.okf.transcripts import is_session_transcript
@@ -298,7 +310,9 @@ def run_eval(
     _pass_source = "source" in inspect.signature(RetrievalPipeline.search).parameters
 
     with RetrievalPipeline(config, runtime_paths=paths) as pipeline:
-        resolved_queries, stale_per_query, no_label_queries = resolve_labels(queries, pipeline)
+        resolved_queries, stale_per_query, no_label_queries = resolve_labels(
+            queries, pipeline, archive_dir=paths.archive
+        )
         report.stale_labels = stale_per_query
         report.stale_labels_total = sum(stale_per_query.values())
         report.queries_without_labels = no_label_queries

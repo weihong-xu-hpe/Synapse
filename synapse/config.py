@@ -248,6 +248,9 @@ class DreamerThresholdSettings(BaseModel):
     min_semantic_merge_cluster: int = Field(default=2, ge=2)
     max_semantic_merge_cluster: int = Field(default=6, ge=2)
     max_merges_per_run: int = Field(default=10, ge=1)
+    semantic_merge_floor_cosine: float = Field(default=0.84, ge=0.0, le=1.0)
+    semantic_merge_project_mode: str = Field(default="explicit_slug")
+    oversized_dedupe_cosine: float = Field(default=0.88, ge=0.0, le=1.0)
     # Dreamer 2.0 Stage 4d — oversized node compaction (§3.4(2)).
     oversized_compaction_bytes: int = Field(default=4096, ge=512)
     max_compactions_per_run: int = Field(default=10, ge=1)

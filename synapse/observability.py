@@ -1147,13 +1147,115 @@ def _node_usage_counter_columns(store: SQLiteStoreLike) -> set[str]:
     return {str(row["name"]) for row in rows} & set(_NORTH_STAR_COUNTER_COLUMNS)
 
 
-def _north_star_consolidation(store: SQLiteStoreLike) -> dict[str, Any]:
-    """Metric 1: share of knowledge nodes corroborated by >=2 sources (target >50%)."""
+def _is_root_provenance_source(source: str) -> bool:
+    return (
+        source.startswith("mem_session_")
+        or source.startswith("skill://")
+        or source.startswith("managed-skill:")
+        or source.startswith("http://")
+        or source.startswith("https://")
+        or source.startswith("session:")
+    )
+
+
+def _three_way_provenance_stats(
+    store: SQLiteStoreLike,
+    *,
+    runtime_paths: RuntimePaths | None = None,
+) -> dict[str, int]:
+    """Cycle-safe DFS provenance classification across nodes + canonical .archive/<id>.md."""
+
+    node_sources: dict[str, list[str]] = {}
+    active_ids: list[str] = []
+    for row in store.connection.execute(
+        "SELECT id, status, type, okf_meta FROM nodes"
+    ).fetchall():
+        nid = str(row["id"])
+        try:
+            meta = json.loads(str(row["okf_meta"] or "{}"))
+        except json.JSONDecodeError:
+            meta = {}
+        srcs = [str(s) for s in (meta.get("sources") or []) if s] if isinstance(meta, dict) else []
+        node_sources[nid] = srcs
+        if (
+            str(row["type"]) == "persistent"
+            and str(row["status"]) == "active"
+            and not nid.startswith("mem_session_")
+        ):
+            active_ids.append(nid)
+
+    archive_sources: dict[str, list[str]] = {}
+    if runtime_paths is not None and runtime_paths.archive.exists():
+        from synapse.storage.markdown import read_node_file
+
+        for path in runtime_paths.archive.glob("*.md"):
+            try:
+                archived = read_node_file(path)
+                archive_sources[archived.id] = [str(s) for s in archived.metadata.sources if s]
+            except Exception:  # noqa: BLE001
+                continue
+
+    verified_multi = 0
+    same_root_dedup = 0
+    unknown_or_cyclic = 0
+    for nid in active_ids:
+        direct = node_sources.get(nid, [])
+        roots: set[str] = set()
+        has_unknown = False
+        has_cycle = False
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def _dfs(cur: str) -> None:
+            nonlocal has_unknown, has_cycle
+            if _is_root_provenance_source(cur):
+                roots.add(cur)
+                return
+            if cur in visiting:
+                has_cycle = True
+                return
+            if cur in visited:
+                return
+            visiting.add(cur)
+            srcs = node_sources.get(cur)
+            if srcs is None:
+                srcs = archive_sources.get(cur)
+            if not srcs:
+                has_unknown = True
+            else:
+                for src in srcs:
+                    _dfs(src)
+            visiting.remove(cur)
+            visited.add(cur)
+
+        for src in direct:
+            _dfs(src)
+        if has_unknown or has_cycle:
+            unknown_or_cyclic += 1
+        if len(roots) >= 2:
+            verified_multi += 1
+        elif len(roots) == 1 and len(direct) >= 2 and not has_unknown and not has_cycle:
+            same_root_dedup += 1
+
+    return {
+        "verified_independent_multi_source": verified_multi,
+        "same_root_dedup_count": same_root_dedup,
+        "unknown_or_cyclic_provenance_count": unknown_or_cyclic,
+    }
+
+
+def _north_star_consolidation(
+    store: SQLiteStoreLike,
+    *,
+    runtime_paths: RuntimePaths | None = None,
+) -> dict[str, Any]:
+    """Metric 1: share of active knowledge nodes corroborated by >=2 sources (target >50%)."""
 
     multi = 0
     single = 0
     knowledge_bytes = 0
     transcript_bytes = 0
+    provenance = {"verified_independent_multi_source": 0, "same_root_dedup_count": 0, "unknown_or_cyclic_provenance_count": 0}
     try:
         rows = store.connection.execute(
             """
@@ -1162,6 +1264,7 @@ def _north_star_consolidation(store: SQLiteStoreLike) -> dict[str, Any]:
                    COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) AS total_bytes
             FROM nodes
             WHERE type = 'persistent'
+              AND status = 'active'
               AND id NOT LIKE 'mem\\_session\\_%' ESCAPE '\\'
               AND json_valid(okf_meta)
               AND json_extract(okf_meta, '$.sources') IS NOT NULL
@@ -1185,14 +1288,20 @@ def _north_star_consolidation(store: SQLiteStoreLike) -> dict[str, Any]:
         ).fetchone()
         if tx_row is not None:
             transcript_bytes = int(tx_row["total_bytes"] or 0)
+        provenance = _three_way_provenance_stats(store, runtime_paths=runtime_paths)
     except Exception:  # noqa: BLE001
         pass
     total = multi + single
+    verified_multi = provenance["verified_independent_multi_source"]
     return {
         "multi_source_nodes": multi,
         "single_source_nodes": single,
         "total_knowledge_nodes": total,
         "consolidation_ratio": _ratio(multi, total),
+        "verified_independent_multi_source": verified_multi,
+        "verified_independent_consolidation_ratio": _ratio(verified_multi, total),
+        "same_root_dedup_count": provenance["same_root_dedup_count"],
+        "unknown_or_cyclic_provenance_count": provenance["unknown_or_cyclic_provenance_count"],
         "knowledge_bytes": knowledge_bytes,
         "transcript_bytes": transcript_bytes,
         "compression_ratio": _ratio(knowledge_bytes, transcript_bytes),
@@ -1439,7 +1548,7 @@ def collect_north_star_metrics(
     """Compute the four §6.5 north-star metrics. Read-only, never raises."""
 
     return {
-        "consolidation": _north_star_consolidation(store),
+        "consolidation": _north_star_consolidation(store, runtime_paths=runtime_paths),
         "signal_to_noise": _north_star_signal_to_noise(store),
         "graph_connectivity": _north_star_graph_connectivity(store),
         "llm_gate_health": _north_star_llm_gate_health(store, runtime_paths),
@@ -1468,6 +1577,8 @@ def render_north_star_stats(metrics: dict[str, Any]) -> str:
         f"| Single-source knowledge nodes | {consolidation.get('single_source_nodes', 0)} |",
         f"| Total knowledge nodes | {consolidation.get('total_knowledge_nodes', 0)} |",
         f"| **Consolidation ratio** | **{_fmt_rate(consolidation.get('consolidation_ratio'))}** |",
+        f"| Verified independent multi-root | {consolidation.get('verified_independent_multi_source', 0)} ({_fmt_rate(consolidation.get('verified_independent_consolidation_ratio'))}) |",
+        f"| Same-root dedup / Unknown-cyclic | {consolidation.get('same_root_dedup_count', 0)} / {consolidation.get('unknown_or_cyclic_provenance_count', 0)} |",
         f"| Compression ratio (knowledge/transcript bytes) | {_fmt_rate(consolidation.get('compression_ratio'))} |",
         "",
         "## 2. Recall signal-to-noise",

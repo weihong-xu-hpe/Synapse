@@ -620,6 +620,44 @@ def test_oversized_node_without_section_boundaries_is_kept(tmp_path: Path) -> No
     assert node is not None and node.metadata.status is NodeStatus.ACTIVE
 
 
+
+def test_unshrinkable_oversized_nodes_do_not_block_later_candidates(tmp_path: Path) -> None:
+    """An oversized node that cannot be compacted or split is stamped once, so a
+    capped run moves on to the next candidate instead of retrying the same head."""
+
+    config, paths, store = _env(tmp_path)
+    config.dreamer.thresholds.oversized_compaction_bytes = 200
+    config.dreamer.thresholds.max_compactions_per_run = 1
+    body = "## Details\n\n" + ("- one huge unsplittable line about gateways.\n" * 20)
+    with store:
+        _write(store, paths, _node("mem_mono_a", title="Mono A", content=body), [0.0, 1.0, 0.0])
+        _write(store, paths, _node("mem_mono_b", title="Mono B", content=body.replace("gateways", "brokers")), [0.0, 0.0, 1.0])
+        gatekeeper = FakeSamplingClient(error=RuntimeError("gatekeeper offline"))
+        dreamer = Dreamer(config, runtime_paths=paths, sampling_client=gatekeeper, gatekeeper_client=gatekeeper)
+        try:
+            def stamped() -> set[str]:
+                return {
+                    node_id
+                    for node_id in ("mem_mono_a", "mem_mono_b")
+                    if store.get_node(node_id).metadata.compaction_attempted_hash
+                }
+
+            dreamer._run_oversized_compaction(store, [])  # noqa: SLF001
+            first = stamped()
+            calls_after_first = len(gatekeeper.prompts)
+            dreamer._run_oversized_compaction(store, [])  # noqa: SLF001
+            second = stamped()
+            calls_after_second = len(gatekeeper.prompts)
+            dreamer._run_oversized_compaction(store, [])  # noqa: SLF001
+            calls_after_third = len(gatekeeper.prompts)
+        finally:
+            dreamer.close()
+
+    assert len(first) == 1
+    assert second == {"mem_mono_a", "mem_mono_b"}  # the second run reached the other node
+    assert calls_after_second == calls_after_first + 1
+    assert calls_after_third == calls_after_second  # both stamped: nothing left to retry
+
 def test_dreamer_rejects_frontier_background_model(tmp_path: Path) -> None:
     from synapse.config import ensure_background_model_allowed
 

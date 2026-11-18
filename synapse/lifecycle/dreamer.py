@@ -11,11 +11,14 @@ The Dreamer runs a 6-stage pipeline modeled on sleep neuroscience:
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import re
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
 from synapse.config import SynapseConfig, ensure_background_model_allowed
@@ -46,7 +49,8 @@ from synapse.storage import (
     locate_active_node_file,
     write_node_file,
 )
-from synapse.storage.markdown import WIKI_LINK_PATTERN, extract_wiki_links
+from synapse.storage.markdown import WIKI_LINK_PATTERN, atomic_write_text, extract_wiki_links, read_node_file
+from synapse.okf.transcripts import content_sha256
 from synapse.storage.sqlite import DreamerRunMetrics
 from synapse.sync import SyncBatchResult, SyncManager
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
@@ -525,6 +529,7 @@ class Dreamer:
             cosine_threshold=thresholds.synthesis_cosine,
             min_size=thresholds.min_synthesis_cluster,
             max_size=thresholds.max_synthesis_cluster,
+            exclude_hubs=True,
         )
         if not clusters:
             return []
@@ -570,7 +575,9 @@ class Dreamer:
                     )
                 )
                 continue
-            hub = self._write_hub_node(title, takeaway, details, member_ids)
+            projects = {((n.metadata.project or "").strip() or None) for n in cluster}
+            hub_project = next(iter(projects)) if len(projects) == 1 else None
+            hub = self._write_hub_node(title, takeaway, details, member_ids, project=hub_project)
             if hub is None:
                 warnings.append(
                     DreamerWarning(
@@ -595,11 +602,21 @@ class Dreamer:
             if not candidate.metadata.okf_type:
                 continue
             sources = set(candidate.metadata.sources)
-            if sources and member_ids and member_ids.issubset(sources):
-                return True
+            if sources and member_ids:
+                overlap = len(sources & member_ids) / len(member_ids)
+                if overlap >= 0.7:
+                    return True
         return False
 
-    def _write_hub_node(self, title: str, takeaway: str, details: str, member_ids: set[str]) -> Node | None:
+    def _write_hub_node(
+        self,
+        title: str,
+        takeaway: str,
+        details: str,
+        member_ids: set[str],
+        *,
+        project: str | None = None,
+    ) -> Node | None:
         from synapse.models import slugify_english_title
 
         if not slugify_english_title(title):
@@ -630,6 +647,7 @@ class Dreamer:
             sources=sorted(member_ids),
             tags=["dreamer-hub"],
             now_iso=format_utc_datetime(now),
+            project=project,
         )
         hub = Node(metadata=metadata, content=content)
         return self._store_written_path(hub)
@@ -681,10 +699,13 @@ class Dreamer:
         """
 
         thresholds = self.config.dreamer.thresholds
-        clusters = store.find_synthesis_clusters(
+        clusters = store.find_complete_linkage_clusters(
             cosine_threshold=thresholds.semantic_merge_cosine,
+            floor_cosine=thresholds.semantic_merge_floor_cosine,
             min_size=thresholds.min_semantic_merge_cluster,
             max_size=thresholds.max_semantic_merge_cluster,
+            project_mode=thresholds.semantic_merge_project_mode,
+            exclude_hubs=True,
         )
         if not clusters:
             return []
@@ -738,10 +759,21 @@ class Dreamer:
                 )
             )
             return None
+        action = str(payload.get("action") or "merge").strip().casefold()
+        merge_relation = str(payload.get("merge_relation") or "").strip().casefold()
+        if action == "skip" or merge_relation in {"distinct_constraints", "conflict"}:
+            warnings.append(
+                DreamerWarning(
+                    code="semantic_merge_skipped_distinct",
+                    node_id=members[0].id,
+                    message=f"Semantic merge skipped cluster ({merge_relation or action}).",
+                )
+            )
+            return None
         title = str(payload.get("title") or "").strip()
         okf_type = str(payload.get("okf_type") or "").strip()
         takeaway = str(payload.get("takeaway") or "").strip()
-        body = str(payload.get("body") or "").strip()
+        body = self._strip_provenance_sections(str(payload.get("body") or "").strip())
         member_ids = sorted(member.id for member in members)
         if not title or not slugify_english_title(title):
             warnings.append(
@@ -825,6 +857,14 @@ class Dreamer:
             project=members[0].metadata.project,
             t_valid=now_iso,
         )
+        metadata = metadata.model_copy(
+            update={
+                "used_count": sum(m.metadata.used_count for m in members),
+                "injected_count": sum(m.metadata.injected_count for m in members),
+                "retrieved_count": max(m.metadata.retrieved_count for m in members),
+                "access_count": sum(m.metadata.used_count for m in members) + sum(m.metadata.injected_count for m in members),
+            }
+        )
         winner = Node(
             metadata=metadata,
             content=content,
@@ -874,7 +914,9 @@ class Dreamer:
         candidates = [
             node
             for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
-            if node.metadata.okf_type and len(node.content.encode("utf-8")) > limit
+            if node.metadata.okf_type
+            and len(node.content.encode("utf-8")) > limit
+            and node.metadata.compaction_attempted_hash != content_sha256(node.content)
         ]
         if not candidates:
             return []
@@ -882,7 +924,6 @@ class Dreamer:
         client: object | None = None
         results: list[CompactionResult] = []
         for candidate in candidates[: thresholds.max_compactions_per_run]:
-            # Idempotence: an earlier iteration (or run) may have retired it.
             node = store.get_node(candidate.id)
             if node is None or node.metadata.status is not NodeStatus.ACTIVE:
                 continue
@@ -892,9 +933,10 @@ class Dreamer:
                 continue
             if client is None:
                 client = self._background_client()
+            stripped = self._strip_provenance_sections(node.content, strip_takeaway=False)
             try:
                 payload = client.sample_json(
-                    prompt=build_compaction_prompt(node),
+                    prompt=build_compaction_prompt(node, stripped_content=stripped),
                     system_prompt=_COMPACTION_SYSTEM,
                     max_tokens=self.config.decider.max_tokens,
                 )
@@ -917,6 +959,9 @@ class Dreamer:
             split = self._split_oversized(node, store, warnings)
             if split is not None:
                 results.append(split)
+                continue
+            marked = self._with_metadata(node, compaction_attempted_hash=content_sha256(node.content))
+            self._persist(store, marked)
         return results
 
     def _dedupe_oversized(
@@ -935,7 +980,7 @@ class Dreamer:
         thresholds = self.config.dreamer.thresholds
         try:
             similar = store.find_near_duplicate(
-                node.id, cosine_threshold=thresholds.semantic_merge_cosine
+                node.id, cosine_threshold=thresholds.oversized_dedupe_cosine
             )
         except Exception as exc:  # noqa: BLE001 — probe is best effort
             self._logger.warning("Near-duplicate probe failed", extra={"node_id": node.id, "error": str(exc)})
@@ -1142,7 +1187,7 @@ class Dreamer:
             )
             return None
         takeaway = str(payload.get("takeaway") or "").strip()
-        body = str(payload.get("body") or "").strip()
+        body = self._strip_provenance_sections(str(payload.get("body") or "").strip())
         title = str(payload.get("title") or "").strip() or node.title
         if not takeaway or "\n" in takeaway or len(takeaway) > 200 or not body:
             warnings.append(
@@ -1274,11 +1319,16 @@ class Dreamer:
         missing: list[str] = []
         total = 0
         for member in members:
+            # Evidence quotes are verbatim transcript excerpts that a merge never
+            # re-renders (the winner keeps the member ids as Sources). Judge the
+            # merge on the member's knowledge body only, leaving the write-path
+            # supersede gate (which treats Evidence numbers as facts) untouched.
+            member_body = self._strip_provenance_sections(member.content, strip_takeaway=False)
             try:
-                total += len(_supersede_anchor_tokens(member.content))
+                total += len(_supersede_anchor_tokens(member_body))
             except Exception:  # noqa: BLE001 — anchor extraction is best effort
                 continue
-            missing.extend(_missing_supersede_anchors(member.content, content))
+            missing.extend(_missing_supersede_anchors(member_body, content))
         missing = list(dict.fromkeys(missing))
         if total and len(missing) > max(1, int(total * _ANCHOR_LOSS_TOLERANCE)):
             warnings.append(
@@ -1379,6 +1429,24 @@ class Dreamer:
         if in_provenance and current:
             blocks.append("\n".join(current).strip("\n"))
         return "\n\n".join(block for block in blocks if block.strip())
+
+    @staticmethod
+    def _strip_provenance_sections(content: str, *, strip_takeaway: bool = True) -> str:
+        """Strip ## Sources / ## Related / ## Evidence (and optionally ## Takeaway) from content."""
+
+        skip_names = set(_PROVENANCE_SECTION_NAMES)
+        if strip_takeaway:
+            skip_names.add("takeaway")
+        kept: list[str] = []
+        skip = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                name = stripped[3:].strip().casefold()
+                skip = name in skip_names
+            if not skip:
+                kept.append(line)
+        return "\n".join(kept).strip()
 
     # -- Stage 5: Execution -------------------------------------------------
 
@@ -1895,16 +1963,27 @@ class Dreamer:
                 )
                 continue
             if destination.exists():
-                warnings.append(
-                    DreamerWarning(
-                        code="archive_collision",
-                        node_id=node.id,
-                        message=f"Cannot archive node '{node.id}': archive file '{destination}' already exists.",
+                src_text = source_path.read_text(encoding="utf-8")
+                dst_text = destination.read_text(encoding="utf-8")
+                if src_text == dst_text:
+                    source_path.unlink(missing_ok=True)
+                else:
+                    collisions_dir = self.runtime_paths.archive / ".collisions"
+                    collisions_dir.mkdir(parents=True, exist_ok=True)
+                    sha8 = hashlib.sha1(dst_text.encode("utf-8")).hexdigest()[:8]
+                    collision_path = collisions_dir / f"{node.id}.{sha8}.md"
+                    if not collision_path.exists():
+                        atomic_write_text(collision_path, dst_text)
+                    atomic_write_text(destination, src_text)
+                    source_path.unlink(missing_ok=True)
+                    self._logger.info(
+                        "Quarantined divergent archive collision",
+                        extra={"node_id": node.id, "collision_path": str(collision_path)},
                     )
-                )
-                continue
-
-            source_path.replace(destination)
+            else:
+                dst_text = source_path.read_text(encoding="utf-8")
+                atomic_write_text(destination, dst_text)
+                source_path.unlink(missing_ok=True)
             # The file has left active/. Record it so later stages in this same
             # run know the node is no longer live, even though the write index
             # (``nodes.file_path``) only catches up at the closing startup sync.

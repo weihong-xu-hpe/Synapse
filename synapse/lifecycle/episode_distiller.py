@@ -422,12 +422,11 @@ class EpisodeDistiller:
         return run
 
     def _credit_retrieved_usage(self, run: EpisodeRun) -> None:
-        """Credit nodes the distiller retrieved *and* put to work (design doc §4.3(1)).
+        """Credit nodes the distiller actually updated (design doc §4.3(1)).
 
-        An existing node consumed as an ``update`` target, or referenced from a
-        distilled op's ``related_ids``, was not merely retrieved — it shaped the
-        new knowledge. That is the strongest available usage signal, so it feeds
-        ``used_count`` rather than the weak ``injected_count`` prior.
+        Only an ``updated`` target was confirmed to shape new knowledge; passive
+        ``related_ids`` links are associative cross-references and must not
+        inflate ``used_count`` or suppress low-utility pruning.
         """
 
         used: list[str] = []
@@ -436,10 +435,6 @@ class EpisodeDistiller:
                 target = op.get("target_id")
                 if isinstance(target, str) and target.startswith("mem_"):
                     used.append(target)
-            for link in op.get("related_ids") or []:
-                text = str(link)
-                if text.startswith("mem_"):
-                    used.append(text)
         used = list(dict.fromkeys(used))
         if not used:
             return
