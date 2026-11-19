@@ -602,3 +602,72 @@ def test_similar_pairs_matches_scalar_cosine_for_every_pair() -> None:
         if threshold == 0.5:
             assert expected, "test data must produce pairs or the comparison is vacuous"
         assert not any("odd_dim" in key for key in got)
+
+def test_synthesis_persists_hub_and_blocks_same_run_merge_id_collision(tmp_path: Path) -> None:
+    """Stage 4b must upsert synthesized hubs into SQLite so Stage 4c cannot overwrite
+    a newly synthesized hub when both stages pick the same generated node id."""
+    from synapse.storage import locate_active_node_file, read_node_file
+
+    config, runtime_paths = make_runtime(tmp_path)
+    config.dreamer.thresholds.synthesis_cosine = 0.80
+    config.dreamer.thresholds.min_synthesis_cluster = 4
+    config.dreamer.thresholds.semantic_merge_cosine = 0.80
+    config.dreamer.thresholds.semantic_merge_floor_cosine = 0.80
+    config.dreamer.thresholds.min_semantic_merge_cluster = 2
+
+    shared_title = "Kafka consumer offset handling across services"
+    synth_client = _SynthesisSamplingClient()
+
+    class _CollidingMergeClient:
+        name = "fake-merge-collision"
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            return {
+                "action": "merge",
+                "merge_relation": "synonymous",
+                "title": shared_title,
+                "okf_type": "fact",
+                "takeaway": "Merged takeaway attempting to reuse hub id.",
+                "body": "## Details\n\n- content mem_kafka_0\n- content mem_kafka_1\n- content mem_kafka_2\n- content mem_kafka_3",
+            }
+
+        def decide_memory_write(self, request):  # pragma: no cover
+            raise AssertionError(f"Unexpected write decision request: {request}")
+
+    dreamer = Dreamer(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=synth_client,
+        gatekeeper_client=_CollidingMergeClient(),
+    )
+    try:
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            for i in range(4):
+                node = _typed_cluster_node(f"mem_kafka_{i}")
+                written = dreamer._store_written_path(node)  # noqa: SLF001
+                store.upsert_node(written, embedding=[0.0, 0.0, 1.0])
+
+            warnings: list[Any] = []
+            synth_results = dreamer._run_synthesis(store, warnings)  # noqa: SLF001
+            assert len(synth_results) == 1
+            hub_id = synth_results[0].hub_node_id
+            # Hub must already be visible in SQLite before Stage 4c starts.
+            stored_hub = store.get_node(hub_id)
+            assert stored_hub is not None
+            assert "dreamer-hub" in stored_hub.metadata.tags
+
+            # Stage 4c generating the same id must detect the collision and leave the hub intact.
+            merge_results = dreamer._run_semantic_merge(store, warnings)  # noqa: SLF001
+            assert merge_results == []
+            assert any(w.code == "semantic_merge_id_collision" for w in warnings)
+
+            hub_after = store.get_node(hub_id)
+            assert hub_after is not None
+            assert "dreamer-hub" in hub_after.metadata.tags
+            hub_path = locate_active_node_file(runtime_paths.base, hub_id)
+            assert hub_path is not None
+            disk_hub = read_node_file(hub_path)
+            assert "dreamer-hub" in disk_hub.metadata.tags
+            assert "dreamer-merged" not in disk_hub.metadata.tags
+    finally:
+        dreamer.close()

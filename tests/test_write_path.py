@@ -660,3 +660,64 @@ def test_write_memory_scrubs_credential_values_before_storage(tmp_path: Path) ->
     stored = active_text(runtime_paths, node_id)
     assert secret not in stored
     assert "CLIENT_SECRET=[REDACTED_CREDENTIAL]" in stored
+
+
+def test_supersede_anchor_tokens_ignores_prose_between_fences_list_numbers_and_dup_frontmatter() -> None:
+    from synapse.server.service import _supersede_anchor_tokens
+
+    body = (
+        "---\n"
+        "id: mem_20260927_legacy_dup\n"
+        "created_at: '2026-09-27T13:01:41.869864Z'\n"
+        "---\n\n"
+        "## Takeaway\n\n"
+        "Check empty/null and read/grep behavior.\n\n"
+        "## Steps\n\n"
+        "1. Run `git pull --ff-only` in `~/workspace/omp-synapse-bridge`.\n"
+        "2. Inspect `/api/v1/gateway` and `/customers/{acid}/users/{user}/resources` with timeout 30s and retry budget 3.\n"
+        "3. Query logscale:\n"
+        "```logscale\n"
+        "path=/accounts/app/v1/users | percentile(duration)\n"
+        "```\n"
+        "Although concurrent adapters must eventually freeze without caching,\n"
+        "```bash\n"
+        "echo done\n"
+        "```\n"
+        "- Preserved anchor tokens: `old_noise_token_99`\n"
+    )
+    tokens = _supersede_anchor_tokens(body)
+
+    # Real technical anchors survive.
+    assert "/api/v1/gateway" in tokens
+    assert "/customers/{acid}/users/{user}/resources" in tokens
+    assert "/accounts/app/v1/users" in tokens
+    assert "~/workspace/omp-synapse-bridge" in tokens
+    assert "30s" in tokens
+    assert "3" in tokens
+    assert "ff-only" in tokens
+
+    # Noise does NOT leak into anchors.
+    for noise in (
+        "although",
+        "concurrent",
+        "adapters",
+        "must",
+        "eventually",
+        "freeze",
+        "without",
+        "caching",
+        "empty/null",
+        "read/grep",
+        "2026",
+        "09",
+        "27",
+        "41",
+        "1",
+        "2",
+        "git",
+        "pull",
+        "old_noise_token_99",
+        "/.workspace/omp-synapse-bridge",
+        "/workspace/omp-synapse-bridge",
+    ):
+        assert noise not in tokens, f"unexpected noise token: {noise!r}"

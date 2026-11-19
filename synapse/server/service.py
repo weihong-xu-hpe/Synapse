@@ -64,48 +64,89 @@ def _normalize_supersede_anchor(value: str) -> str:
     return " ".join(value.split()).casefold().replace("–", "-").replace("—", "-").replace("×", "x")
 
 
+_LEADING_DUPLICATE_FRONTMATTER_RE = re.compile(r"\A\s*---\n.*?\n---(?:\n|\Z)", re.DOTALL)
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_ORDERED_LIST_PREFIX_RE = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+)?\d+[.)][ \t]+")
+_PRESERVED_ANCHORS_LINE_RE = re.compile(r"(?m)^[ \t]*(?:[-*][ \t]+)?Preserved anchor tokens:[^\n]*$")
+_PROSE_SLASH_PAIR_RE = re.compile(r"^[A-Za-z]{1,20}/[A-Za-z]{1,20}$")
+_TECH_CODE_TOKEN_RE = re.compile(r"[\d_/.:-]|[a-z][A-Z]|^[A-Z]{2,}$")
+_ANCHOR_DURATION_RE = re.compile(
+    r"(?<![A-Za-z0-9])-?\d+(?:\.\d+)?(?:\s*[–—-]\s*\d+(?:\.\d+)?)?\s*(?:ms|milliseconds?|seconds?|secs?|sec|s|minutes?|mins?|min|m|hours?|h|days?|d)\b",
+    flags=re.IGNORECASE,
+)
+_ANCHOR_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9._:/~-])(?:~?/)?(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?"
+)
+_ANCHOR_ALNUM_IDENT_RE = re.compile(
+    r"\b(?:[A-Za-z][A-Za-z0-9._:/-]*\d[A-Za-z0-9._:/-]*|[a-z]+[A-Z][A-Za-z0-9]*)\b"
+)
+_ANCHOR_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?%?(?![A-Za-z0-9])")
+_ANCHOR_CODE_SPAN_TOKEN_RE = re.compile(r"(?:~/|/)?[A-Za-z0-9._<{][A-Za-z0-9._:/<>{}-]*")
+
+
 def _supersede_anchor_tokens(content: str) -> set[str]:
     """Extract non-provenance literals that must survive a supersede."""
 
-    import re
-
+    cleaned = _LEADING_DUPLICATE_FRONTMATTER_RE.sub("", content)
     semantic_lines: list[str] = []
     include_section = True
-    for line in content.splitlines():
+    for line in cleaned.splitlines():
         heading = line.strip()
         if heading.startswith("## "):
             include_section = heading[3:].strip().casefold() not in {"sources", "related"}
         if include_section:
             semantic_lines.append(line)
-    semantic = "\n".join(semantic_lines)
-    numeric_text = re.sub(r"`[^`]*`", " ", semantic)
+    semantic = _PRESERVED_ANCHORS_LINE_RE.sub("", "\n".join(semantic_lines))
+
+    # Extract fenced code blocks before inline-backtick matching so triple-backtick
+    # delimiters never pair across prose between two fences.
+    fenced_blocks: list[str] = []
+
+    def _collect_fence(match: re.Match[str]) -> str:
+        fenced_blocks.append(match.group(1))
+        return "\n"
+
+    prose = _FENCED_CODE_BLOCK_RE.sub(_collect_fence, semantic)
+    prose = re.sub(r"```[^\n]*", " ", prose)
+
+    numeric_text = re.sub(r"`[^`\n]*`", " ", prose)
+    numeric_text = _ORDERED_LIST_PREFIX_RE.sub(" ", numeric_text)
     numeric_text = re.sub(
         r"\b[A-Za-z][A-Za-z0-9._:/-]*\d[A-Za-z0-9._:/-]*\b",
         " ",
         numeric_text,
     )
-    anchors = {
-        str(number)
-        for number in re.findall(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?%?(?![A-Za-z0-9])", numeric_text)
-    }
-    anchors.update(
-        re.findall(
-            r"(?<![A-Za-z0-9])-?\d+(?:\.\d+)?(?:\s*[–—-]\s*\d+(?:\.\d+)?)?\s*(?:ms|milliseconds?|seconds?|secs?|sec|s|minutes?|mins?|min|m|hours?|h|days?|d)\b",
-            semantic,
-            flags=re.IGNORECASE,
-        )
-    )
-    anchors.update(
-        re.findall(
-            r"(?<![A-Za-z0-9:/])(?:/)?(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9._-]+)?",
-            semantic,
-        )
-    )
-    for code_span in re.findall(r"`([^`]+)`", semantic):
-        anchors.update(re.findall(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", code_span))
-    anchors.update(
-        re.findall(r"\b(?:[A-Za-z][A-Za-z0-9._:/-]*\d[A-Za-z0-9._:/-]*|[a-z]+[A-Z][A-Za-z0-9]*)\b", semantic)
-    )
+    anchors = {str(number) for number in _ANCHOR_NUMBER_RE.findall(numeric_text)}
+    anchors.update(_ANCHOR_DURATION_RE.findall(prose))
+
+    def _add_paths(text: str) -> None:
+        for raw_path in _ANCHOR_PATH_RE.findall(text):
+            trimmed = raw_path.rstrip(".,;:)")
+            if not trimmed or _PROSE_SLASH_PAIR_RE.match(trimmed):
+                continue
+            anchors.add(trimmed)
+
+    _add_paths(prose)
+
+    for code_span in re.findall(r"`([^`\n]+)`", prose):
+        tokens = [token.strip(".,;:") for token in _ANCHOR_CODE_SPAN_TOKEN_RE.findall(code_span)]
+        tokens = [token for token in tokens if token and any(ch.isalnum() for ch in token)]
+        if len(tokens) == 1:
+            if not _PROSE_SLASH_PAIR_RE.match(tokens[0]):
+                anchors.add(tokens[0])
+        else:
+            for token in tokens:
+                if _PROSE_SLASH_PAIR_RE.match(token):
+                    continue
+                if _TECH_CODE_TOKEN_RE.search(token):
+                    anchors.add(token)
+
+    for block in fenced_blocks:
+        _add_paths(block)
+        anchors.update(token.rstrip(".,;:") for token in _ANCHOR_ALNUM_IDENT_RE.findall(block))
+        anchors.update(_ANCHOR_DURATION_RE.findall(block))
+
+    anchors.update(token.rstrip(".,;:") for token in _ANCHOR_ALNUM_IDENT_RE.findall(prose))
     return {_normalize_supersede_anchor(anchor) for anchor in anchors if anchor}
 
 

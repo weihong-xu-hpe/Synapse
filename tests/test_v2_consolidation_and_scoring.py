@@ -501,6 +501,61 @@ def test_semantic_merge_rejects_anchor_token_loss(tmp_path: Path) -> None:
         assert member is not None and member.metadata.status is NodeStatus.ACTIVE
 
 
+def test_semantic_merge_within_anchor_tolerance_does_not_append_raw_token_line(tmp_path: Path) -> None:
+    config, paths, store = _env(tmp_path)
+    config.dreamer.thresholds.semantic_merge_cosine = 0.9
+    config.dreamer.thresholds.min_semantic_merge_cluster = 2
+    with store:
+        member_a = _node(
+            "mem_tol_a",
+            title="Gateway Timeout Policy A",
+            content=(
+                "## Takeaway\n\nTimeout is 30s.\n\n## Details\n\n"
+                "- GET `/api/v1/gateway` times out after 30s.\n"
+                "- Returns `GW_504` after 3 retries and 500ms backoff.\n"
+                "- Config file `/etc/authz/gateway.yaml` sets pool 16.\n"
+            ),
+            project="proj-a",
+        )
+        member_b = _node(
+            "mem_tol_b",
+            title="Gateway Timeout Policy B",
+            content=(
+                "## Takeaway\n\nTimeout is 30s.\n\n## Details\n\n"
+                "- GET `/api/v1/gateway` times out after 30s with `GW_504`.\n"
+            ),
+            project="proj-a",
+        )
+        _write(store, paths, member_a, [1.0, 0.0, 0.0])
+        _write(store, paths, member_b, [1.0, 0.0, 0.0])
+
+        # Omit one token (500ms) out of many -> within 20% tolerance, must accept cleanly without backfill noise.
+        gatekeeper = FakeSamplingClient(
+            {
+                "action": "merge",
+                "merge_relation": "synonymous",
+                "title": "Gateway Timeout And Retry Policy",
+                "okf_type": "fact",
+                "takeaway": "GET /api/v1/gateway times out after 30s with GW_504.",
+                "body": (
+                    "## Details\n\n"
+                    "- GET `/api/v1/gateway` times out after 30s and returns `GW_504` after 3 retries.\n"
+                    "- Configured via `/etc/authz/gateway.yaml` with pool 16.\n"
+                ),
+            }
+        )
+        dreamer = Dreamer(config, runtime_paths=paths, sampling_client=gatekeeper, gatekeeper_client=gatekeeper)
+        warnings: list[Any] = []
+        try:
+            merged_results = dreamer._run_semantic_merge(store, warnings)  # noqa: SLF001
+        finally:
+            dreamer.close()
+        assert len(merged_results) == 1
+        winner = store.get_node(merged_results[0].winner_node_id)
+        assert winner is not None
+        assert "Preserved anchor tokens:" not in winner.content
+        assert "/api/v1/gateway" in winner.content
+
 def test_oversized_near_duplicate_is_deduped_into_keeper(tmp_path: Path) -> None:
     """§3.4(2): an oversized near-duplicate is retired without spending an LLM call."""
 

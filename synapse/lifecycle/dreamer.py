@@ -577,14 +577,16 @@ class Dreamer:
                 continue
             projects = {((n.metadata.project or "").strip() or None) for n in cluster}
             hub_project = next(iter(projects)) if len(projects) == 1 else None
-            hub = self._write_hub_node(title, takeaway, details, member_ids, project=hub_project)
+            hub = self._write_hub_node(
+                store,
+                title,
+                takeaway,
+                details,
+                member_ids,
+                warnings=warnings,
+                project=hub_project,
+            )
             if hub is None:
-                warnings.append(
-                    DreamerWarning(
-                        code="synthesis_title_unusable",
-                        message=f"Synthesis produced an unusable English title ({title!r}); skipping cluster.",
-                    )
-                )
                 continue
             hub_ids_created.add(hub.id)
             results.append(SynthesisResult(member_ids=tuple(sorted(member_ids)), hub_node_id=hub.id, hub_title=hub.title))
@@ -610,19 +612,37 @@ class Dreamer:
 
     def _write_hub_node(
         self,
+        store: SQLiteNodeStore,
         title: str,
         takeaway: str,
         details: str,
         member_ids: set[str],
         *,
+        warnings: list[DreamerWarning] | None = None,
         project: str | None = None,
     ) -> Node | None:
         from synapse.models import slugify_english_title
 
         if not slugify_english_title(title):
+            if warnings is not None:
+                warnings.append(
+                    DreamerWarning(
+                        code="synthesis_title_unusable",
+                        message=f"Synthesis produced an unusable English title ({title!r}); skipping cluster.",
+                    )
+                )
             return None
         now = self._utc_now()
         hub_id = generate_node_id(title, now)
+        if store.get_node(hub_id) is not None:
+            if warnings is not None:
+                warnings.append(
+                    DreamerWarning(
+                        code="synthesis_id_collision",
+                        message=f"Synthesis hub id '{hub_id}' already exists; skipping cluster.",
+                    )
+                )
+            return None
         content = "\n".join(
             [
                 "## Takeaway",
@@ -650,7 +670,7 @@ class Dreamer:
             project=project,
         )
         hub = Node(metadata=metadata, content=content)
-        return self._store_written_path(hub)
+        return self._persist(store, hub)
 
     # -- Stage 4c/4d: Dreamer 2.0 sleep consolidation ------------------------
 
@@ -1308,16 +1328,17 @@ class Dreamer:
     ) -> str | None:
         """Nighttime anchor-token verification (§3.3).
 
-        Merges/compactions may tighten wording and de-duplicate, but every
-        concrete literal (error codes, paths, versions, numbers, durations)
-        must survive. At most 20% of the member anchor tokens may be missing;
-        any within-tolerance stragglers are appended back into the body.
+        Merges/compactions may tighten wording and de-duplicate, but concrete
+        literals (error codes, paths, versions, numbers, durations) must survive
+        within the tolerance budget. Products exceeding the loss budget are
+        rejected; within-tolerance products are kept clean with no raw-token
+        backfill line appended to the body.
         """
 
         from synapse.server.service import _missing_supersede_anchors, _supersede_anchor_tokens
 
         missing: list[str] = []
-        total = 0
+        all_anchors: set[str] = set()
         for member in members:
             # Evidence quotes are verbatim transcript excerpts that a merge never
             # re-renders (the winner keeps the member ids as Sources). Judge the
@@ -1325,10 +1346,11 @@ class Dreamer:
             # supersede gate (which treats Evidence numbers as facts) untouched.
             member_body = self._strip_provenance_sections(member.content, strip_takeaway=False)
             try:
-                total += len(_supersede_anchor_tokens(member_body))
+                all_anchors.update(_supersede_anchor_tokens(member_body))
             except Exception:  # noqa: BLE001 — anchor extraction is best effort
                 continue
             missing.extend(_missing_supersede_anchors(member_body, content))
+        total = len(all_anchors)
         missing = list(dict.fromkeys(missing))
         if total and len(missing) > max(1, int(total * _ANCHOR_LOSS_TOLERANCE)):
             warnings.append(
@@ -1342,8 +1364,6 @@ class Dreamer:
                 )
             )
             return None
-        if missing:
-            content = self._append_anchor_tokens(content, missing)
         fatal = self._fatal_okf_findings(content, okf_type, sources, title)
         if fatal:
             warnings.append(
@@ -1355,40 +1375,6 @@ class Dreamer:
             )
             return None
         return content
-
-    @staticmethod
-    def _append_anchor_tokens(content: str, tokens: list[str]) -> str:
-        """Append missing anchor tokens as a bullet in the first knowledge section."""
-
-        note = "- Preserved anchor tokens: " + ", ".join(f"`{token}`" for token in tokens)
-        lines = content.splitlines()
-        preferred = {
-            "details",
-            "fix",
-            "decision",
-            "steps",
-            "context",
-            "cause",
-            "symptom",
-            "consequences",
-        }
-        start: int | None = None
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("## ") and stripped[3:].strip().casefold() in preferred:
-                start = index
-                break
-        if start is None:
-            return content.rstrip() + "\n\n## Details\n\n" + note
-        end = len(lines)
-        for index in range(start + 1, len(lines)):
-            if lines[index].strip().startswith("## "):
-                end = index
-                break
-        while end > start + 1 and not lines[end - 1].strip():
-            end -= 1
-        lines.insert(end, note)
-        return "\n".join(lines)
 
     @staticmethod
     def _render_consolidated_body(
