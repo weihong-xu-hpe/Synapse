@@ -441,7 +441,11 @@ class SynapseServerService:
         # Serializes unkeyed writes of the same (title, content-hash) pair.
         self._content_write_locks_guard = threading.Lock()
         self._content_write_locks: dict[str, threading.Lock] = {}
-
+        # Shared embedding/reranker engines keep RemoteTokenizer's thread-safe
+        # truncation LRU warm across requests instead of recreating it per search.
+        self._engines_lock = threading.Lock()
+        self._embedding_engine = None
+        self._reranker_engine = None
     @property
     def sampling_client(self) -> SamplingClient | None:
         return self._sampling_client_var.get()
@@ -1696,8 +1700,30 @@ class SynapseServerService:
                 candidate = f"{base_id}_{digest[:6]}"
         return candidate
 
+    def _get_embedding_engine(self):
+        engine = self._embedding_engine
+        if engine is None:
+            with self._engines_lock:
+                engine = self._embedding_engine
+                if engine is None:
+                    engine = create_embedding_engine(self.config.embedding, providers=self.config.providers)
+                    self._embedding_engine = engine
+        return engine
+
+    def _get_reranker_engine(self):
+        engine = self._reranker_engine
+        if engine is None:
+            with self._engines_lock:
+                engine = self._reranker_engine
+                if engine is None:
+                    from synapse.embedding import create_reranker_engine
+
+                    engine = create_reranker_engine(self.config.reranker, providers=self.config.providers)
+                    self._reranker_engine = engine
+        return engine
+
     def _embed_query(self, query: str) -> list[float] | None:
-        engine = create_embedding_engine(self.config.embedding, providers=self.config.providers)
+        engine = self._get_embedding_engine()
         backend = getattr(engine, "backend_name", "")
         if backend == "unavailable":
             return None
@@ -1714,9 +1740,13 @@ class SynapseServerService:
         return vector
 
     def _run_retrieval_search(self, query: str, *, top_k: int, update_access: bool, result_filter=None) -> Any:
-        with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as pipeline:
+        with RetrievalPipeline(
+            self.config,
+            runtime_paths=self.runtime_paths,
+            embedding_engine=self._get_embedding_engine(),
+            reranker_engine=self._get_reranker_engine(),
+        ) as pipeline:
             return pipeline.search(query, top_k=top_k, update_access=update_access, result_filter=result_filter)
-
     def _search_existing_nodes_payload(self, query: str, similarity_threshold: float) -> dict[str, Any]:
         normalized_query = " ".join(str(query or "").split()).strip()
         queries = [normalized_query] if normalized_query else []
@@ -1758,7 +1788,12 @@ class SynapseServerService:
         # knowledge nodes, never against the transcript the draft came from.
         from synapse.okf.transcripts import is_session_transcript
 
-        with RetrievalPipeline(self.config, runtime_paths=self.runtime_paths) as pipeline:
+        with RetrievalPipeline(
+            self.config,
+            runtime_paths=self.runtime_paths,
+            embedding_engine=self._get_embedding_engine(),
+            reranker_engine=self._get_reranker_engine(),
+        ) as pipeline:
             for query in normalized_queries:
                 response = pipeline.search(
                     query,

@@ -671,3 +671,79 @@ def test_synthesis_persists_hub_and_blocks_same_run_merge_id_collision(tmp_path:
             assert "dreamer-merged" not in disk_hub.metadata.tags
     finally:
         dreamer.close()
+
+
+def test_dreamer_records_v2_consolidation_metrics_and_archived_counts(tmp_path: Path) -> None:
+    """dreamer_runs persists Stage 4b/4c/4d counts and includes Stage 4c/4d archived nodes."""
+    from synapse.observability import _day_dreamer_runs
+
+    config, runtime_paths = make_runtime(tmp_path)
+    config.dreamer.thresholds.synthesis_cosine = 0.80
+    config.dreamer.thresholds.min_synthesis_cluster = 4
+    config.dreamer.thresholds.semantic_merge_cosine = 0.90
+    config.dreamer.thresholds.semantic_merge_floor_cosine = 0.90
+    config.dreamer.thresholds.min_semantic_merge_cluster = 2
+
+    class _MergeAndSynthClient:
+        name = "fake-v2"
+
+        def sample_json(self, *, prompt: str, system_prompt: str, max_tokens: int = 600, model_hints=()):
+            if "semantic merge" in prompt.lower():
+                return {
+                    "action": "merge",
+                    "merge_relation": "synonymous",
+                    "title": "Unified Billing Retry Rule",
+                    "okf_type": "fact",
+                    "takeaway": "Billing retries share one idempotency key.",
+                    "body": "## Details\n\n- Billing retries keep one key.\n- content mem_bill_0\n- content mem_bill_1\n",
+                }
+            return {
+                "title": "Kafka consumer offset handling across services",
+                "takeaway": "All services resume from committed kafka offsets.",
+                "details": "Members establish that offsets gate resume behavior.",
+                "sources": [],
+            }
+
+        def decide_memory_write(self, request):  # pragma: no cover
+            raise AssertionError(f"Unexpected write decision request: {request}")
+
+    client = _MergeAndSynthClient()
+    dreamer = Dreamer(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=client,
+        gatekeeper_client=client,
+    )
+    try:
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            for i in range(4):
+                node = _typed_cluster_node(f"mem_kafka_{i}", project="kafka")
+                written = dreamer._store_written_path(node)  # noqa: SLF001
+                store.upsert_node(written, embedding=[0.0, 0.0, 1.0])
+            for i in range(2):
+                node = _typed_cluster_node(f"mem_bill_{i}", project="billing")
+                written = dreamer._store_written_path(node)  # noqa: SLF001
+                store.upsert_node(written, embedding=[1.0, 0.0, 0.0])
+
+        report = dreamer.run(batch_size=4)
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            summary = store.get_dreamer_metrics_summary()
+            row = store.connection.execute(
+                "SELECT archived, synthesized_hubs, semantic_merges, oversized_compacted, repointed_links "
+                "FROM dreamer_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            day = _day_dreamer_runs(store, "2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z")
+    finally:
+        dreamer.close()
+
+    assert len(report.synthesized) == 1
+    assert len(report.merged) == 1
+    assert len(report.archived) == 2
+    assert row["archived"] == 2
+    assert row["synthesized_hubs"] == 1
+    assert row["semantic_merges"] == 1
+    assert summary["decision_totals"]["synthesized_hubs"] == 1
+    assert summary["decision_totals"]["semantic_merges"] == 1
+    assert day["synthesized_hubs"] == 1
+    assert day["semantic_merges"] == 1
+    assert day["archived"] == 2

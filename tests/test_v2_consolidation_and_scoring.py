@@ -676,6 +676,139 @@ def test_oversized_node_without_section_boundaries_is_kept(tmp_path: Path) -> No
 
 
 
+def test_oversized_split_keeps_typed_okf_project_size_cap_and_no_provenance_shards(tmp_path: Path) -> None:
+    """Split shards stay typed (fact/pitfall), keep the source project, never exceed
+    the byte cap after headers/links, and never emit standalone ## Sources/Related shards."""
+
+    config, paths, store = _env(tmp_path)
+    config.dreamer.thresholds.oversized_compaction_bytes = 900
+    body = (
+        "## Takeaway\n\nOIC sync state 404 means workspace was never onboarded.\n\n"
+        "## Symptom\n\n" + ("- OIC returns 404 on sync state query for workspace.\n" * 6) + "\n"
+        "## Cause\n\n" + ("- Missing workspace onboarding row in silvercreek DB.\n" * 6) + "\n"
+        "## Fix\n\n" + ("- Re-run onboarding job before checking authz-svc.\n" * 6) + "\n"
+        "## Related\n\n- [[mem_other_note]]\n\n"
+        "## Sources\n\n- mem_session_a\n"
+    )
+    node = _node(
+        "mem_pitfall_big",
+        title="OIC Workspace Sync State 404",
+        content=body,
+        project="silvercreek",
+        okf_type="pitfall",
+    )
+    assert len(body.encode("utf-8")) > 900
+
+    with store:
+        _write(store, paths, node, [0.0, 1.0, 0.0])
+        gatekeeper = FakeSamplingClient(error=RuntimeError("gatekeeper offline"))
+        dreamer = Dreamer(config, runtime_paths=paths, sampling_client=gatekeeper, gatekeeper_client=gatekeeper)
+        warnings: list[Any] = []
+        try:
+            compacted = dreamer._run_oversized_compaction(store, warnings)  # noqa: SLF001
+        finally:
+            dreamer.close()
+        parts = [
+            item
+            for item in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+            if "dreamer-split" in item.metadata.tags
+        ]
+
+    assert len(compacted) == 1
+    assert len(parts) >= 2
+    for part in parts:
+        assert part.metadata.okf_type == "fact"
+        assert part.metadata.okf_version == 1
+        assert part.metadata.project == "silvercreek"
+        assert len(part.content.encode("utf-8")) <= 900
+        assert "## Takeaway" in part.content
+        assert "## Details" in part.content
+        # No provenance-only shard: every part has substantive content beyond Sources/Related.
+        stripped = Dreamer._strip_provenance_sections(part.content, strip_takeaway=True)  # noqa: SLF001
+        assert stripped.strip()
+
+
+def test_oversized_split_declines_when_only_provenance_follows_single_body_section(tmp_path: Path) -> None:
+    """A procedure with only ## Takeaway + ## Steps + ## Sources/Related must not
+    split off a tiny ## Sources or ## Related tail shard."""
+
+    config, paths, store = _env(tmp_path)
+    config.dreamer.thresholds.oversized_compaction_bytes = 600
+    body = (
+        "## Takeaway\n\nRehearse every extract round on a copy.\n\n"
+        "## Steps\n\n" + ("1. Run rehearsed extract step on staging copy.\n" * 12) + "\n"
+        "## Related\n\n- [[mem_other]]\n\n"
+        "## Sources\n\n- mem_session_a\n"
+    )
+    node = _node("mem_proc_tail", title="Rehearsed Extract Round", content=body, okf_type="procedure")
+    assert len(body.encode("utf-8")) > 600
+
+    with store:
+        _write(store, paths, node, [0.0, 1.0, 0.0])
+        gatekeeper = FakeSamplingClient(error=RuntimeError("gatekeeper offline"))
+        dreamer = Dreamer(config, runtime_paths=paths, sampling_client=gatekeeper, gatekeeper_client=gatekeeper)
+        warnings: list[Any] = []
+        try:
+            compacted = dreamer._run_oversized_compaction(store, warnings)  # noqa: SLF001
+        finally:
+            dreamer.close()
+        source = store.get_node("mem_proc_tail")
+
+    assert compacted == []
+    assert any(w.code == "oversized_split_impossible" for w in warnings)
+    assert source is not None and source.metadata.status is NodeStatus.ACTIVE
+
+
+def test_semantic_merge_rejects_oversized_unshrunk_product(tmp_path: Path) -> None:
+    """A semantic merge whose output stays > oversized_compaction_bytes without
+    shrinking past the largest member is rejected rather than growing unboundedly."""
+
+    config, paths, store = _env(tmp_path)
+    config.dreamer.thresholds.semantic_merge_cosine = 0.9
+    config.dreamer.thresholds.min_semantic_merge_cluster = 2
+    config.dreamer.thresholds.oversized_compaction_bytes = 512
+    big_details = "\n".join(f"- concrete step {i} with path /api/v2/item/{i}" for i in range(12))
+    with store:
+        member_a = _node(
+            "mem_big_a",
+            title="Large Triage Procedure A",
+            content=f"## Takeaway\n\nRun triage A.\n\n## Details\n\n{big_details}\n",
+            project="proj-a",
+        )
+        member_b = _node(
+            "mem_big_b",
+            title="Large Triage Procedure B",
+            content=f"## Takeaway\n\nRun triage B.\n\n## Details\n\n{big_details}\n",
+            project="proj-a",
+        )
+        _write(store, paths, member_a, [1.0, 0.0, 0.0])
+        _write(store, paths, member_b, [1.0, 0.0, 0.0])
+
+        gatekeeper = FakeSamplingClient(
+            {
+                "action": "merge",
+                "merge_relation": "synonymous",
+                "title": "Combined Huge Triage Procedure",
+                "okf_type": "fact",
+                "takeaway": "Run combined triage.",
+                "body": f"## Details\n\n{big_details}\n- extra bloated line that makes it even larger than both members.\n",
+            }
+        )
+        dreamer = Dreamer(config, runtime_paths=paths, sampling_client=gatekeeper, gatekeeper_client=gatekeeper)
+        warnings: list[Any] = []
+        try:
+            merged = dreamer._run_semantic_merge(store, warnings)  # noqa: SLF001
+        finally:
+            dreamer.close()
+        a_after = store.get_node("mem_big_a")
+        b_after = store.get_node("mem_big_b")
+
+    assert merged == []
+    assert any(w.code == "semantic_merge_oversized" for w in warnings)
+    assert a_after is not None and a_after.metadata.status is NodeStatus.ACTIVE
+    assert b_after is not None and b_after.metadata.status is NodeStatus.ACTIVE
+
+
 def test_unshrinkable_oversized_nodes_do_not_block_later_candidates(tmp_path: Path) -> None:
     """An oversized node that cannot be compacted or split is stamped once, so a
     capped run moves on to the next candidate instead of retrying the same head."""

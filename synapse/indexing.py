@@ -421,6 +421,10 @@ def _empty_dreamer_decision_totals() -> dict[str, int]:
         "conflicts_both_valid": 0,
         "warnings": 0,
         "sampling_failures": 0,
+        "synthesized_hubs": 0,
+        "semantic_merges": 0,
+        "oversized_compacted": 0,
+        "repointed_links": 0,
     }
 
 

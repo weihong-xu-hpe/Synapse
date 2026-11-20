@@ -14,7 +14,7 @@ from synapse.config import SynapseConfig
 from synapse.embedding import create_embedding_engine
 from synapse.models import Node
 from synapse.okf.transcripts import is_session_transcript
-from synapse.storage import SQLiteNodeStore, build_node_alias_map, extract_wiki_links, read_node_file, resolve_links_to_node_ids
+from synapse.storage import SQLiteNodeStore, extract_wiki_links, read_node_file, resolve_links_to_node_ids
 from synapse.utils.documents import render_node_document
 from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 
@@ -252,11 +252,10 @@ class SyncManager:
 
         if synced_nodes:
             store = self._get_store()
-            alias_map = build_node_alias_map(store.list_nodes())
+            alias_map = store.get_node_alias_map()
             for node in synced_nodes:
                 linked_ids = resolve_links_to_node_ids(extract_wiki_links(node.content), alias_map)
                 store.upsert_edges(node.id, linked_ids)
-
         return SyncBatchResult(
             upserted=upserted,
             deleted=deleted,

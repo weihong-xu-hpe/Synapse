@@ -680,3 +680,36 @@ def test_vector_cache_ranking_matches_uncached_path(tmp_path: Path) -> None:
         assert again == truth
     finally:
         store.close()
+
+
+def test_delete_embeddings_missing_id_keeps_vector_cache_warm(tmp_path: Path) -> None:
+    """Deleting a non-existent vector (e.g. transcript session_upsert) must not
+    drop the in-process numpy vector cache."""
+    db_path = tmp_path / "synapse.db"
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        store.upsert_node(
+            make_node(node_id="mem_vec_keep", title="Keep", content="Body", file_name="mem_vec_keep.md"),
+            embedding=[1.0, 0.0, 0.0],
+        )
+        assert store.vector_search([1.0, 0.0, 0.0], limit=1) == [("mem_vec_keep", 0.0)]
+        gen = store._current_vector_generation()  # noqa: SLF001
+        assert sqlite_module._VECTOR_CACHE.get(db_path, 3, gen) is not None  # noqa: SLF001
+
+        removed = store.delete_embeddings(["mem_session_without_vector"])
+        assert removed == 0
+        assert sqlite_module._VECTOR_CACHE.get(db_path, 3, gen) is not None  # noqa: SLF001
+
+
+def test_get_node_alias_map_matches_build_node_alias_map(tmp_path: Path) -> None:
+    """Projected SQL alias map matches full build_node_alias_map without loading bodies."""
+    from synapse.storage.sqlite import build_node_alias_map
+
+    db_path = tmp_path / "synapse.db"
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        nodes = [
+            make_node(node_id="mem_a", title="Gateway Rate Limits", content="Body A", file_name="gateway-rate-limits.md", tags=["gateway", "API"]),
+            make_node(node_id="mem_b", title="AuthZ Shim", content="Body B", file_name="authz-shim.md", tags=[]),
+        ]
+        for n in nodes:
+            store.upsert_node(n)
+        assert store.get_node_alias_map() == build_node_alias_map(store.list_nodes())

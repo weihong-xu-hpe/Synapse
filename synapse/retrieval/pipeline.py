@@ -231,30 +231,40 @@ class RetrievalPipeline:
             vector_sets: list[list[tuple[str, float]]] = []
         else:
             vector_sets = [store.vector_search(query_embedding, limit=per_source_limit)]
-            for chunk in query.split(_QUERY_CHUNK_SEPARATOR):
-                chunk = chunk.strip()
-                if len(chunk) < _MIN_CHUNK_CHARS or chunk.casefold() == query.strip().casefold():
-                    continue
-                chunk_embedding = self._embed_query(chunk)
-                if chunk_embedding:
-                    vector_sets.append(store.vector_search(chunk_embedding, limit=per_source_limit))
+            chunks = [
+                chunk.strip()
+                for chunk in query.split(_QUERY_CHUNK_SEPARATOR)
+                if len(chunk.strip()) >= _MIN_CHUNK_CHARS and chunk.strip().casefold() != query.strip().casefold()
+            ]
+            if chunks:
+                for chunk_embedding in self._embed_queries(chunks):
+                    if chunk_embedding:
+                        vector_sets.append(store.vector_search(chunk_embedding, limit=per_source_limit))
         if exclude is not None:
             # ``exclude`` follows the service result_filter convention: it
-            # returns True for nodes to KEEP.
-            def _keep(node_id: str) -> bool:
-                node = store.get_node(node_id)
-                return node is not None and exclude(node)
-
-            fts_results = [(node_id, score) for node_id, score in fts_results if _keep(node_id)]
+            # returns True for nodes to KEEP. Batch-fetch candidate nodes once
+            # instead of issuing one SELECT per hit across FTS and vector legs.
+            candidate_ids = [
+                node_id
+                for result_set in (fts_results, *vector_sets)
+                for node_id, _ in result_set
+            ]
+            fetched = {node.id: node for node in store.get_nodes(candidate_ids)}
+            kept_ids = {node_id for node_id, node in fetched.items() if exclude(node)}
+            fts_results = [(node_id, score) for node_id, score in fts_results if node_id in kept_ids]
             vector_sets = [
-                [(node_id, score) for node_id, score in vs if _keep(node_id)]
+                [(node_id, score) for node_id, score in vs if node_id in kept_ids]
                 for vs in vector_sets
             ]
+        else:
+            fetched = {}
         ranked_ids = self.fuse_rankings((fts_results, *vector_sets), k=self.config.retrieval.rrf_k, limit=limit)
         ranked_id_list = [node_id for node_id, _ in ranked_ids]
-        nodes = {node.id: node for node in store.get_nodes(ranked_id_list)}
-        return [_AnchorCandidate(node=nodes[node_id], score=score) for node_id, score in ranked_ids if node_id in nodes]
-
+        missing_ids = [node_id for node_id in ranked_id_list if node_id not in fetched]
+        if missing_ids:
+            for node in store.get_nodes(missing_ids):
+                fetched[node.id] = node
+        return [_AnchorCandidate(node=fetched[node_id], score=score) for node_id, score in ranked_ids if node_id in fetched]
     @staticmethod
     def fuse_rankings(
         result_sets: Iterable[Sequence[tuple[str, float]]],
@@ -512,24 +522,30 @@ class RetrievalPipeline:
         ).strip()
 
     def _embed_query(self, query: str) -> list[float] | None:
+        vectors = self._embed_queries([query])
+        return vectors[0] if vectors else None
+
+    def _embed_queries(self, queries: Sequence[str]) -> list[list[float] | None]:
+        if not queries:
+            return []
         engine = self._embedding_engine
         backend = getattr(engine, "backend_name", "")
         if backend == "unavailable":
-            return None
+            return [None for _ in queries]
         try:
-            vector = engine.embed(query)
+            if len(queries) == 1:
+                raw_vectors: list[list[float]] = [engine.embed(queries[0])]
+            else:
+                raw_vectors = list(engine.embed_batch(list(queries)))
         except (OSError, RuntimeError, ValueError):
-            return None
-        if not vector:
-            return None
+            return [None for _ in queries]
         if backend == "remote_api" and not engine.is_available():
             # Remote provider degraded this batch to deterministic hash
             # vectors; searching with them would silently poison the vector
             # leg. Skip it — FTS + rerank still serve the query.
             LOGGER.warning("Skipping vector search leg: remote embedding provider degraded")
-            return None
-        return vector
-
+            return [None for _ in queries]
+        return [vector if vector else None for vector in raw_vectors]
     def _get_store(self) -> SQLiteNodeStore:
         if self._store is None:
             self._store = SQLiteNodeStore(

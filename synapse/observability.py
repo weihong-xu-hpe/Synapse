@@ -390,13 +390,16 @@ def _day_dreamer_runs(store: SQLiteNodeStore, start_utc: str, end_utc: str) -> d
                COALESCE(SUM(archived), 0) AS archived,
                COALESCE(SUM(condensed), 0) AS condensed,
                COALESCE(SUM(links_added), 0) AS links_added,
-               COALESCE(SUM(sampling_failures), 0) AS sampling_failures
+               COALESCE(SUM(sampling_failures), 0) AS sampling_failures,
+               COALESCE(SUM(synthesized_hubs), 0) AS synthesized_hubs,
+               COALESCE(SUM(semantic_merges), 0) AS semantic_merges,
+               COALESCE(SUM(oversized_compacted), 0) AS oversized_compacted,
+               COALESCE(SUM(repointed_links), 0) AS repointed_links
         FROM dreamer_runs WHERE started_at >= ? AND started_at < ?
         """,
         (start_utc, end_utc),
     ).fetchone()
     return {key: int(row[key] or 0) for key in row.keys()}
-
 
 def _day_search_stats(store: SQLiteNodeStore, start_utc: str, end_utc: str) -> dict[str, Any]:
     rows = store.connection.execute(
@@ -803,7 +806,10 @@ def _report_sections(
         """
         SELECT COUNT(*) AS runs,
                COALESCE(SUM(archived), 0) AS archived,
-               COALESCE(SUM(condensed), 0) AS condensed
+               COALESCE(SUM(condensed), 0) AS condensed,
+               COALESCE(SUM(synthesized_hubs), 0) AS synthesized_hubs,
+               COALESCE(SUM(semantic_merges), 0) AS semantic_merges,
+               COALESCE(SUM(oversized_compacted), 0) AS oversized_compacted
         FROM dreamer_runs WHERE started_at >= ?
         """,
         (cutoff,),
@@ -819,7 +825,9 @@ def _report_sections(
         f"{int(distiller_row['archived'])} archived"
     )
     lines.append(
-        f"- Dreamer: {int(dreamer_row['runs'])} runs, {int(dreamer_row['archived'])} archived, {int(dreamer_row['condensed'])} condensed"
+        f"- Dreamer: {int(dreamer_row['runs'])} runs, {int(dreamer_row['archived'])} archived, "
+        f"{int(dreamer_row['condensed'])} condensed, {int(dreamer_row['synthesized_hubs'])} hubs, "
+        f"{int(dreamer_row['semantic_merges'])} merges, {int(dreamer_row['oversized_compacted'])} compacted"
     )
     lines.append("")
 
@@ -1510,7 +1518,10 @@ def _north_star_llm_gate_health(store: SQLiteStoreLike, runtime_paths: RuntimePa
             SELECT COUNT(*) AS runs,
                    COALESCE(MAX(started_at), '') AS last_started_at,
                    COALESCE(SUM(condensed), 0) AS condensed,
-                   COALESCE(SUM(links_added), 0) AS links_added
+                   COALESCE(SUM(links_added), 0) AS links_added,
+                   COALESCE(SUM(synthesized_hubs), 0) AS synthesized_hubs,
+                   COALESCE(SUM(semantic_merges), 0) AS semantic_merges,
+                   COALESCE(SUM(oversized_compacted), 0) AS oversized_compacted
             FROM dreamer_runs WHERE started_at >= ?
             """,
             (_utc_cutoff(7),),
@@ -1520,10 +1531,20 @@ def _north_star_llm_gate_health(store: SQLiteStoreLike, runtime_paths: RuntimePa
             "last_started_at": str(dreamer_row["last_started_at"] or "") or None,
             "condensed_last_7d": int(dreamer_row["condensed"] or 0),
             "links_added_last_7d": int(dreamer_row["links_added"] or 0),
+            "synthesized_hubs_last_7d": int(dreamer_row["synthesized_hubs"] or 0),
+            "semantic_merges_last_7d": int(dreamer_row["semantic_merges"] or 0),
+            "oversized_compacted_last_7d": int(dreamer_row["oversized_compacted"] or 0),
         }
     except Exception:  # noqa: BLE001
-        dreamer = {"runs_last_7d": 0, "last_started_at": None, "condensed_last_7d": 0, "links_added_last_7d": 0}
-
+        dreamer = {
+            "runs_last_7d": 0,
+            "last_started_at": None,
+            "condensed_last_7d": 0,
+            "links_added_last_7d": 0,
+            "synthesized_hubs_last_7d": 0,
+            "semantic_merges_last_7d": 0,
+            "oversized_compacted_last_7d": 0,
+        }
     return {
         "runs": runs,
         "items_extracted": items_extracted,

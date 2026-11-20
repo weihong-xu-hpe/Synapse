@@ -43,27 +43,40 @@ class _ProcessVectorCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[tuple[str, int], tuple[int, dict[str, array]]] = {}
+        # (resolved_path, dim) -> (generation, id->array map, ordered ids, float64 matrix)
+        self._entries: dict[
+            tuple[str, int],
+            tuple[int, dict[str, array], tuple[str, ...], np.ndarray],
+        ] = {}
 
     @staticmethod
     def _key(db_path: Path, dimension: int) -> tuple[str, int]:
         return (str(db_path.resolve()), dimension)
 
-    def get(self, db_path: Path, dimension: int, generation: int) -> dict[str, array] | None:
+    def get(
+        self, db_path: Path, dimension: int, generation: int
+    ) -> tuple[dict[str, array], tuple[str, ...], np.ndarray] | None:
         with self._lock:
             entry = self._entries.get(self._key(db_path, dimension))
         if entry is not None and entry[0] == generation:
-            return entry[1]
+            return entry[1], entry[2], entry[3]
         return None
 
-    def put(self, db_path: Path, dimension: int, generation: int, vectors: dict[str, array]) -> None:
+    def put(
+        self,
+        db_path: Path,
+        dimension: int,
+        generation: int,
+        vectors: dict[str, array],
+        ids: tuple[str, ...],
+        matrix: np.ndarray,
+    ) -> None:
         with self._lock:
-            self._entries[self._key(db_path, dimension)] = (generation, vectors)
+            self._entries[self._key(db_path, dimension)] = (generation, vectors, ids, matrix)
 
     def drop(self, db_path: Path, dimension: int) -> None:
         with self._lock:
             self._entries.pop(self._key(db_path, dimension), None)
-
 
 _VECTOR_CACHE = _ProcessVectorCache()
 
@@ -121,7 +134,10 @@ class DreamerRunMetrics:
     condensed: int
     warnings: int
     sampling_failures: int
-
+    synthesized_hubs: int = 0
+    semantic_merges: int = 0
+    oversized_compacted: int = 0
+    repointed_links: int = 0
 
 @dataclass(slots=True, frozen=True)
 class WriteMemoryEventMetrics:
@@ -363,12 +379,31 @@ class SQLiteNodeStore:
         }
         if not {"items_quarantined", "failures", "trigger", "attempts_json"}.issubset(distiller_columns):
             return True
+        dreamer_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(dreamer_runs)").fetchall()
+        }
+        if not {
+            "synthesized_hubs",
+            "semantic_merges",
+            "oversized_compacted",
+            "repointed_links",
+        }.issubset(dreamer_columns):
+            return True
         node_columns = {
             str(row["name"])
             for row in self._connection.execute("PRAGMA table_info(nodes)").fetchall()
         }
         # P1B usage counters: legacy databases need the ADD COLUMN migration.
         if not {"retrieved_count", "injected_count", "used_count"}.issubset(node_columns):
+            return True
+        node_indexes = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'nodes'"
+            ).fetchall()
+        }
+        if not {"idx_nodes_type_status_okf_meta", "idx_nodes_alias_lookup"}.issubset(node_indexes):
             return True
         stored_version = self.get_meta("schema_version")
         stored_dimension = self.get_meta("embedding_dimension")
@@ -415,6 +450,12 @@ class SQLiteNodeStore:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_type_status_okf_meta ON nodes(type, status, okf_meta)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_alias_lookup ON nodes(id, title, file_path, tags)"
+        )
         connection.execute(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -480,7 +521,11 @@ class SQLiteNodeStore:
                 archived INTEGER NOT NULL,
                 condensed INTEGER NOT NULL,
                 warnings INTEGER NOT NULL,
-                sampling_failures INTEGER NOT NULL
+                sampling_failures INTEGER NOT NULL,
+                synthesized_hubs INTEGER NOT NULL DEFAULT 0,
+                semantic_merges INTEGER NOT NULL DEFAULT 0,
+                oversized_compacted INTEGER NOT NULL DEFAULT 0,
+                repointed_links INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -584,6 +629,13 @@ class SQLiteNodeStore:
             connection.execute("ALTER TABLE distiller_runs ADD COLUMN \"trigger\" TEXT NOT NULL DEFAULT 'legacy'")
         if "attempts_json" not in distiller_columns:
             connection.execute("ALTER TABLE distiller_runs ADD COLUMN attempts_json TEXT NOT NULL DEFAULT '[]'")
+        dreamer_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(dreamer_runs)").fetchall()
+        }
+        for column in ("synthesized_hubs", "semantic_merges", "oversized_compacted", "repointed_links"):
+            if column not in dreamer_columns:
+                connection.execute(f"ALTER TABLE dreamer_runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
 
     def _ensure_node_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -851,11 +903,12 @@ class SQLiteNodeStore:
         if not node_ids:
             return 0
         with self.transaction() as connection:
-            self._invalidate_vector_cache()
             placeholders = ", ".join("?" for _ in node_ids)
             cursor = connection.execute(f"DELETE FROM nodes_vec WHERE id IN ({placeholders})", node_ids)
-            return int(cursor.rowcount)
-
+            removed = int(cursor.rowcount)
+            if removed > 0:
+                self._invalidate_vector_cache()
+            return removed
     def delete_edges_touching(self, node_ids: list[str]) -> int:
         """Delete edges with any of the given ids as source or target; returns rows removed."""
 
@@ -1081,14 +1134,23 @@ class SQLiteNodeStore:
         raise ValueError("direction must be 'outgoing' or 'incoming'")
 
     def vector_search(self, embedding: list[float], limit: int = 10) -> list[tuple[str, float]]:
-        if not embedding:
+        if not embedding or limit <= 0:
             return []
         normalized_query = _normalize_embedding(embedding, self.embedding_dimension)
-        vectors = self._load_vectors_cached()
-        scored: list[tuple[str, float]] = []
-        for node_id, candidate_vector in vectors.items():
-            distance = _cosine_distance(normalized_query, list(candidate_vector))
-            scored.append((node_id, distance))
+        _vectors, ids, matrix = self._load_vector_cache_entry()
+        if not ids:
+            return []
+        query_vec = np.asarray(normalized_query, dtype=np.float64)
+        dots = matrix @ query_vec
+        distances = np.round(1.0 - np.clip(dots, -1.0, 1.0), 8)
+        count = len(ids)
+        if count > limit:
+            partition = np.argpartition(distances, limit - 1)[:limit]
+            cutoff = float(distances[partition].max())
+            candidate_indices = np.flatnonzero(distances <= cutoff)
+            scored = [(ids[int(index)], float(distances[int(index)])) for index in candidate_indices]
+        else:
+            scored = [(ids[index], float(distances[index])) for index in range(count)]
         scored.sort(key=lambda item: (item[1], item[0]))
         return scored[:limit]
 
@@ -1103,15 +1165,14 @@ class SQLiteNodeStore:
         except (TypeError, ValueError):
             return 0
 
-    def _load_vectors_cached(self) -> dict[str, array]:
-        """Return {node_id: packed vector} shared process-wide.
+    def _load_vector_cache_entry(self) -> tuple[dict[str, array], tuple[str, ...], np.ndarray]:
+        """Return ``({node_id: array}, ordered_ids, float64_matrix)`` shared process-wide.
 
         Invalidation invariant: every nodes_vec mutation (insert/update/delete,
         including FK ON DELETE CASCADE deletes from nodes — cascade actions fire
         child triggers) bumps schema_meta.vector_generation via triggers. Each
         read validates its cached generation with one cheap SELECT, which is
-        authoritative across processes and connections. Vectors are stored as
-        pre-normalized array('d') (8 bytes/float → ~16 MB for 2k×1024).
+        authoritative across processes and connections.
         """
 
         generation = self._current_vector_generation()
@@ -1123,14 +1184,65 @@ class SQLiteNodeStore:
             (self.embedding_dimension,),
         ).fetchall()
         vectors: dict[str, array] = {}
+        parsed_ids: list[str] = []
+        parsed_rows: list[list[float]] = []
         for row in rows:
             try:
-                vectors[str(row["id"])] = array("d", json.loads(str(row["embedding"])))
+                values = json.loads(str(row["embedding"]))
+                if len(values) != self.embedding_dimension:
+                    continue
+                node_id = str(row["id"])
+                vectors[node_id] = array("d", values)
+                parsed_ids.append(node_id)
+                parsed_rows.append(values)
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
-        _VECTOR_CACHE.put(self.db_path, self.embedding_dimension, generation, vectors)
+        ids = tuple(parsed_ids)
+        matrix = (
+            np.asarray(parsed_rows, dtype=np.float64)
+            if parsed_rows
+            else np.empty((0, self.embedding_dimension), dtype=np.float64)
+        )
+        _VECTOR_CACHE.put(self.db_path, self.embedding_dimension, generation, vectors, ids, matrix)
+        return vectors, ids, matrix
+
+    def _load_vectors_cached(self) -> dict[str, array]:
+        """Return {node_id: packed vector} shared process-wide."""
+
+        vectors, _ids, _matrix = self._load_vector_cache_entry()
         return vectors
 
+    def get_node_alias_map(self) -> dict[str, str]:
+        """Build wiki-link alias map without loading node bodies from disk."""
+
+        rows = self._connection.execute("SELECT id, title, file_path, tags FROM nodes").fetchall()
+        alias_map: dict[str, str] = {}
+        for row in rows:
+            node_id = str(row["id"])
+            title = str(row["title"] or "")
+            stem = Path(str(row["file_path"] or "")).stem
+            candidates = {
+                node_id,
+                node_id.casefold(),
+                title,
+                title.casefold(),
+                stem,
+                stem.casefold(),
+            }
+            try:
+                tags = json.loads(row["tags"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+            if isinstance(tags, list):
+                for tag in tags:
+                    tag_text = str(tag)
+                    candidates.add(tag_text)
+                    candidates.add(tag_text.casefold())
+            for candidate in candidates:
+                cleaned = candidate.strip()
+                if cleaned and cleaned not in alias_map:
+                    alias_map[cleaned] = node_id
+        return alias_map
     def _invalidate_vector_cache(self) -> None:
         # The DB-stored generation is the source of truth; dropping the process
         # entry only avoids a stale hit if a same-tick write hasn't committed.
@@ -1639,8 +1751,9 @@ class SQLiteNodeStore:
                     stale_scanned, superseded_scanned, disputed_scanned, missing_link_pairs_scanned,
                     triage_keep, triage_condense, triage_archive, links_added,
                     conflicts_superseded, conflicts_both_valid, archived, condensed,
-                    warnings, sampling_failures
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    warnings, sampling_failures,
+                    synthesized_hubs, semantic_merges, oversized_compacted, repointed_links
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     metrics.started_at,
@@ -1661,9 +1774,12 @@ class SQLiteNodeStore:
                     metrics.condensed,
                     metrics.warnings,
                     metrics.sampling_failures,
+                    metrics.synthesized_hubs,
+                    metrics.semantic_merges,
+                    metrics.oversized_compacted,
+                    metrics.repointed_links,
                 ),
             )
-
     def record_distiller_run(self, metrics: DistillerRunMetrics) -> None:
         """Persist a low-cardinality distiller sweep summary for long-term stats."""
         with self.transaction() as connection:
@@ -1834,6 +1950,10 @@ class SQLiteNodeStore:
                 "conflicts_both_valid": int(aggregate["conflicts_both_valid"] or 0),
                 "warnings": int(aggregate["warnings"] or 0),
                 "sampling_failures": int(aggregate["sampling_failures"] or 0),
+                "synthesized_hubs": int(aggregate["synthesized_hubs"] or 0),
+                "semantic_merges": int(aggregate["semantic_merges"] or 0),
+                "oversized_compacted": int(aggregate["oversized_compacted"] or 0),
+                "repointed_links": int(aggregate["repointed_links"] or 0),
             },
         }
 
@@ -1895,7 +2015,11 @@ class SQLiteNodeStore:
                 SUM(conflicts_superseded) AS conflicts_superseded,
                 SUM(conflicts_both_valid) AS conflicts_both_valid,
                 SUM(warnings) AS warnings,
-                SUM(sampling_failures) AS sampling_failures
+                SUM(sampling_failures) AS sampling_failures,
+                SUM(synthesized_hubs) AS synthesized_hubs,
+                SUM(semantic_merges) AS semantic_merges,
+                SUM(oversized_compacted) AS oversized_compacted,
+                SUM(repointed_links) AS repointed_links
             FROM dreamer_runs
             """
         ).fetchone()

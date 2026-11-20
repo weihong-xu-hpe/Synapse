@@ -348,6 +348,20 @@ class Dreamer:
 
         # Stage 6: Report
         completed_at = self._utc_now()
+        all_archived_ids = list(
+            dict.fromkeys(
+                [
+                    *archived_ids,
+                    *archived_superseded_ids,
+                    *(member_id for result in merge_results for member_id in result.superseded_ids),
+                    *(
+                        result.node_id
+                        for result in compaction_results
+                        if result.node_id in self._archived_this_run
+                    ),
+                ]
+            )
+        )
         report = DreamerReport(
             started_at=format_utc_datetime(started_at),
             completed_at=format_utc_datetime(completed_at),
@@ -355,7 +369,7 @@ class Dreamer:
             triage=tuple(triage_decisions),
             links_added=tuple(link_decisions),
             conflicts_resolved=tuple(conflict_decisions),
-            archived=tuple([*archived_ids, *archived_superseded_ids]),
+            archived=tuple(all_archived_ids),
             condensed=tuple(condensed_results),
             synthesized=tuple(synthesis_results),
             merged=tuple(merge_results),
@@ -853,6 +867,22 @@ class Dreamer:
         if content is None:
             return None
 
+        limit = self.config.dreamer.thresholds.oversized_compaction_bytes
+        member_max_bytes = max(len(member.content.encode("utf-8")) for member in members)
+        merged_bytes = len(content.encode("utf-8"))
+        if merged_bytes > limit and merged_bytes >= member_max_bytes:
+            warnings.append(
+                DreamerWarning(
+                    code="semantic_merge_oversized",
+                    node_id=members[0].id,
+                    message=(
+                        f"Semantic merge product exceeded the {limit}-byte cap without shrinking "
+                        f"({merged_bytes} B >= {member_max_bytes} B); skipping cluster."
+                    ),
+                )
+            )
+            return None
+
         now = self._utc_now()
         winner_id = generate_node_id(title, now)
         existing = store.get_node(winner_id)
@@ -864,7 +894,6 @@ class Dreamer:
                 )
             )
             return None
-
         now_iso = format_utc_datetime(now)
         metadata = self._knowledge_metadata(
             node_id=winner_id,
@@ -1067,66 +1096,143 @@ class Dreamer:
     ) -> CompactionResult | None:
         """Split an oversized node by ``##`` section into atomic siblings (§3.4(2)).
 
-        Purely deterministic: sections are packed in order into <= 4 KB chunks
-        and copied verbatim, so no content can be lost. Siblings share the
-        source's sources/project and link to each other via ``[[...]]`` +
-        ``edges``; the source is superseded and archived.
+        Purely deterministic: knowledge sections are packed in order into
+        ``<= limit`` byte chunks (with provenance kept out of standalone
+        shards and sibling-link overhead reserved up front) and copied
+        verbatim, so no content can be lost. Siblings inherit the source's
+        project and valid OKF structure (typed ``fact`` with Takeaway +
+        Details + Sources when the slice no longer satisfies the original
+        type's required sections), link to each other via ``[[...]]`` +
+        ``edges``, and supersede/archive the source.
         """
 
         limit = self.config.dreamer.thresholds.oversized_compaction_bytes
-        chunks = self._pack_sections(node.content, limit)
-        if chunks is None:
+        full_knowledge = self._strip_provenance_sections(node.content, strip_takeaway=False)
+        takeaway_text = self._extract_takeaway_line(full_knowledge) or node.title
+        if len(takeaway_text) > 200:
+            takeaway_text = takeaway_text[:199] + "…"
+        # Strip ## Takeaway before packing so part 1 does not pay Takeaway twice
+        # (every part gets `## Takeaway` + its sections consistently).
+        knowledge_body = self._strip_provenance_sections(node.content, strip_takeaway=True)
+
+        now = self._utc_now()
+        now_iso = format_utc_datetime(now)
+        sources = sorted({*node.metadata.sources, node.id})
+        sources_block = "## Sources\n\n" + "\n".join(f"- {source}" for source in sources)
+        sources_bytes = len(sources_block.encode("utf-8")) + 2
+        takeaway_bytes = len(f"## Takeaway\n\n{takeaway_text}\n\n## Details\n\n".encode("utf-8"))
+        sample_id = generate_node_id(f"{node.title} — part 1", now)
+        # Sibling link format: `[[<id>_part_N]]\n` (or compact chain when many parts).
+        link_bytes_per_sibling = len(sample_id.encode("utf-8")) + 12
+
+        from synapse.models import infer_project
+
+        resolved_project = (node.metadata.project or "").strip() or infer_project(node)
+
+        # Compute chunk packing with headroom for Takeaway/Details wrapper and
+        # sibling links (plus ## Sources when the byte cap permits).
+        part_specs: list[tuple[str, str, str | None, str]] = []
+        final_contents: list[str] = []
+        est_links = 1
+        chunks: list[str] | None = None
+        for _attempt in range(3):
+            link_overhead = est_links * link_bytes_per_sibling + 4
+            include_sources_block = (sources_bytes + takeaway_bytes + link_overhead + 128) <= limit
+            wrapper_overhead = takeaway_bytes + link_overhead + (sources_bytes if include_sources_block else 0)
+            # Reserve wrapper overhead, while never shrinking below what the
+            # node's own smallest multi-section chunks need if the limit is small.
+            effective_limit = limit - wrapper_overhead
+            if effective_limit < 64:
+                chunks = None
+                break
+            chunks = self._pack_sections(knowledge_body, effective_limit)
+            if chunks is None:
+                break
+
+            part_specs = []
+            used_ids: set[str] = set()
+            for index, chunk in enumerate(chunks, start=1):
+                part_type = node.metadata.okf_type
+                part_body = chunk
+                if part_type and self._missing_required_sections(part_body, part_type):
+                    # A slice rarely carries every required section of a multi-section
+                    # type (e.g. pitfall Symptom/Cause/Fix); wrap it cleanly as a
+                    # valid OKF `fact` so it stays typed and handbook-indexed.
+                    part_type = "fact"
+                    if not self._has_heading(part_body, "Details"):
+                        part_body = self._wrap_as_fact_body(part_body, takeaway_text)
+                elif not self._has_heading(part_body, "Takeaway"):
+                    part_body = f"## Takeaway\n\n{takeaway_text}\n\n{part_body}"
+                if include_sources_block:
+                    part_body = f"{part_body.rstrip()}\n\n{sources_block}"
+                labeled_title = f"{node.title} — part {index}"
+                part_id = generate_node_id(labeled_title, now)
+                # Slugs drop the part number, so every sibling needs a distinct id.
+                # Strip any trailing "_part" first: with the numbered title already
+                # yielding "..._part", appending blindly produced "_part_part_2".
+                if part_id in used_ids or store.get_node(part_id) is not None:
+                    base_part_id = re.sub(r"(?:_part)+$", "", part_id)
+                    part_id = f"{base_part_id}_part_{index}"
+                used_ids.add(part_id)
+                part_specs.append((part_id, labeled_title, part_type, part_body))
+
+            all_part_ids = [spec[0] for spec in part_specs]
+            # Link every sibling directly when all-pairs fits cleanly; for many-part
+            # splits under tight caps, fall back to a directed ring (1 link per part)
+            # so every shard stays <= limit while preserving full graph connectivity.
+            candidate_contents: list[str] = []
+            max_final_bytes = 0
+            for idx, (part_id, _title, _ptype, part_body) in enumerate(part_specs):
+                all_siblings = [other_id for other_id in all_part_ids if other_id != part_id]
+                linked = part_body.rstrip("\n") + "\n\n" + "\n".join(f"[[{s}]]" for s in all_siblings) + "\n"
+                if len(linked.encode("utf-8")) > limit and len(all_part_ids) > 2:
+                    next_sibling = all_part_ids[(idx + 1) % len(all_part_ids)]
+                    linked = part_body.rstrip("\n") + f"\n\n[[{next_sibling}]]\n"
+                size = len(linked.encode("utf-8"))
+                max_final_bytes = max(max_final_bytes, size)
+                candidate_contents.append(linked)
+
+            if max_final_bytes <= limit:
+                final_contents = candidate_contents
+                break
+            next_est = est_links + 1
+            if next_est > max(1, len(part_specs) - 1):
+                chunks = None
+                break
+            est_links = next_est
+
+        if not chunks or not final_contents:
             warnings.append(
                 DreamerWarning(
                     code="oversized_split_impossible",
                     node_id=node.id,
                     message=(
-                        "Node exceeds the size cap but has no splittable '## ' section boundary "
-                        "(or a single section is already over the cap); keeping it as is."
+                        "Node exceeds the size cap but cannot be split into <= "
+                        f"{limit}-byte typed parts; keeping it as is."
                     ),
                 )
             )
             return None
-
-        now = self._utc_now()
-        now_iso = format_utc_datetime(now)
-        sources = sorted({*node.metadata.sources, node.id})
         parts: list[Node] = []
-        used_ids: set[str] = set()
-        for index, chunk in enumerate(chunks, start=1):
-            part_type = node.metadata.okf_type
-            if part_type and self._missing_required_sections(chunk, part_type):
-                part_type = None  # a slice rarely carries every required section
-            labeled_title = f"{node.title} — part {index}"
-            part_id = generate_node_id(labeled_title, now)
-            # Slugs drop the part number, so every sibling needs a distinct id.
-            # Strip any trailing "_part" first: with the numbered title already
-            # yielding "..._part", appending blindly produced "_part_part_2".
-            if part_id in used_ids or store.get_node(part_id) is not None:
-                base_part_id = re.sub(r"(?:_part)+$", "", part_id)
-                part_id = f"{base_part_id}_part_{index}"
-            used_ids.add(part_id)
+        for (part_id, labeled_title, part_type, _part_body), linked_content in zip(part_specs, final_contents, strict=True):
             metadata = self._knowledge_metadata(
                 node_id=part_id,
                 title=labeled_title,
                 okf_type=part_type,
+                okf_version=1 if part_type else None,
                 sources=sources,
                 tags=sorted({*node.metadata.tags, "dreamer-split"}),
                 now_iso=now_iso,
-                project=node.metadata.project,
+                project=resolved_project,
                 t_valid=now_iso,
             )
-            parts.append(Node(metadata=metadata, content=chunk))
-
-        parts = [self._persist(store, part) for part in parts]
+            parts.append(self._persist(store, Node(metadata=metadata, content=linked_content)))
 
         bytes_after = 0
         for part in parts:
             siblings = [other.id for other in parts if other.id != part.id]
-            content = part.content.rstrip("\n") + "\n\n" + "\n".join(f"[[{sibling}]]" for sibling in siblings) + "\n"
-            self._persist(store, Node(metadata=part.metadata, content=content, file_path=part.file_path))
             store.upsert_edges(part.id, siblings)
-            bytes_after += len(content.encode("utf-8"))
+            bytes_after += len(part.content.encode("utf-8"))
 
         superseded = self._with_metadata(
             node,
@@ -1145,10 +1251,62 @@ class Dreamer:
         return CompactionResult(node_id=node.id, bytes_before=bytes_before, bytes_after=bytes_after)
 
     @staticmethod
-    def _pack_sections(content: str, limit: int) -> list[str] | None:
-        """Pack ``##`` sections into <= *limit* byte chunks, or None when impossible."""
+    def _has_heading(content: str, heading_name: str) -> bool:
+        return heading_name.casefold() in {name.casefold() for name in _split_sections(content)}
 
-        blocks: list[list[str]] = []
+    @staticmethod
+    def _extract_takeaway_line(content: str) -> str:
+        sections = _split_sections(content)
+        for name, body in sections.items():
+            if name.casefold() == "takeaway":
+                for line in body.splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        return stripped
+        return ""
+
+    @staticmethod
+    def _wrap_as_fact_body(chunk: str, takeaway_text: str) -> str:
+        """Ensure a split shard is a valid OKF ``fact`` (Takeaway + Details) verbatim."""
+
+        lines = chunk.splitlines()
+        takeaway_lines: list[str] = []
+        detail_lines: list[str] = []
+        in_takeaway = False
+        fence: str | None = None
+        for line in lines:
+            stripped = line.strip()
+            marker = stripped[:3]
+            if fence is None and marker in {"```", "~~~"}:
+                fence = marker
+            elif fence is not None and stripped.startswith(fence):
+                fence = None
+            elif fence is None and stripped.startswith("## "):
+                heading = stripped[3:].strip()
+                if heading.casefold() == "takeaway":
+                    in_takeaway = True
+                    continue
+                in_takeaway = False
+                detail_lines.append(line)
+                continue
+            if in_takeaway:
+                takeaway_lines.append(line)
+            else:
+                detail_lines.append(line)
+        resolved_takeaway = next((ln.strip() for ln in takeaway_lines if ln.strip()), "") or takeaway_text
+        details_body = "\n".join(detail_lines).strip()
+        return f"## Takeaway\n\n{resolved_takeaway}\n\n## Details\n\n{details_body}"
+
+    @staticmethod
+    def _pack_sections(content: str, limit: int) -> list[str] | None:
+        """Pack knowledge ``##`` sections into <= *limit* byte chunks, or None when impossible.
+
+        Never emits a standalone provenance-only shard (``## Sources`` /
+        ``## Related`` / ``## Evidence``) or a Takeaway-only shard.
+        """
+
+        blocks: list[tuple[str | None, list[str]]] = []
+        current_heading: str | None = None
         current: list[str] = []
         fence: str | None = None
         for line in content.splitlines():
@@ -1158,35 +1316,56 @@ class Dreamer:
                 fence = marker
             elif fence is not None and stripped.startswith(fence):
                 fence = None
-            elif fence is None and stripped.startswith("## ") and current:
-                blocks.append(current)
+            elif fence is None and stripped.startswith("## "):
+                if any(item.strip() for item in current):
+                    blocks.append((current_heading, current))
+                current_heading = stripped[3:].strip().casefold()
                 current = [line]
                 continue
             current.append(line)
-        if current:
-            blocks.append(current)
-        blocks = [block for block in blocks if any(line.strip() for line in block)]
-        if len(blocks) < 2:
+        if any(item.strip() for item in current):
+            blocks.append((current_heading, current))
+        # Drop provenance sections so they can never become standalone shards;
+        # the caller attaches ## Sources cleanly to each part.
+        knowledge_blocks = [
+            (heading, block)
+            for heading, block in blocks
+            if heading not in _PROVENANCE_SECTION_NAMES
+        ]
+        # Require at least 2 substantive non-Takeaway knowledge blocks so
+        # Takeaway alone never splits away from a single body section.
+        substantive_blocks = [
+            block for heading, block in knowledge_blocks if heading != "takeaway"
+        ]
+        if len(substantive_blocks) < 2:
             return None
 
         chunks: list[str] = []
         pending: list[str] = []
+        pending_has_substantive = False
         size = 0
-        for block in blocks:
+        for heading, block in knowledge_blocks:
             text = "\n".join(block).strip("\n")
-            block_bytes = len(text.encode("utf-8")) + 1
+            block_bytes = len(text.encode("utf-8")) + 2
             if block_bytes > limit:
                 return None  # an unsplittable single section
-            if pending and size + block_bytes > limit:
+            if pending and pending_has_substantive and size + block_bytes > limit:
                 chunks.append("\n\n".join(pending))
                 pending = []
+                pending_has_substantive = False
                 size = 0
+            elif pending and not pending_has_substantive and size + block_bytes > limit:
+                # Takeaway + first substantive section alone exceeds the cap.
+                return None
             pending.append(text)
+            if heading != "takeaway":
+                pending_has_substantive = True
             size += block_bytes
         if pending:
+            if not pending_has_substantive:
+                return None
             chunks.append("\n\n".join(pending))
         return chunks if len(chunks) > 1 else None
-
     def _materialize_compaction(
         self,
         node: Node,
@@ -2048,6 +2227,10 @@ class Dreamer:
                     condensed=len(report.condensed),
                     warnings=len(report.warnings),
                     sampling_failures=sampling_failures,
+                    synthesized_hubs=len(report.synthesized),
+                    semantic_merges=len(report.merged),
+                    oversized_compacted=len(report.compacted),
+                    repointed_links=report.repointed_links,
                 )
             )
         except sqlite3.DatabaseError as exc:  # pragma: no cover - metrics must never break lifecycle maintenance
