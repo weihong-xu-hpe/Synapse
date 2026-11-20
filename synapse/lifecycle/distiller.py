@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -288,21 +289,90 @@ class Distiller:
         finally:
             manager.close()
 
+    def _effective_archive_timestamp(self, node: Node, *, cutoff: datetime, now: datetime | None = None) -> datetime | None:
+        """Return the effective timestamp used for retention archival.
+
+        Uses file mtime when available, but falls back to ``node.metadata.created_at``
+        when ``created_at <= cutoff`` and the file has not been modified in the last
+        7 days (so migrated transcripts whose mtime was reset archive on schedule
+        without touching active long-lived sessions).
+        """
+
+        updated_at = self._content_updated_at(node)
+        if updated_at is None:
+            return None
+        if updated_at <= cutoff:
+            return updated_at
+        reference_now = now or datetime.now(UTC)
+        created_at = node.metadata.created_at
+        if created_at <= cutoff and updated_at <= reference_now - timedelta(days=7):
+            return created_at
+        return updated_at
+
+    @staticmethod
+    def _collision_safe_archive_path(destination: Path, node_id: str, now: datetime | None = None) -> Path:
+        if not destination.exists():
+            return destination
+        stamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+        candidate = destination.with_name(f"{node_id}_{stamp}{destination.suffix}")
+        counter = 1
+        while candidate.exists():
+            candidate = destination.with_name(f"{node_id}_{stamp}_{counter}{destination.suffix}")
+            counter += 1
+        return candidate
+
+    def _cleanup_stale_transcript_locks(self, max_age_hours: float = 24.0) -> int:
+        """Remove unlocked transcript lock files older than ``max_age_hours``."""
+
+        lock_dir = self.runtime_paths.base / ".transcript-locks"
+        if not lock_dir.is_dir():
+            return 0
+        cutoff_ts = (datetime.now(UTC) - timedelta(hours=max_age_hours)).timestamp()
+        removed = 0
+        for lock_path in lock_dir.glob("*.lock"):
+            try:
+                stat = lock_path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime > cutoff_ts:
+                continue
+            fd: int | None = None
+            try:
+                fd = os.open(lock_path, os.O_RDWR)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            try:
+                lock_path.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+            finally:
+                if fd is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    os.close(fd)
+        return removed
+
     def _archive_expired(self, report: DistillerReport) -> int:
         """Archive current-revision transcripts after their retention window."""
 
         del report  # the scheduler records episode metrics separately
         store = self._get_store()
-        cutoff = datetime.now(UTC) - timedelta(days=self.settings.retention_days)
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=self.settings.retention_days)
         archived = 0
         for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.TRANSIENT}):
             if not is_session_transcript(node) or not is_distilled_current(node):
                 continue
-            updated_at = self._content_updated_at(node)
-            if updated_at is None or updated_at > cutoff:
+            effective_ts = self._effective_archive_timestamp(node, cutoff=cutoff, now=now)
+            if effective_ts is None or effective_ts > cutoff:
                 continue
             if self._archive_transcript(node, cutoff=cutoff):
                 archived += 1
+        self._cleanup_stale_transcript_locks()
         return archived
 
     def _archive_transcript(self, node: Node, *, cutoff: datetime) -> bool:
@@ -313,13 +383,16 @@ class Distiller:
                 current = self._load_transcript_from_disk(node.id)
                 if current is None or not is_session_transcript(current) or not is_distilled_current(current):
                     return False
-                updated_at = self._content_updated_at(current)
-                if updated_at is None or updated_at > cutoff:
+                now = datetime.now(UTC)
+                effective_ts = self._effective_archive_timestamp(current, cutoff=cutoff, now=now)
+                if effective_ts is None or effective_ts > cutoff:
                     return False
-                destination = archive_node_path(self.runtime_paths.archive, node.id)
+                destination = self._collision_safe_archive_path(
+                    archive_node_path(self.runtime_paths.archive, node.id),
+                    node.id,
+                    now=now,
+                )
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if destination.exists():
-                    return False
                 source_path.replace(destination)
                 from synapse.sync import SyncManager
 

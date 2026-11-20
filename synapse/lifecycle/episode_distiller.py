@@ -422,31 +422,15 @@ class EpisodeDistiller:
         return run
 
     def _credit_retrieved_usage(self, run: EpisodeRun) -> None:
-        """Credit nodes the distiller actually updated (design doc §4.3(1)).
+        """No-op: distiller writes must not inflate ``used_count``.
 
-        Only an ``updated`` target was confirmed to shape new knowledge; passive
-        ``related_ids`` links are associative cross-references and must not
-        inflate ``used_count`` or suppress low-utility pruning.
+        ``used_count`` strictly tracks real agent memory usage reported via
+        ``record_memory_feedback``; distiller updates are maintenance writes,
+        not agent usage.
         """
 
-        used: list[str] = []
-        for op in run.ops:
-            if str(op.get("action")) == "updated":
-                target = op.get("target_id")
-                if isinstance(target, str) and target.startswith("mem_"):
-                    used.append(target)
-        used = list(dict.fromkeys(used))
-        if not used:
-            return
-        try:
-            with SQLiteNodeStore(
-                self.runtime_paths.base / "synapse.db",
-                embedding_dimension=self.config.embedding.dimension or 0,
-            ) as store:
-                store.record_memory_usage(used_ids=used)
-        except Exception as exc:  # noqa: BLE001 — credit accounting must never fail a run
-            self.service.logger.warning("Failed to credit distilled memory usage", exc_info=exc)
-
+        del run
+        return
     def _resolve_transcript(self, session: str) -> Node:
         with SQLiteNodeStore(
             self.runtime_paths.base / "synapse.db",

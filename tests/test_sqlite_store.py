@@ -713,3 +713,57 @@ def test_get_node_alias_map_matches_build_node_alias_map(tmp_path: Path) -> None
         for n in nodes:
             store.upsert_node(n)
         assert store.get_node_alias_map() == build_node_alias_map(store.list_nodes())
+
+
+def test_fts_excludes_transient_by_default_and_skips_session_indexing(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    persistent = make_node(
+        node_id="mem_20260307_pers",
+        title="Gateway Persistent",
+        content="Gateway token bucket quota.",
+        file_name="mem_20260307_pers.md",
+    )
+    transient_non_session = Node(
+        metadata=NodeMetadata(
+            id="mem_20260307_trans",
+            title="Gateway Transient",
+            type=NodeType.TRANSIENT,
+            status=NodeStatus.ACTIVE,
+        ),
+        content="Gateway transient note.",
+        file_path=Path("active/mem_20260307_trans.md"),
+    )
+    session_transcript = Node(
+        metadata=NodeMetadata(
+            id="mem_session_20260307_abc",
+            title="Gateway Session",
+            type=NodeType.TRANSIENT,
+            status=NodeStatus.ACTIVE,
+            session_key="sess-abc",
+        ),
+        content="Gateway raw session transcript.",
+        file_path=Path("transcripts/mem_session_20260307_abc.md"),
+    )
+
+    with SQLiteNodeStore(db_path, embedding_dimension=3) as store:
+        store.upsert_node(persistent)
+        store.upsert_node(transient_non_session)
+        store.upsert_node(session_transcript)
+
+        default_ids = [node_id for node_id, _ in store.fts_search("gateway", limit=10)]
+        assert default_ids == [persistent.id]
+
+        with_transient_ids = [node_id for node_id, _ in store.fts_search("gateway", limit=10, include_transient=True)]
+        assert set(with_transient_ids) == {persistent.id, transient_non_session.id, session_transcript.id}
+
+        bi_count = store.connection.execute(
+            "SELECT COUNT(*) FROM nodes_bi_content WHERE rowid = (SELECT rowid FROM nodes WHERE id = ?)",
+            (session_transcript.id,),
+        ).fetchone()[0]
+        assert bi_count == 0
+
+        fts_indexed = store.connection.execute(
+            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'gateway' AND rowid = (SELECT rowid FROM nodes WHERE id = ?)",
+            (session_transcript.id,),
+        ).fetchone()[0]
+        assert fts_indexed == 0

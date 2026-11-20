@@ -744,7 +744,7 @@ def test_schema_version_bumped_and_new_tables_exist(tmp_path: Path) -> None:
             str(row["name"])
             for row in store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
-    assert version == "7"
+    assert version == "8"
     assert {"search_events", "metrics_snapshots"}.issubset(tables)
 
 

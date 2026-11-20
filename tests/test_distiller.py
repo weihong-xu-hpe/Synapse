@@ -1207,3 +1207,93 @@ def test_short_episode_lesson_cap_and_screen_readable_policy() -> None:
     capped = _cap_lessons_for_source_size(lessons, 900)
     assert [l.topic for l in capped] == ["P1", "D1", "PR1"]
     assert len(_cap_lessons_for_source_size(lessons, 2000)) == 5
+
+
+def test_retention_archives_migrated_transcript_with_old_created_at_and_stale_locks(tmp_path: Path) -> None:
+    import fcntl
+    import time
+
+    distiller, paths = _make_distiller(tmp_path)
+    try:
+        now = datetime.now(UTC)
+        old_created = now - timedelta(days=60)
+        migrated_mtime = (now - timedelta(days=10)).timestamp()
+
+        # Migrated distilled transcript: created_at > 45d ago, mtime 10d ago (>7d idle) -> archived.
+        t_migrated = Node(
+            metadata=NodeMetadata(
+                id="mem_session_migrated",
+                title="Session summary — migrated",
+                type=NodeType.TRANSIENT,
+                created_at=old_created,
+                last_accessed=old_created,
+                session_key="s-mig",
+            ),
+            content="## User\nmigrated\n\n## Assistant\n" + "k " * 40,
+            file_path=Path("transcripts/mem_session_migrated.md"),
+        )
+        t_migrated = t_migrated.model_copy(
+            update={
+                "metadata": t_migrated.metadata.model_copy(
+                    update={"distilled_hash": content_sha256(t_migrated.content), "distilled_node_ids": ["mem_k"]}
+                )
+            }
+        )
+        write_node_file(t_migrated, base_path=paths.base)
+        # Pre-create destination to test collision-safe archive naming.
+        (paths.archive / "mem_session_migrated.md").write_text("existing", encoding="utf-8")
+
+        # Active long-lived session: created_at > 45d ago, mtime 1d ago (<7d) -> must NOT archive.
+        t_active = Node(
+            metadata=NodeMetadata(
+                id="mem_session_active_long",
+                title="Session summary — active",
+                type=NodeType.TRANSIENT,
+                created_at=old_created,
+                last_accessed=now,
+                session_key="s-act",
+            ),
+            content="## User\nactive\n\n## Assistant\n" + "k " * 40,
+            file_path=Path("transcripts/mem_session_active_long.md"),
+        )
+        t_active = t_active.model_copy(
+            update={
+                "metadata": t_active.metadata.model_copy(
+                    update={"distilled_hash": content_sha256(t_active.content), "distilled_node_ids": ["mem_k"]}
+                )
+            }
+        )
+        write_node_file(t_active, base_path=paths.base)
+        _sync_all(paths)
+
+        os.utime(paths.transcripts / "mem_session_migrated.md", (migrated_mtime, migrated_mtime))
+        recent_mtime = (now - timedelta(days=1)).timestamp()
+        os.utime(paths.transcripts / "mem_session_active_long.md", (recent_mtime, recent_mtime))
+
+        # Stale unlocked lock (>24h) should be cleaned; stale held lock must be preserved.
+        lock_dir = paths.base / ".transcript-locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        stale_unlocked = lock_dir / "stale.processing.lock"
+        stale_held = lock_dir / "held.processing.lock"
+        stale_unlocked.write_text("", encoding="utf-8")
+        stale_held.write_text("", encoding="utf-8")
+        stale_ts = time.time() - 30 * 3600
+        os.utime(stale_unlocked, (stale_ts, stale_ts))
+        os.utime(stale_held, (stale_ts, stale_ts))
+
+        held_fd = os.open(stale_held, os.O_RDWR)
+        try:
+            fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            archived = distiller._archive_expired(DistillerReport(started_at="x", completed_at="x", duration_ms=0))
+        finally:
+            fcntl.flock(held_fd, fcntl.LOCK_UN)
+            os.close(held_fd)
+
+        assert archived == 1
+        assert not (paths.transcripts / "mem_session_migrated.md").exists()
+        assert (paths.transcripts / "mem_session_active_long.md").exists()
+        assert len(list(paths.archive.glob("mem_session_migrated*.md"))) == 2
+        assert not stale_unlocked.exists()
+        assert stale_held.exists()
+    finally:
+        distiller.close()

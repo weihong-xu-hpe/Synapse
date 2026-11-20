@@ -1185,8 +1185,8 @@ def test_gatekeeper_credentials_are_scrubbed_from_the_written_node(tmp_path: Pat
         runner.close()
 
 
-def test_credit_retrieved_usage_excludes_passive_related_ids(tmp_path: Path) -> None:
-    """Only action=='updated' target_id increments used_count; related_ids must not."""
+def test_credit_retrieved_usage_does_not_inflate_used_count(tmp_path: Path) -> None:
+    """Distiller writes must not increment used_count on updated or related nodes."""
     config, paths, transcript = _setup(tmp_path)
     runner = _runner(config, paths, FakeClient())
     try:
@@ -1212,7 +1212,7 @@ def test_credit_retrieved_usage_excludes_passive_related_ids(tmp_path: Path) -> 
         runner._credit_retrieved_usage(run)
 
         with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as store:
-            assert store.get_node("mem_target").metadata.used_count == 1
+            assert store.get_node("mem_target").metadata.used_count == 0
             assert store.get_node("mem_related").metadata.used_count == 0
     finally:
         runner.close()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import threading
 from array import array
@@ -20,7 +21,7 @@ from synapse.storage.markdown import extract_wiki_links
 
 
 _MISSING_LINK_BLOCK_ROWS = 1024
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 FALLBACK_VECTOR_BACKEND = "python-fallback"
 SQLITE_VEC_BACKEND = "sqlite-vec"
 UTC_SUFFIX = "+00:00"
@@ -312,8 +313,20 @@ class SQLiteNodeStore:
             dimension_changed = stored_dimension not in {None, str(self.embedding_dimension)}
             backend_changed = stored_backend not in {None, self._vector_backend}
             if fts_new or dimension_changed or backend_changed or stored_version != str(SCHEMA_VERSION):
-                connection.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild')")
+                self._rebuild_fts_index(connection)
                 self._rebuild_bigram_index(connection)
+
+    def _rebuild_fts_index(self, connection: sqlite3.Connection) -> None:
+        """Rebuild nodes_fts excluding transient session transcripts."""
+
+        connection.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('delete-all')")
+        connection.execute(
+            """
+            INSERT INTO nodes_fts(rowid, title, content, tags)
+            SELECT rowid, title, content, tags FROM nodes
+            WHERE NOT (type = 'transient' AND id LIKE 'mem_session_%')
+            """
+        )
 
     def _rebuild_bigram_index(self, connection: sqlite3.Connection) -> None:
         """Rebuild the CJK-bigram shadow content and its FTS index from nodes."""
@@ -321,7 +334,12 @@ class SQLiteNodeStore:
         from synapse.storage.lexical import build_bigram_text
 
         connection.execute("DELETE FROM nodes_bi_content")
-        for row in connection.execute("SELECT rowid, title, content, tags FROM nodes").fetchall():
+        for row in connection.execute(
+            """
+            SELECT rowid, title, content, tags FROM nodes
+            WHERE NOT (type = 'transient' AND id LIKE 'mem_session_%')
+            """
+        ).fetchall():
             bi_title, bi_content, bi_tags = build_bigram_text(
                 str(row["title"] or ""), str(row["content"] or ""), str(row["tags"] or "[]")
             )
@@ -330,7 +348,6 @@ class SQLiteNodeStore:
                 (row["rowid"], bi_title, bi_content, bi_tags),
             )
         connection.execute("INSERT INTO nodes_fts_bigram(nodes_fts_bigram) VALUES ('rebuild')")
-
     def _get_meta(self, connection: sqlite3.Connection, key: str) -> str | None:
         row = connection.execute("SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
         if row is None:
@@ -674,21 +691,32 @@ class SQLiteNodeStore:
     def _ensure_fts_triggers(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
-            CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
+            DROP TRIGGER IF EXISTS nodes_ai;
+            DROP TRIGGER IF EXISTS nodes_ad;
+            DROP TRIGGER IF EXISTS nodes_au;
+
+            CREATE TRIGGER nodes_ai AFTER INSERT ON nodes
+            WHEN NOT (new.type = 'transient' AND new.id LIKE 'mem_session_%')
+            BEGIN
                 INSERT INTO nodes_fts(rowid, title, content, tags)
                 VALUES (new.rowid, new.title, new.content, new.tags);
             END;
 
-            CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
+            CREATE TRIGGER nodes_ad AFTER DELETE ON nodes
+            WHEN NOT (old.type = 'transient' AND old.id LIKE 'mem_session_%')
+            BEGIN
                 INSERT INTO nodes_fts(nodes_fts, rowid, title, content, tags)
                 VALUES ('delete', old.rowid, old.title, old.content, old.tags);
             END;
 
-            CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+            CREATE TRIGGER nodes_au AFTER UPDATE ON nodes
+            BEGIN
                 INSERT INTO nodes_fts(nodes_fts, rowid, title, content, tags)
-                VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+                SELECT 'delete', old.rowid, old.title, old.content, old.tags
+                WHERE NOT (old.type = 'transient' AND old.id LIKE 'mem_session_%');
                 INSERT INTO nodes_fts(rowid, title, content, tags)
-                VALUES (new.rowid, new.title, new.content, new.tags);
+                SELECT new.rowid, new.title, new.content, new.tags
+                WHERE NOT (new.type = 'transient' AND new.id LIKE 'mem_session_%');
             END;
             """
         )
@@ -824,20 +852,22 @@ class SQLiteNodeStore:
             )
             # Keep the CJK-bigram shadow content in sync (bigram-expanded text;
             # the nodes_bi_* triggers copy it into the FTS5 shadow index).
-            bi_title, bi_content, bi_tags = build_bigram_text(
-                str(node.title), str(node.content), json.dumps(node.metadata.tags)
-            )
+            # Skip transient session transcripts to avoid bloating FTS with raw sessions.
             connection.execute(
                 "DELETE FROM nodes_bi_content WHERE rowid = (SELECT rowid FROM nodes WHERE id = ?)",
                 (node.id,),
             )
-            connection.execute(
-                """
-                INSERT INTO nodes_bi_content (rowid, title, content, tags)
-                SELECT rowid, ?, ?, ? FROM nodes WHERE id = ?
-                """,
-                (bi_title, bi_content, bi_tags, node.id),
-            )
+            if not (node.metadata.type is NodeType.TRANSIENT and node.id.startswith("mem_session_")):
+                bi_title, bi_content, bi_tags = build_bigram_text(
+                    str(node.title), str(node.content), json.dumps(node.metadata.tags)
+                )
+                connection.execute(
+                    """
+                    INSERT INTO nodes_bi_content (rowid, title, content, tags)
+                    SELECT rowid, ?, ?, ? FROM nodes WHERE id = ?
+                    """,
+                    (bi_title, bi_content, bi_tags, node.id),
+                )
             if embedding is not None:
                 self._upsert_embedding(connection, node.id, embedding)
 
@@ -1279,7 +1309,7 @@ class SQLiteNodeStore:
         counts.setdefault(NodeStatus.DISPUTED.value, 0)
         return counts
 
-    def fts_search(self, query: str, limit: int = 10) -> list[tuple[str, float]]:
+    def fts_search(self, query: str, limit: int = 10, *, include_transient: bool = False) -> list[tuple[str, float]]:
         """Lexical leg: OR semantics over the CJK-bigram shadow index.
 
         The primary ``nodes_fts`` table keeps unicode61 tokens (English words,
@@ -1287,6 +1317,9 @@ class SQLiteNodeStore:
         runs expanded to overlapping bigrams so Chinese queries segment
         correctly. Both legs are queried with OR semantics (AND kills
         multi-word queries) and ranks merged per-leg by bm25.
+
+        When ``include_transient=False`` (default), results are restricted to
+        ``nodes.type = 'persistent'`` so transient nodes never consume FTS slots.
         """
 
         from synapse.storage.lexical import build_or_query
@@ -1294,32 +1327,62 @@ class SQLiteNodeStore:
         sanitized = build_or_query(query)
         if not sanitized:
             return []
+        type_clause = "" if include_transient else " AND nodes.type = 'persistent'"
         rows = self._connection.execute(
-            """
+            f"""
             SELECT nodes.id AS node_id, -bm25(nodes_fts) AS score
             FROM nodes_fts
             JOIN nodes ON nodes.rowid = nodes_fts.rowid
-            WHERE nodes_fts MATCH ?
+            WHERE nodes_fts MATCH ?{type_clause}
             ORDER BY score DESC, nodes.id ASC
             LIMIT ?
             """,
             (sanitized, limit),
         ).fetchall()
         bigram_rows = self._connection.execute(
-            """
+            f"""
             SELECT nodes.id AS node_id, -bm25(nodes_fts_bigram) AS score
             FROM nodes_fts_bigram
             JOIN nodes ON nodes.rowid = nodes_fts_bigram.rowid
-            WHERE nodes_fts_bigram MATCH ?
+            WHERE nodes_fts_bigram MATCH ?{type_clause}
             ORDER BY score DESC, nodes.id ASC
             LIMIT ?
             """,
             (sanitized, limit),
         ).fetchall()
+        legs: list[tuple[list[sqlite3.Row], float]] = [(rows, 1.0), (bigram_rows, 1.0)]
+        if include_transient:
+            tokens = [
+                tok
+                for tok in dict.fromkeys(re.findall(r"[0-9A-Za-z_\u4e00-\u9fff]+", query.casefold()))
+                if len(tok) >= 2
+            ][:8]
+            if tokens:
+                like_clauses = " OR ".join(
+                    "(lower(title) LIKE ? OR lower(content) LIKE ? OR lower(tags) LIKE ?)"
+                    for _ in tokens
+                )
+                params: list[Any] = []
+                for tok in tokens:
+                    pat = f"%{tok}%"
+                    params.extend([pat, pat, pat])
+                params.append(limit)
+                transcript_rows = self._connection.execute(
+                    f"""
+                    SELECT id AS node_id
+                    FROM nodes
+                    WHERE type = 'transient' AND id LIKE 'mem_session_%' AND ({like_clauses})
+                    ORDER BY last_accessed DESC, id ASC
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+                if transcript_rows:
+                    legs.append((transcript_rows, 1.0))
         # bm25 scores are not comparable across tables; fuse by rank (RRF-style)
         # per leg, then merge with the better rank kept for ordering.
         merged: dict[str, float] = {}
-        for rows_leg, weight in ((rows, 1.0), (bigram_rows, 1.0)):
+        for rows_leg, weight in legs:
             for rank, row in enumerate(rows_leg, start=1):
                 contribution = weight / (60.0 + rank)
                 merged[row["node_id"]] = merged.get(row["node_id"], 0.0) + contribution

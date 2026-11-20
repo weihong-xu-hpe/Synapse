@@ -184,6 +184,15 @@ class NodeMetadata(BaseModel):
             return [str(item).strip() for item in value if str(item).strip()]
         raise TypeError("tags must be a list of strings or a single string")
 
+    @field_validator("project", mode="before")
+    @classmethod
+    def _normalize_project(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return normalize_project_slug(text)
     @model_validator(mode="after")
     def _set_default_last_accessed(self) -> "NodeMetadata":
         if self.last_accessed is None:
@@ -466,9 +475,11 @@ def kebab_slug(node_id: str) -> str:
 def normalize_project_slug(value: str) -> str:
     """Slug a project name for use as a directory segment."""
 
-    slug = re.sub(r"[^a-z0-9._/-]+", "-", value.lower()).strip("-.")
+    cleaned = value.strip().lower()
+    if cleaned.startswith("glcp/"):
+        cleaned = cleaned[len("glcp/"):]
+    slug = re.sub(r"[^a-z0-9._/-]+", "-", cleaned).strip("-./")
     return slug or FALLBACK_PROJECT
-
 
 def infer_project(node: "Node") -> str:
     """Deterministic project attribution for a knowledge node.

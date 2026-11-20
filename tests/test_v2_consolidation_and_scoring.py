@@ -899,3 +899,57 @@ def test_distiller_sweep_counts_below_threshold(tmp_path: Path) -> None:
     with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=0) as check:
         assert check.get_meta("dreamer_pending_knowledge_nodes") == "1"
     assert started == []
+
+
+def test_bridge_search_does_not_credit_injected_count_and_project_slug_normalizes(tmp_path: Path) -> None:
+    from synapse.models import normalize_project_slug
+    from synapse.server.service import SynapseServerService
+    from tests.test_server_api import FakeSamplingClient
+
+    assert normalize_project_slug("Synapse") == "synapse"
+    assert normalize_project_slug("glcp/authz-svc") == "authz-svc"
+    assert normalize_project_slug("  glcp/AuthZ-Svc  ") == "authz-svc"
+
+    meta = NodeMetadata(id="mem_proj", title="Proj", type=NodeType.PERSISTENT, project="glcp/AuthZ-Svc")
+    assert meta.project == "authz-svc"
+
+    config, paths, store = _env(tmp_path)
+    config.embedding.provider = "builtin"
+    config.reranker.provider = "builtin"
+    store.close()
+
+    node = Node(
+        metadata=NodeMetadata(
+            id="mem_bridge_counter",
+            title="Gateway Rate Limits",
+            type=NodeType.PERSISTENT,
+            okf_type="fact",
+            project="Synapse",
+        ),
+        content="## Takeaway\n\nGateway rate limits use token buckets.\n\n## Details\n\nToken bucket details.\n",
+        file_path=Path("active/mem_bridge_counter.md"),
+    )
+    from synapse.storage import write_node_file
+    from synapse.sync import SyncManager
+
+    write_node_file(node, base_path=paths.base)
+    sync = SyncManager(config, runtime_paths=paths, debounce_seconds=0.0)
+    try:
+        sync.startup_sync()
+    finally:
+        sync.close()
+
+    service = SynapseServerService(config, runtime_paths=paths, sampling_client=FakeSamplingClient())
+    service.search_memory("gateway rate limits token buckets", top_k=3, source="bridge")
+    with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as check:
+        after_bridge = check.get_node("mem_bridge_counter")
+    assert after_bridge is not None
+    assert after_bridge.metadata.retrieved_count == 1
+    assert after_bridge.metadata.injected_count == 0
+
+    service.search_memory("gateway rate limits token buckets", top_k=3, source="mcp")
+    with SQLiteNodeStore(paths.base / "synapse.db", embedding_dimension=config.embedding.dimension or 0) as check:
+        after_mcp = check.get_node("mem_bridge_counter")
+    assert after_mcp is not None
+    assert after_mcp.metadata.retrieved_count == 2
+    assert after_mcp.metadata.injected_count == 1

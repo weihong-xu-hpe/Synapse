@@ -226,6 +226,28 @@ class DeciderSettings(BaseModel):
     temperature: float = 0.0
 
 
+class DecisionModelEndpointSettings(BaseModel):
+    """One System One (StartLux/Karpo) endpoint in the decision pool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    base_url: str
+    model: str
+    api_key_env: str = ""
+
+
+class DecisionModelSettings(BaseModel):
+    """Optional System One decision model routing (disabled by default)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    timeout_ms: int = Field(default=1200, ge=1)
+    offline_timeout_ms: int = Field(default=10000, ge=1)
+    min_confidence: float = Field(default=0.70, ge=0.0, le=1.0)
+    endpoints: list[DecisionModelEndpointSettings] = Field(default_factory=list)
+
 class DreamerThresholdSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -359,6 +381,7 @@ class SynapseConfig(BaseModel):
     sanitization: SanitizationSettings = Field(default_factory=SanitizationSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     decider: DeciderSettings = Field(default_factory=DeciderSettings)
+    decision_model: DecisionModelSettings = Field(default_factory=DecisionModelSettings)
     dreamer: DreamerSettings = Field(default_factory=DreamerSettings)
     distiller: DistillerSettings = Field(default_factory=DistillerSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)

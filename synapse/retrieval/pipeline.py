@@ -126,6 +126,8 @@ class RetrievalPipeline:
         top_k: int | None = None,
         update_access: bool = True,
         result_filter: Callable[[Node], bool] | None = None,
+        include_transient: bool = False,
+        credit_injected: bool = True,
     ) -> RetrievalResponse:
         """Run the full retrieval pipeline and update access only for final results.
 
@@ -146,6 +148,7 @@ class RetrievalPipeline:
             query_embedding,
             limit=self.config.reranker.max_candidates,
             exclude=result_filter,
+            include_transient=include_transient,
         )
         anchor_ids = [anchor.node.id for anchor in anchors]
         # Graph-hop neighbours APPEND after fused hits (slots permitting);
@@ -181,9 +184,8 @@ class RetrievalPipeline:
             # *injected*. Legacy callers that pass no gate still fall back.
             self._get_store().update_access(
                 [item.node.id for item in final_results],
-                injected_ids=[item.node.id for item in final_results if item.is_injectable],
+                injected_ids=[item.node.id for item in final_results if item.is_injectable] if credit_injected else [],
             )
-
         anchor_items = tuple(
             self._score_candidate(
                 anchor.node,
@@ -212,6 +214,7 @@ class RetrievalPipeline:
         limit: int = 3,
         per_source_limit: int = 20,
         exclude: Callable[[Node], bool] | None = None,
+        include_transient: bool = False,
     ) -> list[_AnchorCandidate]:
         """Fuse FTS and vector retrieval with reciprocal rank fusion.
 
@@ -226,7 +229,7 @@ class RetrievalPipeline:
         """
 
         store = self._get_store()
-        fts_results = store.fts_search(query, limit=per_source_limit)
+        fts_results = store.fts_search(query, limit=per_source_limit, include_transient=include_transient)
         if query_embedding is None:
             vector_sets: list[list[tuple[str, float]]] = []
         else:

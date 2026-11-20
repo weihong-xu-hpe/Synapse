@@ -503,6 +503,8 @@ class SynapseServerService:
             top_k=top_k,
             update_access=True,
             result_filter=lambda node: self._include_result(node, include) and node.id != excluded_id,
+            include_transient=include in {"all", "transcripts"},
+            credit_injected=source != "bridge",
         )
         payload: dict[str, Any] = {
             "query": response.query,
@@ -1739,14 +1741,30 @@ class SynapseServerService:
             return None
         return vector
 
-    def _run_retrieval_search(self, query: str, *, top_k: int, update_access: bool, result_filter=None) -> Any:
+    def _run_retrieval_search(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        update_access: bool,
+        result_filter=None,
+        include_transient: bool = False,
+        credit_injected: bool = True,
+    ) -> Any:
         with RetrievalPipeline(
             self.config,
             runtime_paths=self.runtime_paths,
             embedding_engine=self._get_embedding_engine(),
             reranker_engine=self._get_reranker_engine(),
         ) as pipeline:
-            return pipeline.search(query, top_k=top_k, update_access=update_access, result_filter=result_filter)
+            return pipeline.search(
+                query,
+                top_k=top_k,
+                update_access=update_access,
+                result_filter=result_filter,
+                include_transient=include_transient,
+                credit_injected=credit_injected,
+            )
     def _search_existing_nodes_payload(self, query: str, similarity_threshold: float) -> dict[str, Any]:
         normalized_query = " ".join(str(query or "").split()).strip()
         queries = [normalized_query] if normalized_query else []
