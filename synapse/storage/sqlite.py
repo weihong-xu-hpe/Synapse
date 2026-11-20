@@ -21,7 +21,7 @@ from synapse.storage.markdown import extract_wiki_links
 
 
 _MISSING_LINK_BLOCK_ROWS = 1024
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 FALLBACK_VECTOR_BACKEND = "python-fallback"
 SQLITE_VEC_BACKEND = "sqlite-vec"
 UTC_SUFFIX = "+00:00"
@@ -313,9 +313,9 @@ class SQLiteNodeStore:
             dimension_changed = stored_dimension not in {None, str(self.embedding_dimension)}
             backend_changed = stored_backend not in {None, self._vector_backend}
             if fts_new or dimension_changed or backend_changed or stored_version != str(SCHEMA_VERSION):
+                self._migrate_vectors_to_blob(connection)
                 self._rebuild_fts_index(connection)
                 self._rebuild_bigram_index(connection)
-
     def _rebuild_fts_index(self, connection: sqlite3.Connection) -> None:
         """Rebuild nodes_fts excluding transient session transcripts."""
 
@@ -680,7 +680,7 @@ class SQLiteNodeStore:
             """
             CREATE TABLE IF NOT EXISTS nodes_vec (
                 id TEXT PRIMARY KEY,
-                embedding TEXT NOT NULL,
+                embedding BLOB NOT NULL,
                 dimension INTEGER NOT NULL,
                 FOREIGN KEY (id) REFERENCES nodes(id) ON DELETE CASCADE
             )
@@ -886,8 +886,41 @@ class SQLiteNodeStore:
                 embedding = excluded.embedding,
                 dimension = excluded.dimension
             """,
-            (node_id, json.dumps(normalized), len(normalized)),
+            (node_id, _pack_embedding_blob(normalized), len(normalized)),
         )
+
+    def _migrate_vectors_to_blob(self, connection: sqlite3.Connection, *, batch_size: int = 500) -> int:
+        """Convert legacy JSON-text rows in nodes_vec to compact float32 BLOBs."""
+        migrated = 0
+        while True:
+            rows = connection.execute(
+                "SELECT id, embedding, dimension FROM nodes_vec WHERE typeof(embedding) = 'text' LIMIT ?",
+                (batch_size,),
+            ).fetchall()
+            if not rows:
+                break
+            updates: list[tuple[bytes, str]] = []
+            for row in rows:
+                dim = int(row["dimension"])
+                arr = _unpack_embedding(row["embedding"], dim)
+                if arr is None:
+                    continue
+                updates.append((_pack_embedding_blob(arr.tolist()), str(row["id"])))
+            if not updates:
+                break
+            connection.executemany("UPDATE nodes_vec SET embedding = ? WHERE id = ?", updates)
+            migrated += len(updates)
+            if len(rows) < batch_size:
+                break
+        if migrated > 0:
+            self._invalidate_vector_cache()
+        return migrated
+
+    def vacuum(self) -> None:
+        """Reclaim free space by running VACUUM outside any open transaction."""
+        if self._connection.in_transaction:
+            self._connection.commit()
+        self._connection.execute("VACUUM")
 
     def get_node(self, node_id: str) -> Node | None:
         row = self._connection.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
@@ -1215,18 +1248,15 @@ class SQLiteNodeStore:
         ).fetchall()
         vectors: dict[str, array] = {}
         parsed_ids: list[str] = []
-        parsed_rows: list[list[float]] = []
+        parsed_rows: list[np.ndarray] = []
         for row in rows:
-            try:
-                values = json.loads(str(row["embedding"]))
-                if len(values) != self.embedding_dimension:
-                    continue
-                node_id = str(row["id"])
-                vectors[node_id] = array("d", values)
-                parsed_ids.append(node_id)
-                parsed_rows.append(values)
-            except (json.JSONDecodeError, TypeError, ValueError):
+            arr = _unpack_embedding(row["embedding"], self.embedding_dimension)
+            if arr is None:
                 continue
+            node_id = str(row["id"])
+            vectors[node_id] = array("d", arr.tolist())
+            parsed_ids.append(node_id)
+            parsed_rows.append(arr)
         ids = tuple(parsed_ids)
         matrix = (
             np.asarray(parsed_rows, dtype=np.float64)
@@ -1485,14 +1515,14 @@ class SQLiteNodeStore:
             if exclude_hubs and "dreamer-hub" in node.metadata.tags:
                 continue
             vec_row = self._connection.execute(
-                "SELECT embedding FROM nodes_vec WHERE id = ?", [node_id]
+                "SELECT embedding, dimension FROM nodes_vec WHERE id = ?", [node_id]
             ).fetchone()
             if vec_row is None:
                 continue
-            try:
-                embeddings[node_id] = json.loads(str(vec_row["embedding"]))
-            except (json.JSONDecodeError, TypeError):
+            arr = _unpack_embedding(vec_row["embedding"], int(vec_row["dimension"]))
+            if arr is None:
                 continue
+            embeddings[node_id] = arr.tolist()
             nodes[node_id] = node
         return nodes, embeddings
 
@@ -1788,7 +1818,7 @@ class SQLiteNodeStore:
         cutoff = _utc_cutoff(recency_days)
         rows = self._connection.execute(
             """
-            SELECT n.id, v.embedding
+            SELECT n.id, v.embedding, v.dimension
             FROM nodes AS n
             JOIN nodes_vec AS v ON v.id = n.id
             WHERE n.status = ? AND n.last_accessed > ?
@@ -1798,10 +1828,9 @@ class SQLiteNodeStore:
         ).fetchall()
         embeddings: dict[str, list[float]] = {}
         for row in rows:
-            try:
-                embeddings[str(row["id"])] = json.loads(str(row["embedding"]))
-            except (json.JSONDecodeError, TypeError):
-                continue
+            arr = _unpack_embedding(row["embedding"], int(row["dimension"]))
+            if arr is not None:
+                embeddings[str(row["id"])] = arr.tolist()
         return embeddings
 
     def record_dreamer_run(self, metrics: DreamerRunMetrics) -> None:
@@ -2282,6 +2311,30 @@ def _normalize_embedding(embedding: list[float], expected_dimension: int) -> lis
     if magnitude == 0:
         return [0.0 for _ in embedding]
     return [float(value) / magnitude for value in embedding]
+
+
+def _pack_embedding_blob(values: Sequence[float]) -> bytes:
+    """Pack a sequence of floats into a compact little-endian float32 BLOB."""
+    return np.asarray(values, dtype="<f4").tobytes()
+
+
+def _unpack_embedding(raw: bytes | bytearray | memoryview | str, dimension: int) -> np.ndarray | None:
+    """Decode either a float32 BLOB or a legacy JSON-text embedding into a 1D float32 array."""
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        buf = bytes(raw)
+        if len(buf) != dimension * 4:
+            return None
+        return np.frombuffer(buf, dtype="<f4").astype(np.float32, copy=False)
+    try:
+        parsed = json.loads(str(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or len(parsed) != dimension:
+        return None
+    try:
+        return np.asarray(parsed, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
 
 
 def _cosine_distance(left: list[float], right: list[float]) -> float:

@@ -15,6 +15,7 @@ from time import perf_counter
 from typing import Any
 from contextlib import nullcontext
 
+from synapse.decision import DecisionClient
 from synapse.embedding import create_embedding_engine
 from synapse.indexing import collect_health_status
 from synapse.models import (
@@ -446,6 +447,7 @@ class SynapseServerService:
         self._engines_lock = threading.Lock()
         self._embedding_engine = None
         self._reranker_engine = None
+        self._decision_client = DecisionClient(self.config.decision_model)
     @property
     def sampling_client(self) -> SamplingClient | None:
         return self._sampling_client_var.get()
@@ -1756,6 +1758,7 @@ class SynapseServerService:
             runtime_paths=self.runtime_paths,
             embedding_engine=self._get_embedding_engine(),
             reranker_engine=self._get_reranker_engine(),
+            decision_client=self._decision_client,
         ) as pipeline:
             return pipeline.search(
                 query,
@@ -1811,6 +1814,7 @@ class SynapseServerService:
             runtime_paths=self.runtime_paths,
             embedding_engine=self._get_embedding_engine(),
             reranker_engine=self._get_reranker_engine(),
+            decision_client=self._decision_client,
         ) as pipeline:
             for query in normalized_queries:
                 response = pipeline.search(

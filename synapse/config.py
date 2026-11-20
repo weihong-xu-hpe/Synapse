@@ -246,6 +246,15 @@ class DecisionModelSettings(BaseModel):
     timeout_ms: int = Field(default=1200, ge=1)
     offline_timeout_ms: int = Field(default=10000, ge=1)
     min_confidence: float = Field(default=0.70, ge=0.0, le=1.0)
+    # Recall inject judge. "set": one question for the whole candidate set (one state read; right for a slow
+    # local node, where Instant models re-read the state once per question). "candidate": one noul per candidate
+    # (right for a fast remote node such as Jev / Karpo-31B).
+    recall_judge: Literal["set", "candidate"] = "set"
+    # Survivors of the logit gate whose best rerank logit is already >= this are confident hits: no judge call.
+    skip_above_logit: float = Field(default=2.0)
+    # Recall judge accept threshold. Lower than min_confidence on purpose: a wrong "reject" costs a missed
+    # memory, and A/B on golden-v1 showed 0.70 drops a true hit while 0.50 keeps recall and still cuts false injections.
+    recall_min_confidence: float = Field(default=0.50, ge=0.0, le=1.0)
     endpoints: list[DecisionModelEndpointSettings] = Field(default_factory=list)
 
 class DreamerThresholdSettings(BaseModel):

@@ -673,7 +673,16 @@ def test_vector_cache_ranking_matches_uncached_path(tmp_path: Path) -> None:
             "SELECT id, embedding FROM nodes_vec WHERE dimension = 3"
         ).fetchall()
         truth = sorted(
-            ((str(r["id"]), _cosine_distance(normalized_query, json.loads(str(r["embedding"])))) for r in rows),
+            (
+                (
+                    str(r["id"]),
+                    _cosine_distance(
+                        normalized_query,
+                        sqlite_module._unpack_embedding(r["embedding"], 3).tolist(),  # noqa: SLF001
+                    ),
+                )
+                for r in rows
+            ),
             key=lambda item: (item[1], item[0]),
         )
         assert again == cached
@@ -767,3 +776,56 @@ def test_fts_excludes_transient_by_default_and_skips_session_indexing(tmp_path: 
             (session_transcript.id,),
         ).fetchone()[0]
         assert fts_indexed == 0
+
+
+def test_nodes_vec_stores_float32_blob_and_migrates_legacy_json_text(tmp_path: Path) -> None:
+    db_path = tmp_path / "synapse.db"
+    recent_now = datetime.now(UTC)
+    alpha = make_node(
+        node_id="mem_blob_alpha",
+        title="Blob Alpha",
+        content="Gateway token bucket.",
+        file_name="mem_blob_alpha.md",
+        tags=["okf_type:fact"],
+        last_accessed=recent_now,
+    )
+    beta = make_node(
+        node_id="mem_blob_beta",
+        title="Blob Beta",
+        content="Gateway rate limit.",
+        file_name="mem_blob_beta.md",
+        tags=["okf_type:fact"],
+        last_accessed=recent_now,
+    )
+
+    with SQLiteNodeStore(db_path, embedding_dimension=4) as store:
+        store.upsert_node(alpha, embedding=[1.0, 0.0, 0.0, 0.0])
+        row = store.connection.execute(
+            "SELECT typeof(embedding) AS kind, length(embedding) AS nbytes FROM nodes_vec WHERE id = ?",
+            (alpha.id,),
+        ).fetchone()
+        assert row["kind"] == "blob"
+        assert row["nbytes"] == 16  # 4 * float32
+
+        # Simulate legacy v8 JSON-text row and schema_version=8.
+        store.upsert_node(beta)
+        store.connection.execute(
+            "INSERT INTO nodes_vec (id, embedding, dimension) VALUES (?, ?, ?)",
+            (beta.id, json.dumps([0.0, 1.0, 0.0, 0.0]), 4),
+        )
+        store.connection.execute("UPDATE schema_meta SET value = '8' WHERE key = 'schema_version'")
+        store.connection.commit()
+
+    with SQLiteNodeStore(db_path, embedding_dimension=4) as migrated:
+        assert migrated.get_meta("schema_version") == "9"
+        beta_row = migrated.connection.execute(
+            "SELECT typeof(embedding) AS kind, length(embedding) AS nbytes FROM nodes_vec WHERE id = ?",
+            (beta.id,),
+        ).fetchone()
+        assert beta_row["kind"] == "blob"
+        assert beta_row["nbytes"] == 16
+        assert migrated.vector_search([0.0, 1.0, 0.0, 0.0], limit=1)[0][0] == beta.id
+        assert migrated.get_node_embedding(beta.id) == pytest.approx([0.0, 1.0, 0.0, 0.0])
+        assert set(migrated._recent_active_embeddings(30)) == {alpha.id, beta.id}  # noqa: SLF001
+        migrated.vacuum()
+        assert migrated.check_integrity().ok is True

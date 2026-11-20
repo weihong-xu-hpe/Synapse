@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import sqlite3
 
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any, Callable, Iterable, Sequence
 
 from synapse.config import SynapseConfig
+from synapse.decision import DecisionClient
 from synapse.embedding import create_embedding_engine, create_reranker_engine
 from synapse.interfaces import SearchQuery
 from synapse.models import Node, NodeStatus, NodeType
@@ -21,6 +23,24 @@ from synapse.utils.runtime import RuntimePaths, get_runtime_paths
 
 
 LOGGER = logging.getLogger(__name__)
+
+_TAKEAWAY_RE = re.compile(r"(?ms)^## Takeaway\s*\n(.*?)(?=^## |\Z)")
+_DECISION_QUERY_CHARS = 240
+_DECISION_MAX_CANDIDATES = 3
+_DECISION_SNIPPET_CHARS = 140
+
+
+def _memory_snippet(node: Node, limit: int = _DECISION_SNIPPET_CHARS) -> str:
+    """Title + Takeaway (first non-empty line) kept short: Instant decision models re-read the state per question."""
+
+    content = node.content or ""
+    match = _TAKEAWAY_RE.search(content)
+    text = ""
+    if match:
+        text = next((line.strip() for line in match.group(1).splitlines() if line.strip()), "")
+    if not text:
+        text = next((line.strip() for line in content.splitlines() if line.strip() and not line.lstrip().startswith("#")), "")
+    return f"{node.title.strip()} — {text}"[:limit]
 
 STATUS_MULTIPLIERS: dict[NodeStatus, float] = {
     NodeStatus.ACTIVE: 1.0,
@@ -96,6 +116,7 @@ class RetrievalPipeline:
         runtime_paths: RuntimePaths | None = None,
         embedding_engine=None,
         reranker_engine=None,
+        decision_client: DecisionClient | None = None,
         now_fn=None,
     ) -> None:
         self.config = config
@@ -104,8 +125,8 @@ class RetrievalPipeline:
         self._owns_store = store is None
         self._embedding_engine = embedding_engine or create_embedding_engine(config.embedding, providers=config.providers)
         self._reranker_engine = reranker_engine or create_reranker_engine(config.reranker, providers=config.providers)
+        self._decision_client = decision_client or DecisionClient(config.decision_model)
         self._now_fn = now_fn or (lambda: datetime.now(UTC))
-
     def close(self) -> None:
         if self._owns_store and self._store is not None:
             self._store.close()
@@ -177,7 +198,7 @@ class RetrievalPipeline:
             candidate_items.append(scored_item)
 
         final_results = tuple(sorted(candidate_items, key=lambda item: (-item.score, item.node.id))[:final_top_k])
-        final_results = self._apply_inject_decisions(final_results)
+        final_results = self._apply_inject_decisions(final_results, query=request.text)
         if update_access and final_results:
             # Read/write decoupling (§4.3.1): every returned result is
             # *retrieved*; only results that reached the inject gate are
@@ -436,7 +457,12 @@ class RetrievalPipeline:
         penalty = math.log(multiplier) if multiplier > 0 else -1000.0
         return score + penalty, multiplier
 
-    def _apply_inject_decisions(self, results: tuple[RetrievalItem, ...]) -> tuple[RetrievalItem, ...]:
+    def _apply_inject_decisions(
+        self,
+        results: tuple[RetrievalItem, ...],
+        *,
+        query: str = "",
+    ) -> tuple[RetrievalItem, ...]:
         """Set ``is_injectable`` on final results (server-side inject decision).
 
         Rule (config [retrieval]): a result is injectable when
@@ -448,6 +474,13 @@ class RetrievalPipeline:
         query sits far below zero. Nodes with ``verified: false`` frontmatter
         are never auto-injected (P2+, docs/okf.md §9) but still returned with
         scores.
+
+        When ``self._decision_client.enabled`` and the best logit-gate survivor
+        is not already a confident hit (``rerank_score >= skip_above_logit``),
+        System One judges the survivors (fail-open on ``None``/timeout):
+        ``recall_judge="set"`` asks ONE question ("does any candidate directly
+        help?") and rejects them all on ``noul < min_confidence``;
+        ``recall_judge="candidate"`` asks one ``noul`` per candidate.
         """
 
         settings = self.config.retrieval
@@ -456,9 +489,8 @@ class RetrievalPipeline:
         best_logit = max(item.rerank_score for item in results)
         floor = settings.inject_logit_floor
         margin = settings.inject_relative_margin
-        decided: list[RetrievalItem] = []
-        for item in results:
-            injectable = (
+        injectable_flags: list[bool] = [
+            (
                 item.rerank_score >= floor
                 and item.rerank_score >= best_logit - margin
                 # P2+ (owner decision C "annotate, never auto-inject"): nodes
@@ -466,20 +498,86 @@ class RetrievalPipeline:
                 # WITHOUT the field (all pre-existing nodes) are unaffected.
                 and item.node.metadata.verified is not False
             )
-            decided.append(
-                RetrievalItem(
-                    node=item.node,
-                    score=item.score,
-                    anchor_score=item.anchor_score,
-                    rerank_score=item.rerank_score,
-                    decay_multiplier=item.decay_multiplier,
-                    status_multiplier=item.status_multiplier,
-                    is_anchor=item.is_anchor,
-                    is_injectable=injectable,
-                    context_text=item.context_text,
-                    markers=item.markers,
+            for item in results
+        ]
+
+        passed_indices = [idx for idx, flag in enumerate(injectable_flags) if flag]
+        query_text = query.strip()
+        dm = self.config.decision_model
+        best_passed = max((results[idx].rerank_score for idx in passed_indices), default=None)
+        if (
+            self._decision_client.enabled
+            and passed_indices
+            and query_text
+            and best_passed is not None
+            and best_passed < dm.skip_above_logit
+        ):
+            batch = passed_indices[:_DECISION_MAX_CANDIDATES]
+            snippets = [_memory_snippet(results[idx].node) for idx in batch]
+            query_short = query_text[:_DECISION_QUERY_CHARS]
+            if dm.recall_judge == "candidate":
+                state = f"User query: {query_short}"
+                questions: dict[str, dict[str, str]] = {
+                    f"m{i}": {
+                        "type": "noul",
+                        "instructions": (
+                            f"Memory: {snippet}\nDoes this memory directly help answer or execute the user query "
+                            f"(not merely share a keyword)?"
+                        ),
+                    }
+                    for i, snippet in enumerate(snippets)
+                }
+            else:
+                state = f"User query: {query_short}\nCandidate memories:\n" + "\n".join(
+                    f"[m{i}] {snippet}" for i, snippet in enumerate(snippets)
                 )
+                questions = {
+                    "any_relevant": {
+                        "type": "noul",
+                        "instructions": (
+                            "Does at least one candidate memory directly help answer or execute the user query "
+                            "(not merely share a keyword)?"
+                        ),
+                    }
+                }
+            response = self._decision_client.decide(state, questions, offline=False)
+            answers = response.get("answers") if isinstance(response, dict) else None
+            if isinstance(answers, dict):
+                def _noul(name: str) -> float | None:
+                    answer = answers.get(name)
+                    if not isinstance(answer, dict) or answer.get("noul") is None:
+                        return None
+                    try:
+                        return float(answer["noul"])
+                    except (TypeError, ValueError):
+                        return None
+
+                if dm.recall_judge == "candidate":
+                    for i, idx in enumerate(batch):
+                        score = _noul(f"m{i}")
+                        if score is not None:
+                            injectable_flags[idx] = score >= dm.recall_min_confidence
+                else:
+                    score = _noul("any_relevant")
+                    if score is not None and score < dm.recall_min_confidence:
+                        for idx in passed_indices:
+                            injectable_flags[idx] = False
+
+        decided: list[RetrievalItem] = [
+            RetrievalItem(
+                node=item.node,
+                score=item.score,
+                anchor_score=item.anchor_score,
+                rerank_score=item.rerank_score,
+                decay_multiplier=item.decay_multiplier,
+                status_multiplier=item.status_multiplier,
+                is_anchor=item.is_anchor,
+                is_injectable=injectable_flags[idx],
+                context_text=item.context_text,
+                markers=item.markers,
             )
+            for idx, item in enumerate(results)
+        ]
         return tuple(decided)
 
     def _score_candidate(

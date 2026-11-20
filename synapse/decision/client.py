@@ -49,7 +49,7 @@ class DecisionClient:
     def decide(
         self,
         state: Mapping[str, Any] | str,
-        questions: Sequence[Mapping[str, Any]],
+        questions: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]],
         *,
         offline: bool = False,
     ) -> dict[str, Any] | None:
@@ -60,11 +60,15 @@ class DecisionClient:
 
         timeout_ms = self.settings.offline_timeout_ms if offline else self.settings.timeout_ms
         timeout_seconds = max(0.001, float(timeout_ms) / 1000.0)
+        serialized_questions: dict[str, dict[str, Any]] | list[dict[str, Any]]
+        if isinstance(questions, Mapping):
+            serialized_questions = {str(key): dict(value) for key, value in questions.items()}
+        else:
+            serialized_questions = [dict(question) for question in questions]
         base_payload: dict[str, Any] = {
             "state": state,
-            "questions": [dict(question) for question in questions],
+            "questions": serialized_questions,
         }
-
         owns_client = self._http_client is None
         client = self._http_client or httpx.Client(timeout=timeout_seconds)
         try:

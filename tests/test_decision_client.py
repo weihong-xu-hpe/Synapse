@@ -135,3 +135,38 @@ def test_decision_client_returns_none_when_all_endpoints_fail() -> None:
         assert decision_client.decide("state", [{"id": "q1"}]) is None
     finally:
         client.close()
+
+
+def test_decision_client_supports_mapping_questions() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"answers": {"m0": {"type": "noul", "noul": 0.91}}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    settings = DecisionModelSettings(
+        enabled=True,
+        endpoints=[
+            DecisionModelEndpointSettings(
+                name="startlux-local",
+                base_url="http://127.0.0.1:8088",
+                model="startlux-decision-4b",
+            )
+        ],
+    )
+    decision_client = DecisionClient(settings, http_client=client)
+    try:
+        result = decision_client.decide(
+            "User query:\nauthz timeout\n\nCandidate memories:\n[m0] AuthZ\nCheck Istio",
+            {"m0": {"type": "noul", "instructions": "Does [m0] help?"}},
+        )
+    finally:
+        client.close()
+
+    assert result == {"answers": {"m0": {"type": "noul", "noul": 0.91}}}
+    assert captured["body"] == {
+        "state": "User query:\nauthz timeout\n\nCandidate memories:\n[m0] AuthZ\nCheck Istio",
+        "questions": {"m0": {"type": "noul", "instructions": "Does [m0] help?"}},
+        "model": "startlux-decision-4b",
+    }

@@ -571,3 +571,217 @@ def test_inject_flag_suppresses_verified_false_nodes(tmp_path: Path) -> None:
     assert by_id["ver"].is_injectable is True
     assert by_id["unver"].is_injectable is False  # verified: false never injects
     assert by_id["legacy"].is_injectable is True  # no field → unaffected
+
+
+def test_inject_flag_uses_decision_client_to_filter_superficial_matches(tmp_path: Path) -> None:
+    import json
+    import httpx
+    from synapse.config import DecisionModelEndpointSettings
+    from synapse.decision import DecisionClient
+
+    config = load_config(_inject_config(tmp_path, floor=-2.0, margin=5.0))
+    config.decision_model.enabled = True
+    config.decision_model.min_confidence = 0.70
+    config.decision_model.recall_judge = "candidate"
+    config.decision_model.endpoints = [
+        DecisionModelEndpointSettings(name="local", base_url="http://127.0.0.1:8088", model="startlux")
+    ]
+
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "m0": {"type": "noul", "noul": 0.92},
+                    "m1": {"type": "noul", "noul": 0.35},
+                }
+            },
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    decision_client = DecisionClient(config.decision_model, http_client=http_client)
+
+    runtime_paths = bootstrap_runtime_directories(config)
+    store = SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3)
+    relevant = make_node(node_id="rel", title="Relevant", content="Actual fix for gateway timeout.", file_name="rel.md")
+    superficial = make_node(node_id="sup", title="Superficial", content="Gateway mentioned in passing.", file_name="sup.md")
+    for node in (relevant, superficial):
+        store.upsert_node(node, embedding=[1.0, 0.0, 0.0])
+
+    class _Reranker:
+        model_name = "test-reranker"
+        def rerank(self, query, documents, limit=None):
+            scores = [(i, 1.0 if "Relevant" in doc else 0.8) for i, doc in enumerate(documents)]
+            scores.sort(key=lambda item: (-item[1], item[0]))
+            return scores[:limit] if limit is not None else scores
+        def is_available(self):
+            return True
+
+    try:
+        pipeline = RetrievalPipeline(
+            config,
+            store=store,
+            runtime_paths=runtime_paths,
+            embedding_engine=FakeEmbeddingEngine(),
+            reranker_engine=_Reranker(),
+            decision_client=decision_client,
+            now_fn=lambda: NOW,
+        )
+        response = pipeline.search("gateway timeout", top_k=5)
+    finally:
+        http_client.close()
+        store.close()
+
+    by_id = {item.node.id: item for item in response.results}
+    assert by_id["rel"].is_injectable is True
+    assert by_id["sup"].is_injectable is False
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert "User query: gateway timeout" in str(body["state"])
+    assert set(body["questions"].keys()) == {"m0", "m1"}
+    assert "Relevant — Actual fix for gateway timeout." in str(body["questions"]["m0"]["instructions"])
+    assert "Superficial — Gateway mentioned in passing." in str(body["questions"]["m1"]["instructions"])
+
+
+def test_inject_flag_fails_open_when_decision_client_returns_none(tmp_path: Path) -> None:
+    import httpx
+    from synapse.config import DecisionModelEndpointSettings
+    from synapse.decision import DecisionClient
+
+    config = load_config(_inject_config(tmp_path, floor=-2.0, margin=5.0))
+    config.decision_model.enabled = True
+    config.decision_model.min_confidence = 0.70
+    config.decision_model.endpoints = [
+        DecisionModelEndpointSettings(name="local", base_url="http://127.0.0.1:8088", model="startlux")
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "down"}, request=request)
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    decision_client = DecisionClient(config.decision_model, http_client=http_client)
+
+    runtime_paths = bootstrap_runtime_directories(config)
+    store = SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3)
+    relevant = make_node(node_id="rel", title="Relevant", content="Actual fix.", file_name="rel.md")
+    store.upsert_node(relevant, embedding=[1.0, 0.0, 0.0])
+
+    class _Reranker:
+        model_name = "test-reranker"
+        def rerank(self, query, documents, limit=None):
+            return [(i, 1.0) for i, _ in enumerate(documents)]
+        def is_available(self):
+            return True
+
+    try:
+        pipeline = RetrievalPipeline(
+            config,
+            store=store,
+            runtime_paths=runtime_paths,
+            embedding_engine=FakeEmbeddingEngine(),
+            reranker_engine=_Reranker(),
+            decision_client=decision_client,
+            now_fn=lambda: NOW,
+        )
+        response = pipeline.search("gateway timeout", top_k=5)
+    finally:
+        http_client.close()
+        store.close()
+
+    assert response.results[0].is_injectable is True
+
+
+def _run_decision_search(tmp_path: Path, *, logit: float, handler, **dm_overrides):
+    import httpx
+    from synapse.config import DecisionModelEndpointSettings
+    from synapse.decision import DecisionClient
+
+    config = load_config(_inject_config(tmp_path, floor=-2.0, margin=5.0))
+    config.decision_model.enabled = True
+    config.decision_model.min_confidence = 0.70
+    config.decision_model.endpoints = [
+        DecisionModelEndpointSettings(name="local", base_url="http://127.0.0.1:8088", model="startlux")
+    ]
+    for key, value in dm_overrides.items():
+        setattr(config.decision_model, key, value)
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    decision_client = DecisionClient(config.decision_model, http_client=http_client)
+    runtime_paths = bootstrap_runtime_directories(config)
+    store = SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3)
+    for node_id, title in (("a", "Alpha"), ("b", "Beta")):
+        store.upsert_node(
+            make_node(node_id=node_id, title=title, content=f"## Takeaway\n\n{title} takeaway text.\n\n## Details\n\nlong body", file_name=f"{node_id}.md"),
+            embedding=[1.0, 0.0, 0.0],
+        )
+
+    class _Reranker:
+        model_name = "test-reranker"
+        def rerank(self, query, documents, limit=None):
+            return [(i, logit - 0.1 * i) for i, _ in enumerate(documents)]
+        def is_available(self):
+            return True
+
+    try:
+        pipeline = RetrievalPipeline(
+            config,
+            store=store,
+            runtime_paths=runtime_paths,
+            embedding_engine=FakeEmbeddingEngine(),
+            reranker_engine=_Reranker(),
+            decision_client=decision_client,
+            now_fn=lambda: NOW,
+        )
+        return pipeline.search("gateway timeout", top_k=5)
+    finally:
+        http_client.close()
+        store.close()
+
+
+def test_set_judge_rejects_every_candidate_with_one_compact_question(tmp_path: Path) -> None:
+    import json
+    import httpx
+
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"answers": {"any_relevant": {"type": "noul", "noul": 0.10}}})
+
+    response = _run_decision_search(tmp_path, logit=1.0, handler=handler)
+
+    assert [item.is_injectable for item in response.results] == [False, False]
+    assert len(captured) == 1
+    assert set(captured[0]["questions"]) == {"any_relevant"}
+    state = str(captured[0]["state"])
+    assert "[m0] Alpha — Alpha takeaway text." in state and "[m1] Beta — Beta takeaway text." in state
+    assert "long body" not in state  # only the Takeaway goes to the judge
+
+
+def test_set_judge_keeps_the_logit_gate_decision_when_the_set_is_relevant(tmp_path: Path) -> None:
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"answers": {"any_relevant": {"type": "noul", "noul": 0.90}}})
+
+    response = _run_decision_search(tmp_path, logit=1.0, handler=handler)
+
+    assert [item.is_injectable for item in response.results] == [True, True]
+
+
+def test_confident_hit_skips_the_decision_model_entirely(tmp_path: Path) -> None:
+    import httpx
+
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, json={"answers": {"any_relevant": {"type": "noul", "noul": 0.0}}})
+
+    response = _run_decision_search(tmp_path, logit=3.0, handler=handler)
+
+    assert calls == []
+    assert response.results[0].is_injectable is True
