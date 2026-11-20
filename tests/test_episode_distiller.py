@@ -1216,3 +1216,106 @@ def test_credit_retrieved_usage_does_not_inflate_used_count(tmp_path: Path) -> N
             assert store.get_node("mem_related").metadata.used_count == 0
     finally:
         runner.close()
+
+
+class _FakeDecisionClient:
+    def __init__(self, responses: list[dict[str, Any] | None], *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._responses = list(responses)
+        self.calls: list[tuple[Any, Any, bool]] = []
+
+    def decide(self, state: Any, questions: Any, *, offline: bool = False) -> dict[str, Any] | None:
+        self.calls.append((state, questions, offline))
+        if self._responses:
+            return self._responses.pop(0)
+        return None
+
+
+def test_decision_model_pre_triage_short_circuits_skip_chatter_and_restates_existing(tmp_path: Path) -> None:
+    config, paths, transcript = _setup(tmp_path)
+    config.decision_model.enabled = True
+    config.decision_model.min_confidence = 0.70
+    scanner = FakeClient()
+    gatekeeper = FakeClient(response={"ops": []})
+    decision_client = _FakeDecisionClient(
+        [
+            {"answers": {"triage": {"choice": "skip_chatter", "confidence": 0.92}}},
+            {"answers": {"triage": {"choice": "restates_existing", "confidence": 0.88}}},
+        ]
+    )
+    runner = EpisodeDistiller(
+        config,
+        runtime_paths=paths,
+        sampling_client=scanner,
+        gatekeeper_client=gatekeeper,
+        decision_client=decision_client,  # type: ignore[arg-type]
+    )
+    try:
+        _write_persistent_fact(
+            runner,
+            transcript,
+            node_id="mem_existing_cache",
+            title="Cache key stability",
+        )
+        parsed = parse_transcript(transcript.content)
+        lessons = [
+            Lesson(topic="Chatter log", claim="Temporary grep output", evidence_turns=["T1"], okf_type="fact"),
+            Lesson(topic="Cache key stability", claim="The cache key remains stable for retried writes", evidence_turns=["T1"], okf_type="fact"),
+        ]
+        run = EpisodeRun(transcript.id, transcript.metadata.session_key, "ep-b2a", 100, 2, 1)
+        result = runner.integrate_episode(
+            transcript,
+            parsed.turns,
+            parsed.turns,
+            parsed.turns,
+            "User: check cache key",
+            lessons,
+            run,
+        )
+    finally:
+        runner.close()
+
+    assert gatekeeper.prompts == []
+    assert len(decision_client.calls) == 2
+    assert all(offline is True for _, _, offline in decision_client.calls)
+    assert all(isinstance(questions, dict) and "triage" in questions for _, questions, _ in decision_client.calls)
+    reasons = [op.get("reason") for op in result.ops if op.get("action") == "none"]
+    assert reasons == ["decision_model:skip_chatter", "decision_model:restates_existing"]
+
+
+def test_decision_model_pre_triage_injects_contradicts_supersede_hint(tmp_path: Path) -> None:
+    config, paths, transcript = _setup(tmp_path)
+    config.decision_model.enabled = True
+    config.decision_model.min_confidence = 0.70
+    scanner = FakeClient()
+    gatekeeper = FakeClient(response={"ops": [{"action": "none", "lesson_index": 0, "reason": "ok"}]})
+    decision_client = _FakeDecisionClient(
+        [{"answers": {"triage": {"choice": "contradicts_supersede", "confidence": 0.91}}}]
+    )
+    runner = EpisodeDistiller(
+        config,
+        runtime_paths=paths,
+        sampling_client=scanner,
+        gatekeeper_client=gatekeeper,
+        decision_client=decision_client,  # type: ignore[arg-type]
+    )
+    try:
+        parsed = parse_transcript(transcript.content)
+        lessons = [
+            Lesson(topic="Auth timeout changed", claim="Auth timeout is now 30s instead of 5s", evidence_turns=["T1"], okf_type="fact"),
+        ]
+        run = EpisodeRun(transcript.id, transcript.metadata.session_key, "ep-b2a-hint", 100, 2, 1)
+        runner.integrate_episode(
+            transcript,
+            parsed.turns,
+            parsed.turns,
+            parsed.turns,
+            "User: auth timeout",
+            lessons,
+            run,
+        )
+    finally:
+        runner.close()
+
+    assert len(gatekeeper.prompts) == 1
+    assert "[DECISION_HINT: contradicts_supersede]" in gatekeeper.prompts[0]

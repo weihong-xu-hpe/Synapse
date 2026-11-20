@@ -747,3 +747,162 @@ def test_dreamer_records_v2_consolidation_metrics_and_archived_counts(tmp_path: 
     assert day["synthesized_hubs"] == 1
     assert day["semantic_merges"] == 1
     assert day["archived"] == 2
+
+
+class _FakeDreamerDecisionClient:
+    def __init__(self, responses: list[dict[str, object] | None], *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._responses = list(responses)
+        self.calls: list[tuple[object, object, bool]] = []
+
+    def decide(self, state: object, questions: object, *, offline: bool = False) -> dict[str, object] | None:
+        self.calls.append((state, questions, offline))
+        if self._responses:
+            return self._responses.pop(0)
+        return None
+
+
+def test_semantic_merge_prescreen_distinct_constraints_skips_llm_call(tmp_path: Path) -> None:
+    config, runtime_paths = make_runtime(tmp_path)
+    config.embedding.dimension = 3
+    config.decision_model.enabled = True
+    config.decision_model.min_confidence = 0.70
+    decision_client = _FakeDreamerDecisionClient(
+        [{"answers": {"merge_relation": {"choice": "distinct_constraints", "confidence": 0.90}}}]
+    )
+    dreamer = Dreamer(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=FailingSamplingClient(),
+        gatekeeper_client=FailingSamplingClient(),
+        decision_client=decision_client,  # type: ignore[arg-type]
+    )
+    try:
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            for idx in range(2):
+                node = _typed_cluster_node(f"mem_distinct_{idx}", project="authz")
+                written = dreamer._store_written_path(node)  # noqa: SLF001
+                store.upsert_node(written, embedding=[1.0, 0.0, 0.0])
+            warnings = []
+            results = dreamer._run_semantic_merge(store, warnings)  # noqa: SLF001
+    finally:
+        dreamer.close()
+
+    assert results == []
+    assert warnings == []
+    assert len(decision_client.calls) == 1
+    assert decision_client.calls[0][2] is True
+
+
+def test_high_usage_transcript_check_emits_contradiction_warning(tmp_path: Path) -> None:
+    config, runtime_paths = make_runtime(tmp_path)
+    config.embedding.dimension = 3
+    config.decision_model.enabled = True
+    config.decision_model.min_confidence = 0.70
+    decision_client = _FakeDreamerDecisionClient(
+        [{"answers": {"contradiction": {"noul": 0.92}}}]
+    )
+    dreamer = Dreamer(
+        config,
+        runtime_paths=runtime_paths,
+        sampling_client=FailingSamplingClient(),
+        decision_client=decision_client,  # type: ignore[arg-type]
+    )
+    try:
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            transcript = Node(
+                metadata=NodeMetadata(
+                    id="mem_session_check_1",
+                    title="Session summary — authz",
+                    type=NodeType.TRANSIENT,
+                    status=NodeStatus.ACTIVE,
+                ),
+                content="## T1 User\nAuthz uses port 8443.",
+                file_path=Path("transcripts/mem_session_check_1.md"),
+            )
+            persistent = Node(
+                metadata=NodeMetadata(
+                    id="mem_high_usage_1",
+                    title="Authz port fact",
+                    type=NodeType.PERSISTENT,
+                    status=NodeStatus.ACTIVE,
+                    okf_type="fact",
+                    injected_count=7,
+                    sources=["mem_session_check_1"],
+                ),
+                content="## Takeaway\n\nAuthz uses port 9999.\n\n## Details\n\nPort 9999.\n\n## Sources\n\n- [[mem_session_check_1]]\n",
+                file_path=Path("active/mem_high_usage_1.md"),
+            )
+            store.upsert_node(transcript)
+            store.upsert_node(persistent)
+            warnings = []
+            dreamer._run_high_usage_transcript_check(store, warnings, max_nodes=5)  # noqa: SLF001
+    finally:
+        dreamer.close()
+
+    assert len(warnings) == 1
+    assert warnings[0].code == "transcript_contradiction_detected"
+    assert warnings[0].node_id == "mem_high_usage_1"
+    assert len(decision_client.calls) == 1
+    _, questions, offline = decision_client.calls[0]
+    assert offline is True
+    assert isinstance(questions, dict) and questions["contradiction"]["type"] == "noul"  # type: ignore[index]
+
+
+def test_export_skill_promotion_proposals_writes_valid_json_manifest(tmp_path: Path) -> None:
+    import json
+
+    config, runtime_paths = make_runtime(tmp_path)
+    config.embedding.dimension = 3
+    dreamer = Dreamer(config, runtime_paths=runtime_paths, sampling_client=FailingSamplingClient())
+    try:
+        with SQLiteNodeStore(runtime_paths.base / "synapse.db", embedding_dimension=3) as store:
+            eligible = Node(
+                metadata=NodeMetadata(
+                    id="mem_promo_proc",
+                    title="Deploy authz safely",
+                    type=NodeType.PERSISTENT,
+                    status=NodeStatus.ACTIVE,
+                    okf_type="procedure",
+                    project="authz-svc",
+                    sources=["mem_session_1", "mem_session_2", "mem_session_3"],
+                    used_count=6,
+                    injected_count=12,
+                ),
+                content="## Takeaway\n\nRun preflight before rollout.\n\n## Steps\n\n1. Check.\n\n## Sources\n\n- [[mem_session_1]]\n",
+                file_path=Path("active/mem_promo_proc.md"),
+            )
+            ineligible_fact = Node(
+                metadata=NodeMetadata(
+                    id="mem_promo_fact",
+                    title="Not a procedure or pitfall",
+                    type=NodeType.PERSISTENT,
+                    status=NodeStatus.ACTIVE,
+                    okf_type="fact",
+                    sources=["mem_session_1", "mem_session_2", "mem_session_3"],
+                    used_count=20,
+                ),
+                content="## Takeaway\n\nFact takeaway.\n\n## Details\n\nDetails.\n\n## Sources\n\n- [[mem_session_1]]\n",
+                file_path=Path("active/mem_promo_fact.md"),
+            )
+            store.upsert_node(eligible)
+            store.upsert_node(ineligible_fact)
+            dreamer._export_skill_promotion_proposals(store)  # noqa: SLF001
+    finally:
+        dreamer.close()
+
+    manifest_path = runtime_paths.base / ".audit" / "skill-promotion-proposals.json"
+    assert manifest_path.exists()
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "generated_at" in data
+    assert len(data["proposals"]) == 1
+    assert data["proposals"][0] == {
+        "node_id": "mem_promo_proc",
+        "title": "Deploy authz safely",
+        "project": "authz-svc",
+        "okf_type": "procedure",
+        "sources_count": 3,
+        "used_count": 6,
+        "injected_count": 12,
+        "takeaway": "Run preflight before rollout.",
+    }

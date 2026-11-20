@@ -12,6 +12,7 @@ The Dreamer runs a 6-stage pipeline modeled on sleep neuroscience:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
 from synapse.config import SynapseConfig, ensure_background_model_allowed
+from synapse.decision import DecisionClient
 from synapse.lifecycle.condensation import CondensationDraft, DeterministicArchiveCondenser
 from synapse.models import (
     Node,
@@ -214,6 +216,7 @@ class Dreamer:
         store: SQLiteNodeStore | None = None,
         sampling_client: SamplingClient,
         gatekeeper_client: SamplingClient | None = None,
+        decision_client: DecisionClient | None = None,
         logger: logging.Logger | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
@@ -229,6 +232,9 @@ class Dreamer:
         # An injected gatekeeper is used as-is and never closed by us.
         self._gatekeeper_client: object | None = gatekeeper_client
         self._owns_gatekeeper_client = False
+        self._decision_client = (
+            decision_client if decision_client is not None else DecisionClient(config.decision_model)
+        )
         # Nodes archived during the current run. Stage 5 executes decisions
         # captured before Stage 4c/4d ran, so it must know which nodes have
         # already left active/ (their files are gone; the write index lags
@@ -346,6 +352,8 @@ class Dreamer:
             debounce_seconds=0.0,
         ).startup_sync()
 
+        if self._decision_client.enabled:
+            self._run_high_usage_transcript_check(store, warnings, max_nodes=5)
         # Stage 6: Report
         completed_at = self._utc_now()
         all_archived_ids = list(
@@ -385,6 +393,7 @@ class Dreamer:
             self._logger.warning(warning.message, extra={"code": warning.code, "node_id": warning.node_id})
         self._logger.info("Dreamer pipeline completed", extra=report.to_dict())
         self._rebuild_handbook()
+        self._export_skill_promotion_proposals(store)
         return report
 
     def _rebuild_handbook(self) -> None:
@@ -756,6 +765,25 @@ class Dreamer:
             ]
             if len(live_members) < thresholds.min_semantic_merge_cluster:
                 continue
+            if self._decision_client.enabled:
+                prescreen = self._prescreen_merge_cluster(live_members)
+                if prescreen is not None:
+                    choice, confidence = prescreen
+                    min_confidence = float(self.config.decision_model.min_confidence)
+                    if choice == "distinct_constraints" and confidence >= max(0.80, min_confidence):
+                        continue
+                    if choice == "conflict" and confidence >= min_confidence:
+                        warnings.append(
+                            DreamerWarning(
+                                code="decision_model_conflict",
+                                node_id=live_members[0].id,
+                                message=(
+                                    f"Decision model flagged conflict in merge cluster "
+                                    f"({', '.join(member.id for member in live_members)}); skipping merge."
+                                ),
+                            )
+                        )
+                        continue
             try:
                 payload = client.sample_json(
                     prompt=build_semantic_merge_prompt(tuple(live_members)),
@@ -2236,6 +2264,196 @@ class Dreamer:
         except sqlite3.DatabaseError as exc:  # pragma: no cover - metrics must never break lifecycle maintenance
             self._logger.warning("Failed to record Dreamer metrics", exc_info=exc)
 
+    def _prescreen_merge_cluster(self, members: list[Node]) -> tuple[str, float] | None:
+        state = {
+            "members": [
+                {
+                    "id": member.id,
+                    "title": member.title,
+                    "okf_type": member.metadata.okf_type,
+                    "snippet": member.content[:600],
+                }
+                for member in members
+            ]
+        }
+        questions = {
+            "merge_relation": {
+                "type": "choice",
+                "prompt": "Classify the relationship among these memory nodes before merging.",
+                "choices": ["synonymous", "complementary", "distinct_constraints", "conflict"],
+            }
+        }
+        decision = self._decision_client.decide(state, questions, offline=True)
+        choice, confidence = _extract_decision_choice(decision, "merge_relation")
+        if choice is None:
+            return None
+        return choice, confidence
+
+    def _run_high_usage_transcript_check(
+        self,
+        store: SQLiteNodeStore,
+        warnings: list[DreamerWarning],
+        *,
+        max_nodes: int = 5,
+    ) -> None:
+        if not self._decision_client.enabled:
+            return
+        candidates = [
+            node
+            for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+            if node.metadata.injected_count >= 5
+            and any(src.startswith("mem_session_") for src in node.metadata.sources)
+        ]
+        candidates.sort(key=lambda node: (-node.metadata.injected_count, node.id))
+        threshold = max(0.85, float(self.config.decision_model.min_confidence))
+        for node in candidates[:max_nodes]:
+            transcript_id = next(
+                (src for src in node.metadata.sources if src.startswith("mem_session_")),
+                None,
+            )
+            if transcript_id is None:
+                continue
+            transcript = store.get_node(transcript_id)
+            if transcript is None:
+                transcript_path = self.runtime_paths.transcripts / f"{transcript_id}.md"
+                if transcript_path.exists():
+                    try:
+                        transcript = read_node_file(transcript_path)
+                    except Exception:
+                        transcript = None
+            if transcript is None:
+                continue
+            state = {
+                "memory": {
+                    "id": node.id,
+                    "title": node.title,
+                    "content": node.content[:2000],
+                },
+                "source_transcript": {
+                    "id": transcript.id,
+                    "content": transcript.content[:4000],
+                },
+            }
+            questions = {
+                "contradiction": {
+                    "type": "noul",
+                    "prompt": (
+                        "Does this stored memory contradict or misstate key facts compared to its "
+                        "source session transcript?"
+                    ),
+                }
+            }
+            decision = self._decision_client.decide(state, questions, offline=True)
+            noul_score = _extract_decision_noul(decision, "contradiction")
+            if noul_score is not None and noul_score >= threshold:
+                warnings.append(
+                    DreamerWarning(
+                        code="transcript_contradiction_detected",
+                        node_id=node.id,
+                        message=(
+                            f"High-usage node {node.id} ({node.title}) may contradict source transcript "
+                            f"{transcript.id} (noul={noul_score:.2f})."
+                        ),
+                    )
+                )
+
+    def _export_skill_promotion_proposals(self, store: SQLiteNodeStore) -> None:
+        try:
+            eligible = [
+                node
+                for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
+                if node.metadata.okf_type in ("procedure", "pitfall")
+                and len(node.metadata.sources) >= 3
+                and (node.metadata.used_count >= 5 or node.metadata.injected_count >= 10)
+            ]
+            eligible.sort(
+                key=lambda node: (
+                    -len(node.metadata.sources),
+                    -node.metadata.used_count,
+                    -node.metadata.injected_count,
+                    node.id,
+                )
+            )
+            proposals = []
+            for node in eligible[:15]:
+                proposals.append(
+                    {
+                        "node_id": node.id,
+                        "title": node.title,
+                        "project": node.metadata.project,
+                        "okf_type": node.metadata.okf_type,
+                        "sources_count": len(node.metadata.sources),
+                        "used_count": node.metadata.used_count,
+                        "injected_count": node.metadata.injected_count,
+                        "takeaway": _extract_takeaway(node.content),
+                    }
+                )
+            audit_dir = self.runtime_paths.base / ".audit"
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "generated_at": format_utc_datetime(self._utc_now()),
+                "proposals": proposals,
+            }
+            atomic_write_text(
+                audit_dir / "skill-promotion-proposals.json",
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort audit export, never a blocker
+            self._logger.warning("Skill promotion proposal export failed: %s", exc)
+
 
 def _duration_ms(started_at: datetime, completed_at: datetime) -> int:
     return max(0, int((completed_at - started_at).total_seconds() * 1000))
+
+
+def _extract_decision_choice(payload: Mapping[str, object] | None, key: str) -> tuple[str | None, float]:
+    if not isinstance(payload, Mapping):
+        return None, 0.0
+    answers = payload.get("answers")
+    raw_answer = answers.get(key) if isinstance(answers, Mapping) else payload.get(key)
+    confidence = 0.0
+    if isinstance(raw_answer, Mapping):
+        choice = raw_answer.get("choice") or raw_answer.get("value") or raw_answer.get("answer")
+        raw_conf = raw_answer.get("confidence", payload.get("confidence", 0.0))
+    else:
+        choice = raw_answer
+        raw_conf = payload.get("confidence", 0.0)
+    try:
+        confidence = float(raw_conf or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if not isinstance(choice, str) or not choice.strip():
+        return None, confidence
+    return choice.strip(), confidence
+
+
+def _extract_decision_noul(payload: Mapping[str, object] | None, key: str) -> float | None:
+    if not isinstance(payload, Mapping):
+        return None
+    answers = payload.get("answers")
+    raw_answer = answers.get(key) if isinstance(answers, Mapping) else payload.get(key)
+    if isinstance(raw_answer, Mapping):
+        raw_val = raw_answer.get("noul")
+        if raw_val is None:
+            raw_val = raw_answer.get("score")
+        if raw_val is None:
+            raw_val = raw_answer.get("value")
+    else:
+        raw_val = raw_answer
+    if raw_val is None:
+        return None
+    try:
+        return float(raw_val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_takeaway(content: str) -> str:
+    match = re.search(r"(?ms)^## Takeaway\s*\n(.*?)(?=^## |\Z)", content)
+    if not match:
+        return ""
+    for line in match.group(1).splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""

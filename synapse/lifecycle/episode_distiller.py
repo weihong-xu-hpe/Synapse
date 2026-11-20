@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Mapping
 
 from synapse.config import DeciderEndpointSettings, SynapseConfig
+from synapse.decision import DecisionClient
 from synapse.lifecycle.distiller import Distiller, content_sha256
 from synapse.models import Node, NodeStatus, NodeType, generate_node_id, slugify_english_title
 from synapse.okf import (
@@ -144,12 +145,16 @@ class EpisodeDistiller:
         runtime_paths: RuntimePaths,
         sampling_client: Any,
         gatekeeper_client: Any | None = None,
+        decision_client: DecisionClient | None = None,
     ) -> None:
         self.config = config
         self.settings = config.distiller.episode
         self.runtime_paths = runtime_paths
         self.sampling_client = sampling_client
         self.gatekeeper_client = gatekeeper_client if gatekeeper_client is not None else sampling_client
+        self._decision_client = (
+            decision_client if decision_client is not None else DecisionClient(config.decision_model)
+        )
         self._prompt_redactor = RedactionEngine.from_config(config)
         self.service = SynapseServerService(
             config,
@@ -546,21 +551,32 @@ class EpisodeDistiller:
                 for batch in self._integrate_lesson_batches(turns, lessons):
                     self.failure_stage = "integrate"
                     candidates = self._retrieve_for_lessons(retrieval, batch, run)
+                    filtered_batch, hints_by_lesson = self._pre_triage_batch(
+                        batch,
+                        candidates=candidates,
+                        same_session_nodes=prior_nodes,
+                        run=run,
+                    )
+                    if not filtered_batch:
+                        continue
                     allowed_target_ids = {node["id"] for node in candidates}
                     allowed_target_ids.update(node["id"] for node in prior_nodes)
-                    evidence_context = self._evidence_context(turns, batch)
+                    evidence_context = self._evidence_context(turns, filtered_batch)
+                    prompt = render_episode_integrate_prompt(
+                        lessons=[lesson.as_dict() for lesson in filtered_batch],
+                        same_session_nodes=prior_nodes,
+                        retrieved_nodes=candidates,
+                        evidence_context=evidence_context,
+                        global_user_spine=global_user_spine,
+                    )
+                    if hints_by_lesson:
+                        prompt = f"{prompt}\n" + "\n".join(hints_by_lesson)
                     payload = self._call(
                         run,
                         "integrate",
-                        render_episode_integrate_prompt(
-                            lessons=[lesson.as_dict() for lesson in batch],
-                            same_session_nodes=prior_nodes,
-                            retrieved_nodes=candidates,
-                            evidence_context=evidence_context,
-                            global_user_spine=global_user_spine,
-                        ),
+                        prompt,
                     )
-                    for op in _parse_ops(payload, len(batch)):
+                    for op in _parse_ops(payload, len(filtered_batch)):
                         self.failure_stage = "integrate"
                         result = self._apply_op(
                             transcript,
@@ -577,6 +593,87 @@ class EpisodeDistiller:
                                 run.node_bodies.append({"node_id": node.id, "title": node.title, "content": node.content})
         finally:
             self.service.reset_sampling_client(helper_token)
+
+    def _pre_triage_batch(
+        self,
+        batch: list[Lesson],
+        *,
+        candidates: list[dict[str, Any]],
+        same_session_nodes: list[dict[str, Any]],
+        run: EpisodeRun,
+    ) -> tuple[list[Lesson], list[str]]:
+        if not self._decision_client.enabled:
+            return batch, []
+        min_confidence = float(self.config.decision_model.min_confidence)
+        combined_candidates = [*same_session_nodes, *candidates]
+        top_candidates = [
+            {
+                "id": node.get("id"),
+                "title": node.get("title"),
+                "takeaway": node.get("takeaway") or (str(node.get("content") or "")[:240]),
+            }
+            for node in combined_candidates[:3]
+        ]
+        kept: list[Lesson] = []
+        hints: list[str] = []
+        for lesson in batch:
+            state = {
+                "lesson": {
+                    "title": lesson.topic,
+                    "okf_type": lesson.okf_type,
+                    "takeaway": lesson.claim[:200],
+                    "snippet": lesson.claim[:600],
+                },
+                "candidates": top_candidates,
+            }
+            questions = {
+                "triage": {
+                    "type": "choice",
+                    "prompt": "Classify whether this lesson should be skipped, merged, supersede, or created.",
+                    "choices": [
+                        "skip_chatter",
+                        "restates_existing",
+                        "contradicts_supersede",
+                        "complements_existing",
+                        "genuinely_new",
+                    ],
+                }
+            }
+            decision = self._decision_client.decide(state, questions, offline=True)
+            choice, confidence = _extract_decision_choice(decision, "triage")
+            if choice == "skip_chatter" and confidence >= min_confidence:
+                run.ops.append(
+                    {
+                        "action": "none",
+                        "title": lesson.topic,
+                        "target_id": None,
+                        "reason": "decision_model:skip_chatter",
+                        "verified": None,
+                        "evidence_sources": [],
+                    }
+                )
+                continue
+            if choice == "restates_existing" and confidence >= min_confidence and combined_candidates:
+                run.ops.append(
+                    {
+                        "action": "none",
+                        "title": lesson.topic,
+                        "target_id": None,
+                        "reason": "decision_model:restates_existing",
+                        "verified": None,
+                        "evidence_sources": [],
+                    }
+                )
+                continue
+            kept_index = len(kept)
+            kept.append(lesson)
+            if choice == "contradicts_supersede" and confidence >= min_confidence:
+                hints.append(
+                    f"[DECISION_HINT: contradicts_supersede] lesson_index={kept_index} ({lesson.topic}): "
+                    "directly contradicts or obsoletes an existing candidate memory; explicitly replace/overwrite "
+                    "the outdated claim rather than keeping stale facts."
+                )
+        return kept, hints
     def _integrate_lesson_batches(
         self, turns: list[TranscriptTurn], lessons: list[Lesson]
     ) -> list[list[Lesson]]:
@@ -1452,3 +1549,24 @@ def _item_from_op(
         evidence=evidence,
         verified=verified,
     )
+
+
+def _extract_decision_choice(payload: Mapping[str, Any] | None, key: str) -> tuple[str | None, float]:
+    if not isinstance(payload, Mapping):
+        return None, 0.0
+    answers = payload.get("answers")
+    raw_answer = answers.get(key) if isinstance(answers, Mapping) else payload.get(key)
+    confidence = 0.0
+    if isinstance(raw_answer, Mapping):
+        choice = raw_answer.get("choice") or raw_answer.get("value") or raw_answer.get("answer")
+        raw_conf = raw_answer.get("confidence", payload.get("confidence", 0.0))
+    else:
+        choice = raw_answer
+        raw_conf = payload.get("confidence", 0.0)
+    try:
+        confidence = float(raw_conf or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if not isinstance(choice, str) or not choice.strip():
+        return None, confidence
+    return choice.strip(), confidence
