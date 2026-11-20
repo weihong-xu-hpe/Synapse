@@ -252,10 +252,14 @@ class DecisionModelSettings(BaseModel):
     recall_judge: Literal["set", "candidate"] = "set"
     # Survivors of the logit gate whose best rerank logit is already >= this are confident hits: no judge call.
     skip_above_logit: float = Field(default=2.0)
-    # Recall judge accept threshold. Full golden-v1 sweep (89 queries, local 4B): true hits scored >= 0.255, the false
-    # injections that motivated the judge <= 0.124, so the usable window is narrow and 0.50 lost 3 true hits.
-    # Re-sweep whenever the first endpoint changes (a stronger node separates better).
-    recall_min_confidence: float = Field(default=0.18, ge=0.0, le=1.0)
+    # Recall judge VETO threshold, not a relevance threshold. Candidates already passed the reranker logit gate; the
+    # judge returns P(yes) for "does any candidate directly help?" and the injection is vetoed only when
+    # P(yes) < recall_veto_below (the model is >= 1 - recall_veto_below sure that none helps).
+    # Deliberately low: a wrong veto loses a memory, a wrong pass costs a few tokens. Full golden-v1 sweep (89 queries,
+    # local 4B): true hits scored >= 0.255, the false injections that motivated the judge <= 0.124, so the window is
+    # narrow (0.50 vetoed 3 true hits). The score is NOT a calibrated probability on this domain: re-sweep whenever
+    # the first endpoint changes.
+    recall_veto_below: float = Field(default=0.18, ge=0.0, le=1.0)
     endpoints: list[DecisionModelEndpointSettings] = Field(default_factory=list)
 
 class DreamerThresholdSettings(BaseModel):

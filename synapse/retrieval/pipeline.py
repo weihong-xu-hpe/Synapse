@@ -479,7 +479,7 @@ class RetrievalPipeline:
         is not already a confident hit (``rerank_score >= skip_above_logit``),
         System One judges the survivors (fail-open on ``None``/timeout):
         ``recall_judge="set"`` asks ONE question ("does any candidate directly
-        help?") and rejects them all on ``noul < min_confidence``;
+        help?") and vetoes them all on ``noul < recall_veto_below``;
         ``recall_judge="candidate"`` asks one ``noul`` per candidate.
         """
 
@@ -556,10 +556,10 @@ class RetrievalPipeline:
                     for i, idx in enumerate(batch):
                         score = _noul(f"m{i}")
                         if score is not None:
-                            injectable_flags[idx] = score >= dm.recall_min_confidence
+                            injectable_flags[idx] = score >= dm.recall_veto_below
                 else:
                     score = _noul("any_relevant")
-                    if score is not None and score < dm.recall_min_confidence:
+                    if score is not None and score < dm.recall_veto_below:
                         for idx in passed_indices:
                             injectable_flags[idx] = False
 
