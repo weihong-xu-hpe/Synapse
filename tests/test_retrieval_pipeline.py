@@ -583,6 +583,7 @@ def test_inject_flag_uses_decision_client_to_filter_superficial_matches(tmp_path
     config.decision_model.enabled = True
     config.decision_model.min_confidence = 0.70
     config.decision_model.recall_judge = "candidate"
+    config.decision_model.recall_min_confidence = 0.50
     config.decision_model.endpoints = [
         DecisionModelEndpointSettings(name="local", base_url="http://127.0.0.1:8088", model="startlux")
     ]
