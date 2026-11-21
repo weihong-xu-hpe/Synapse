@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from synapse.config import DeciderEndpointSettings, SynapseConfig
+from synapse.decision.client import validate_questions
 from synapse.lifecycle import episode_distiller as episode_module
 from synapse.lifecycle.episode_distiller import (
     EpisodeDistiller,
@@ -1225,6 +1226,7 @@ class _FakeDecisionClient:
         self.calls: list[tuple[Any, Any, bool]] = []
 
     def decide(self, state: Any, questions: Any, *, offline: bool = False) -> dict[str, Any] | None:
+        assert validate_questions(questions) is None, validate_questions(questions)
         self.calls.append((state, questions, offline))
         if self._responses:
             return self._responses.pop(0)

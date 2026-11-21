@@ -629,14 +629,14 @@ class EpisodeDistiller:
             questions = {
                 "triage": {
                     "type": "choice",
-                    "prompt": "Classify whether this lesson should be skipped, merged, supersede, or created.",
-                    "choices": [
-                        "skip_chatter",
-                        "restates_existing",
-                        "contradicts_supersede",
-                        "complements_existing",
-                        "genuinely_new",
-                    ],
+                    "instructions": "What should happen to this new lesson, given the existing candidate memories?",
+                    "criteria": {
+                        "skip_chatter": "Conversational filler, status chatter or a one-off remark; no durable knowledge.",
+                        "restates_existing": "An existing candidate already says the same thing.",
+                        "contradicts_supersede": "It contradicts a candidate and is the newer, correct statement.",
+                        "complements_existing": "It adds a new aspect to an existing candidate.",
+                        "genuinely_new": "No candidate covers it; durable knowledge worth its own memory.",
+                    },
                 }
             }
             decision = self._decision_client.decide(state, questions, offline=True)

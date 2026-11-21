@@ -352,8 +352,6 @@ class Dreamer:
             debounce_seconds=0.0,
         ).startup_sync()
 
-        if self._decision_client.enabled:
-            self._run_high_usage_transcript_check(store, warnings, max_nodes=5)
         # Stage 6: Report
         completed_at = self._utc_now()
         all_archived_ids = list(
@@ -2279,8 +2277,13 @@ class Dreamer:
         questions = {
             "merge_relation": {
                 "type": "choice",
-                "prompt": "Classify the relationship among these memory nodes before merging.",
-                "choices": ["synonymous", "complementary", "distinct_constraints", "conflict"],
+                "instructions": "How do these memory nodes relate to each other? Pick the closest relationship.",
+                "criteria": {
+                    "synonymous": "They state the same fact or rule in different words; one can replace the others.",
+                    "complementary": "They cover different aspects of one topic; merged, nothing is lost.",
+                    "distinct_constraints": "They look alike but each carries a different constraint, scope or condition.",
+                    "conflict": "They assert incompatible things about the same subject.",
+                },
             }
         }
         decision = self._decision_client.decide(state, questions, offline=True)
@@ -2288,74 +2291,6 @@ class Dreamer:
         if choice is None:
             return None
         return choice, confidence
-
-    def _run_high_usage_transcript_check(
-        self,
-        store: SQLiteNodeStore,
-        warnings: list[DreamerWarning],
-        *,
-        max_nodes: int = 5,
-    ) -> None:
-        if not self._decision_client.enabled:
-            return
-        candidates = [
-            node
-            for node in store.list_nodes({"status": NodeStatus.ACTIVE, "type": NodeType.PERSISTENT})
-            if node.metadata.injected_count >= 5
-            and any(src.startswith("mem_session_") for src in node.metadata.sources)
-        ]
-        candidates.sort(key=lambda node: (-node.metadata.injected_count, node.id))
-        threshold = max(0.85, float(self.config.decision_model.min_confidence))
-        for node in candidates[:max_nodes]:
-            transcript_id = next(
-                (src for src in node.metadata.sources if src.startswith("mem_session_")),
-                None,
-            )
-            if transcript_id is None:
-                continue
-            transcript = store.get_node(transcript_id)
-            if transcript is None:
-                transcript_path = self.runtime_paths.transcripts / f"{transcript_id}.md"
-                if transcript_path.exists():
-                    try:
-                        transcript = read_node_file(transcript_path)
-                    except Exception:
-                        transcript = None
-            if transcript is None:
-                continue
-            state = {
-                "memory": {
-                    "id": node.id,
-                    "title": node.title,
-                    "content": node.content[:2000],
-                },
-                "source_transcript": {
-                    "id": transcript.id,
-                    "content": transcript.content[:4000],
-                },
-            }
-            questions = {
-                "contradiction": {
-                    "type": "noul",
-                    "prompt": (
-                        "Does this stored memory contradict or misstate key facts compared to its "
-                        "source session transcript?"
-                    ),
-                }
-            }
-            decision = self._decision_client.decide(state, questions, offline=True)
-            noul_score = _extract_decision_noul(decision, "contradiction")
-            if noul_score is not None and noul_score >= threshold:
-                warnings.append(
-                    DreamerWarning(
-                        code="transcript_contradiction_detected",
-                        node_id=node.id,
-                        message=(
-                            f"High-usage node {node.id} ({node.title}) may contradict source transcript "
-                            f"{transcript.id} (noul={noul_score:.2f})."
-                        ),
-                    )
-                )
 
     def _export_skill_promotion_proposals(self, store: SQLiteNodeStore) -> None:
         try:
@@ -2425,27 +2360,6 @@ def _extract_decision_choice(payload: Mapping[str, object] | None, key: str) -> 
     if not isinstance(choice, str) or not choice.strip():
         return None, confidence
     return choice.strip(), confidence
-
-
-def _extract_decision_noul(payload: Mapping[str, object] | None, key: str) -> float | None:
-    if not isinstance(payload, Mapping):
-        return None
-    answers = payload.get("answers")
-    raw_answer = answers.get(key) if isinstance(answers, Mapping) else payload.get(key)
-    if isinstance(raw_answer, Mapping):
-        raw_val = raw_answer.get("noul")
-        if raw_val is None:
-            raw_val = raw_answer.get("score")
-        if raw_val is None:
-            raw_val = raw_answer.get("value")
-    else:
-        raw_val = raw_answer
-    if raw_val is None:
-        return None
-    try:
-        return float(raw_val)
-    except (TypeError, ValueError):
-        return None
 
 
 def _extract_takeaway(content: str) -> str:
